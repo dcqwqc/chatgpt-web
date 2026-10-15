@@ -44,3 +44,13 @@ class TuiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(ChatTui is None, "TUI dependencies unavailable")
+class PickerFailureTests(unittest.TestCase):
+    def test_failed_fetch_is_not_reported_as_empty_results(self):
+        tui = ChatTui(lambda: [], lambda _: {}, lambda *args: {})
+        tui.resume_error = "rate limit reached"
+        text = "".join(part for _, part in tui.render_resume_list())
+        self.assertIn("rate limit", text)
+        self.assertNotIn("No matching", text)

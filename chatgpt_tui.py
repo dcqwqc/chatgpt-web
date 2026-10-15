@@ -353,6 +353,7 @@ class ChatTui:
         self.lock = threading.RLock()
         self.resume_visible = False
         self.resume_loading = False
+        self.resume_error: str | None = None
         self.resume_items: list[dict[str, Any]] = []
         self.resume_filtered: list[dict[str, Any]] = []
         self.resume_index = 0
@@ -839,6 +840,8 @@ class ChatTui:
     def render_resume_list(self) -> FormattedText:
         if self.resume_loading:
             return FormattedText([("class:resume.time", " Loading conversations…")])
+        if self.resume_error:
+            return FormattedText([("class:resume.time", f"  Could not load chats: {self.resume_error[:90]}")])
         if not self.resume_filtered:
             return FormattedText([("class:resume.time", " No matching conversations")])
         fragments: list[tuple[str, str]] = []
@@ -1322,6 +1325,7 @@ class ChatTui:
         if self.busy or self.loading_conversation or self.resume_visible:
             return
         self.resume_visible = True
+        self.resume_error = None
         self.resume_loading = True
         self.resume_items = []
         self.resume_filtered = []
@@ -1335,11 +1339,13 @@ class ChatTui:
             try:
                 items = self.list_conversations()
                 self.resume_items = items
+                self.resume_error = None
                 self.resume_loading = False
                 self.filter_resume()
                 self.status = f"{len(items)} recent conversations"
             except Exception as error:
                 self.resume_loading = False
+                self.resume_error = str(error)
                 self.status = f"Conversation list failed: {error}"
             self.app.invalidate()
 
