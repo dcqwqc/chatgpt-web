@@ -84,9 +84,9 @@ MARKDOWN_THEME = Theme({
     "markdown.h4": "bold #f2f0ec",
     "markdown.h5": "bold #d9d6d0",
     "markdown.h6": "bold #d9d6d0",
-    "markdown.link": "underline #e1c48e",
-    "markdown.link_url": "underline #e1c48e",
-    "markdown.code": "#e1c48e",
+    "markdown.link": "underline #c4a7e7",
+    "markdown.link_url": "underline #c4a7e7",
+    "markdown.code": "#c4a7e7",
     "markdown.block_quote": "#b8b4ad",
     "markdown.hr": "#55514b",
     "markdown.list": "#f2f0ec",
@@ -169,7 +169,7 @@ class PromptMarkdown:
         )
         for index, line in enumerate(lines):
             marker = "› " if index == 0 else "  "
-            style = RichStyle(color="#e1c48e", bold=True) if index == 0 else None
+            style = RichStyle(color="#c4a7e7", bold=True) if index == 0 else None
             yield Segment(marker, style)
             yield from line
             yield Segment("\n")
@@ -542,14 +542,14 @@ class ChatTui:
                 "transcript": "bg:#151413 #f1efeb",
                 "separator": "#56514b",
                 "activity": "bg:#151413 #c4bfb6",
-                "composer": "bg:#262523 #f9f7f2",
-                "prompt": "bg:#262523 bold #e1c48e",
-                "placeholder": "bg:#262523 #a8a39c",
+                "composer": "bg:#26222c #f9f7f2",
+                "prompt": "bg:#26222c bold #c4a7e7",
+                "placeholder": "bg:#26222c #a8a39c",
                 "metadata": "bg:#1c1b19 #c5c0b8",
                 "metadata.model": "bg:#1c1b19 bold #f2eee6",
                 "metadata.ready": "bg:#1c1b19 bold #a6d1ad",
                 "commands": "bg:#21201e #f1ede7",
-                "commands.key": "bg:#21201e bold #e1c48e",
+                "commands.key": "bg:#21201e bold #c4a7e7",
                 "commands.description": "bg:#21201e #d0cac1",
                 "picker.header": "bg:#21201e #f4f1eb",
                 "picker.title": "bg:#21201e bold #f8f5ee",
@@ -557,7 +557,7 @@ class ChatTui:
                 "picker.search": "bg:#34312e #ffffff",
                 "picker.list": "bg:#21201e #f3efe9",
                 "picker.help": "bg:#21201e #bfb8ac",
-                "resume.selected": "bg:#4a3e2d #ffffff bold",
+                "resume.selected": "bg:#4c3b62 #ffffff bold",
                 "resume.item": "bg:#21201e #f3efe9",
                 "resume.time": "bg:#21201e #c0bab0",
             }),
@@ -873,7 +873,7 @@ class ChatTui:
                 Padding(
                     PromptMarkdown(text),
                     (1, 2),
-                    style="#f8f6f1 on #262523",
+                    style="#f4f0f8 on #26222c",
                     expand=True,
                 )
             )
@@ -885,18 +885,20 @@ class ChatTui:
         elif role == "image":
             from rich.text import Text as RichText
             try:
-                preview = render_preview(text, max_columns=max(10, min(42, width - 7)))
+                preview = render_preview(text,
+                    max_columns=max(10, min(88, width - 7)),
+                    max_rows=26)
                 console.print(Padding(
                     RichText.from_ansi(preview), (0, 2),
                     style="#f2f0ec on #151413", expand=True,
                 ))
             except (OSError, ValueError, ImportError) as error:
                 console.print(Padding(Text(
-                    f"Preview unavailable: {error}", style="#e2bc8a"
+                    f"Preview unavailable: {error}", style="#c4a7e7"
                 ), (0, 2), style="#f2f0ec on #151413", expand=True))
         else:
             console.print(Padding(ChatMarkdown(text, code_theme="monokai"),
-                (0, 2), style="#e1c48e on #151413", expand=True))
+                (0, 2), style="#c4a7e7 on #151413", expand=True))
         console.print(Text(" " * width, style="#f2f0ec on #151413"))
         return buffer.getvalue()
 
@@ -1506,15 +1508,11 @@ class ChatTui:
             self.app.invalidate()
             return
         self.last_generated_image = str(Path(path).expanduser())
-        if self.native_image_preview:
-            self.append_system("High-definition preview: " + Path(path).name)
-            self.hd_image_command(path)
-        else:
-            with self.lock:
-                self.messages.append({"role": "image", "text": self.last_generated_image})
-            self.persist_local()
-            self.status = "Image preview shown"
-            self.scroll_bottom()
+        with self.lock:
+            self.messages.append({"role": "image", "text": self.last_generated_image})
+        self.persist_local()
+        self.status = "Image preview shown inline"
+        self.scroll_bottom()
 
     def start_image_command(self, name: str, argument: str) -> None:
         """Run image-use off the UI thread; no shell or browser credentials shared."""
@@ -1558,12 +1556,11 @@ class ChatTui:
                 backend = os.environ.get("CHATGPT_WEB_IMAGE_BACKEND", "auto")
                 result = generate_image(action, prompt, reference=source, backend=backend)
                 self.last_generated_image = result.output
-                if self.native_image_preview:
-                    self.append_system("Generated image: " + Path(result.output).name)
-                    self.hd_image_command(result.output)
-                else:
-                    with self.lock:
-                        self.messages.append({"role": "image", "text": result.output})
+                # Always keep a real image entry in the conversation.
+                # Native graphics drawn outside prompt-toolkit vanish on repaint.
+                # This persistent inline preview remains available after redraw.
+                with self.lock:
+                    self.messages.append({"role": "image", "text": result.output})
                 self.persist_local()
                 self.append_system(
                     f"**{action.title()} completed** · {result.elapsed_seconds}s\n\n"
@@ -1805,6 +1802,20 @@ class ChatTui:
                         visible = visible_chat_message(message)
                         if visible is not None:
                             messages.append(visible)
+                media_files = conversation.get("media_files")
+                if isinstance(media_files, list):
+                    existing_images = {m["text"] for m in messages if m.get("role") == "image"}
+                    for image in media_files:
+                        if (isinstance(image, str) and image not in existing_images
+                                and Path(image).expanduser().is_file()):
+                            messages.append({"role": "image", "text": image})
+                            existing_images.add(image)
+                warning = conversation.get("media_warning")
+                if isinstance(warning, str) and warning:
+                    messages.append({
+                        "role": "system",
+                        "text": "An image attachment could not be downloaded: " + warning,
+                    })
                 if conversation.get("offline"):
                     messages.append({
                         "role": "system",
@@ -1895,6 +1906,25 @@ class ChatTui:
                 if final_text and final_text != rendered:
                     with self.lock:
                         self.messages[-1]["text"] = final_text
+            media_files = result.get("media_files")
+            if isinstance(media_files, list):
+                with self.lock:
+                    already = {m["text"] for m in self.messages if m["role"] == "image"}
+                    inserted = 0
+                    for file in media_files:
+                        if (isinstance(file, str) and file not in already
+                                and Path(file).expanduser().is_file()):
+                            self.messages.append({"role": "image", "text": file})
+                            already.add(file)
+                            self.last_generated_image = file
+                            inserted += 1
+                    if inserted and len(self.messages) >= inserted + 1:
+                        previous = self.messages[-inserted-1]
+                        if previous["role"] == "assistant" and not previous["text"]:
+                            previous["text"] = "Image generated and saved locally."
+            warning = result.get("media_warning")
+            if isinstance(warning, str) and warning:
+                self.append_system("Image attachment could not be saved: " + warning)
             self.status = "Ready"
         except Exception as error:
             self.pending_attachments[0:0] = attachments
@@ -1911,7 +1941,23 @@ class ChatTui:
             self.persist_local()
             self.commit_completed_turns()
 
+    @staticmethod
+    def set_terminal_background() -> None:
+        """OSC 11 changes background for this terminal session (incl. padding)."""
+        if not sys.stdout.isatty() or os.environ.get("CHATGPT_WEB_KEEP_TERMINAL_BG") == "1":
+            return
+        sys.stdout.write("]11;#151413")
+        sys.stdout.flush()
+
+    @staticmethod
+    def restore_terminal_background() -> None:
+        if not sys.stdout.isatty() or os.environ.get("CHATGPT_WEB_KEEP_TERMINAL_BG") == "1":
+            return
+        sys.stdout.write("]111")
+        sys.stdout.flush()
+
     def run(self) -> None:
+        self.set_terminal_background()
         self.persist_local()
         self.reset_terminal_session()
         self.commit_initial_history()
@@ -1922,8 +1968,11 @@ class ChatTui:
             if self.load_on_start and self.conversation_id is not None:
                 self.resume_conversation(self.conversation_id)
 
-        self.app.run(pre_run=started)
-        self.persist_local()
+        try:
+            self.app.run(pre_run=started)
+        finally:
+            self.persist_local()
+            self.restore_terminal_background()
 
 
 def run_tui(

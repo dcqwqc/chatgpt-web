@@ -79,3 +79,64 @@ class PresentationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PersistedMediaTests(unittest.TestCase):
+    def test_web_image_is_appended_after_ordinary_prompt(self):
+        from unittest.mock import patch
+        from chatgpt_tui import ChatTui
+        import time
+        from pathlib import Path
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as d, patch.dict(__import__("os").environ,{"XDG_DATA_HOME":d}):
+            img=Path(d)/"image.png"
+            Image.new("RGB",(50,50),"purple").save(img)
+            def send(conversation_id,prompt,attachments,on_event,on_connection):
+                return {
+                    "conversation_id":"aaaa1111",
+                    "previous_ids":[],
+                    "conversation":{"messages":[],"title":"A normal chat"},
+                    "media_files":[str(img)],
+                }
+            tui=ChatTui(lambda:[],lambda _: {},send)
+            tui.input.text="Generate an illustration of a nebula"
+            tui.submit_prompt()
+            for _ in range(200):
+                if not tui.busy:
+                    break
+                time.sleep(.01)
+            self.assertTrue(any(m["role"]=="image" and m["text"]==str(img) for m in tui.messages))
+            self.assertIn("nebula", tui.messages[0]["text"])
+            self.assertIn("▀",tui.render_history(tui.messages))
+            self.assertEqual(tui.last_generated_image,str(img))
+
+    def test_preview_persists_when_display_is_redrawn(self):
+        from chatgpt_tui import ChatTui
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as d, patch.dict(__import__("os").environ,{"XDG_DATA_HOME":d}):
+            img=Path(d)/"image.png"
+            Image.new("RGB",(50,50),"purple").save(img)
+            tui=ChatTui(lambda:[],lambda _: {},lambda *args:{})
+            tui.native_image_preview=True
+            tui.preview_image_command(str(img))
+            first=tui.render_transcript()
+            tui.status="Ready"
+            second=tui.render_transcript()
+            self.assertIn("▀",first)
+            self.assertIn("▀",second)
+            self.assertEqual(first,second)
+
+    def test_lavender_palette_and_terminal_background(self):
+        from chatgpt_tui import ChatTui
+        from unittest.mock import patch
+        import io
+        tui=ChatTui(lambda:[],lambda _: {},lambda *args:{})
+        self.assertIn("#c4a7e7",Path("chatgpt_tui.py").read_text())
+        sink=io.StringIO()
+        sink.isatty=lambda:True
+        with patch("chatgpt_tui.sys.stdout",sink):
+            tui.set_terminal_background()
+            tui.restore_terminal_background()
+        content=sink.getvalue()
+        self.assertIn("]11;#151413",content)
+        self.assertIn("]111",content)

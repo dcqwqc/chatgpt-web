@@ -33,6 +33,7 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 import local_history
+from generated_media import download_generated_images, image_asset_ids
 
 from cli_preferences import (
     PROJECT_NAME, PROJECT_ID_RE, MODEL_RE, load_preferences, save_preferences,
@@ -1405,7 +1406,11 @@ def run_fullscreen(
         }, on_event, on_connection)
         conversation = result.get("conversation")
         if isinstance(conversation, dict):
-            cache_conversation(conversation)
+            normalized = cache_conversation(conversation)
+            files = result.get("media_files")
+            if isinstance(files, list):
+                normalized["media_files"] = files
+                cache_conversation(normalized)
         return result
 
     def upload_image(
@@ -1728,7 +1733,15 @@ def handle_daemon_command(
         conversation = client.get_conversation(conversation_id)
         if conversation.get("gizmo_id") != client.target_project_id():
             raise ChatGPTWebError("This conversation is outside the CLI Project")
-        return {"conversation": cache_conversation(conversation)}, False
+        normalized = cache_conversation(conversation)
+        try:
+            normalized["media_files"] = download_generated_images(
+                client, conversation, conversation_cache_dir().parent / "images" / "web-generated"
+            )
+        except (ValueError, httpx.HTTPError, OSError, ChatGPTWebError) as error:
+            normalized["media_warning"] = str(error)[:200]
+        cache_conversation(normalized)
+        return {"conversation": normalized}, False
     if command == "rename":
         conversation_id = request.get("conversation_id")
         title = request.get("title")
@@ -1849,13 +1862,29 @@ def run_daemon(socket_path: Path, cdp_url: str) -> int:
                                     "ok": True, "event": event,
                                 }),
                             )
-                            cache_conversation(conversation)
+                            normalized = cache_conversation(conversation)
+                            media_paths = []
+                            media_warning = None
+                            if image_asset_ids(conversation):
+                                try:
+                                    media_paths = download_generated_images(
+                                        client, conversation,
+                                        conversation_cache_dir().parent / "images" / "web-generated",
+                                    )
+                                except (ValueError, httpx.HTTPError, OSError, ChatGPTWebError) as error:
+                                    media_warning = str(error)[:200]
+                            normalized["media_files"] = media_paths
+                            if media_warning:
+                                normalized["media_warning"] = media_warning
+                            cache_conversation(normalized)
                             send_json_line(connection, {
                                 "ok": True,
                                 "result": {
                                     "conversation_id": resolved_id,
                                     "conversation": conversation,
                                     "previous_ids": sorted(previous_ids),
+                                    "media_files": media_paths,
+                                    "media_warning": media_warning,
                                 },
                             })
                             continue
