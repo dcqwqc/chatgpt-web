@@ -40,6 +40,7 @@ from rich.style import Style as RichStyle
 from rich.syntax import Syntax
 from rich.text import Text
 from image_preview import render_preview
+from terminal_native import supports_native, render_native
 from rich.theme import Theme
 
 
@@ -186,6 +187,8 @@ class SlashCommandCompleter(Completer):
         ("/edit", "edit an image: PATH | prompt"),
         ("/animate", "generate an animated WebP"),
         ("/preview", "show an image directly in the terminal"),
+        ("/hd", "view the last image as true pixels"),
+        ("/open", "open original image at full resolution"),
         ("/remove", "remove the latest image"),
         ("/clear", "clear the displayed transcript"),
         ("/help", "show available commands"),
@@ -355,6 +358,7 @@ class ChatTui:
         self.image_busy = False
         self.image_started: float | None = None
         self.last_generated_image: str | None = None
+        self.native_image_preview = supports_native()
         self.uploading_image = False
         self.upload_started: float | None = None
         self.pending_attachments: list[dict[str, Any]] = []
@@ -1336,6 +1340,10 @@ class ChatTui:
             self.start_image_command(name, argument)
         elif name == "/preview":
             self.preview_image_command(argument)
+        elif name == "/hd":
+            self.hd_image_command(argument, force=True)
+        elif name == "/open":
+            self.open_image_command(argument)
         elif name == "/remove":
             if self.pending_attachments:
                 removed = self.pending_attachments.pop()
@@ -1360,6 +1368,75 @@ class ChatTui:
             self.status = f"Unknown command: {name}"
             self.app.invalidate()
 
+    def hd_image_command(self, argument: str, *, force: bool = False) -> None:
+        """Suspend prompt-toolkit while writing native pixels to the terminal."""
+        path = argument.strip().strip('"').strip("'") or self.last_generated_image
+        if not path:
+            self.status = "Usage: /hd PATH (or generate an image first)"
+            self.app.invalidate()
+            return
+        try:
+            from terminal_native import load_png
+            load_png(path, limit=64)  # Validate before leaving the application.
+        except (OSError, ValueError, ImportError) as error:
+            self.status = f"Cannot render image: {error}"
+            self.app.invalidate()
+            return
+        if not (self.native_image_preview or force):
+            self.status = "Native images unavailable here; use /preview or /open"
+            self.app.invalidate()
+            return
+        if self.event_loop is None:
+            self.status = "Native preview requires a running terminal session"
+            self.app.invalidate()
+            return
+        self.last_generated_image = str(Path(path).expanduser())
+        terminal_size = shutil.get_terminal_size((100, 35))
+        columns = max(8, min(130, terminal_size.columns - 6))
+        rows = max(4, min(34, terminal_size.lines - 8))
+
+        def draw() -> None:
+            try:
+                sys.stdout.write(chr(10) + "  High-definition image (original: " +
+                                 Path(path).name + ")" + chr(10))
+                sys.stdout.flush()
+                render_native(path, sys.stdout.buffer, columns, rows,
+                              tmux_passthrough=bool(os.environ.get("TMUX")))
+                sys.stdout.write("  /open to inspect original at full resolution" + chr(10))
+                sys.stdout.flush()
+                self.status = "HD image sent to the terminal"
+            except (ValueError, OSError) as error:
+                sys.stdout.write("  HD preview failed: " + str(error) + chr(10))
+                sys.stdout.flush()
+                self.status = f"HD preview failed: {error}"
+
+        self.event_loop.call_soon_threadsafe(
+            lambda: run_in_terminal(draw, render_cli_done=False)
+        )
+        self.status = "Sending HD image to terminal…"
+        self.app.invalidate()
+
+    def open_image_command(self, argument: str) -> None:
+        """Open local full-resolution file in the desktop image viewer."""
+        path = argument.strip().strip('"').strip("'") or self.last_generated_image
+        if not path:
+            self.status = "Usage: /open PATH (or generate an image first)"
+            self.app.invalidate()
+            return
+        try:
+            from terminal_native import load_png
+            load_png(path, limit=64)
+            opener = shutil.which("xdg-open") or shutil.which("open")
+            if opener is None:
+                raise RuntimeError("No desktop image opener found")
+            subprocess.Popen([opener, str(Path(path).expanduser().resolve())],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            self.status = "Opening full-resolution original"
+        except (OSError, ValueError, RuntimeError) as error:
+            self.status = f"Could not open image: {error}"
+        self.app.invalidate()
+
     def preview_image_command(self, argument: str) -> None:
         path = argument.strip().strip('"').strip("'") or self.last_generated_image
         if not path:
@@ -1374,10 +1451,14 @@ class ChatTui:
             self.app.invalidate()
             return
         self.last_generated_image = str(Path(path).expanduser())
-        with self.lock:
-            self.messages.append({"role": "image", "text": self.last_generated_image})
-        self.status = "Image preview shown"
-        self.scroll_bottom()
+        if self.native_image_preview:
+            self.append_system("High-definition preview: " + Path(path).name)
+            self.hd_image_command(path)
+        else:
+            with self.lock:
+                self.messages.append({"role": "image", "text": self.last_generated_image})
+            self.status = "Image preview shown"
+            self.scroll_bottom()
 
     def start_image_command(self, name: str, argument: str) -> None:
         """Run image-use off the UI thread; no shell or browser credentials shared."""
@@ -1414,8 +1495,12 @@ class ChatTui:
                 backend = os.environ.get("CHATGPT_WEB_IMAGE_BACKEND", "auto")
                 result = generate_image(action, prompt, reference=source, backend=backend)
                 self.last_generated_image = result.output
-                with self.lock:
-                    self.messages.append({"role": "image", "text": result.output})
+                if self.native_image_preview:
+                    self.append_system("Generated image: " + Path(result.output).name)
+                    self.hd_image_command(result.output)
+                else:
+                    with self.lock:
+                        self.messages.append({"role": "image", "text": result.output})
                 self.append_system(
                     f"**{action.title()} completed** · {result.elapsed_seconds}s\n\n"
                     f"Saved to `{result.output}`\n\n"

@@ -330,3 +330,11 @@ The `/usage` command now reports two separate categories:
   countdowns from the account's separate usage endpoint.
 
 CLI `chatgpt-web usage` returns the same data as structured JSON.
+
+### Native high-definition images
+
+Direct Ghostty and Kitty sessions now use native raster graphics instead of ANSI half-block pixels. Run /hd to display the last image in the terminal or /open to open the original full-resolution file in the desktop viewer. Run /preview PATH to show an image using automatic terminal detection. In tmux, /hd uses explicit passthrough while the default stays conservative. The original image remains unchanged.
+
+### ChatGPT Web usage research
+
+The account model catalog and normal quota-related response headers did not reveal a reliable remaining Web message counter. The common usage and limits URL paths returned 404. Codex percentages remain separately labeled and exact Web message balances are not fabricated.
