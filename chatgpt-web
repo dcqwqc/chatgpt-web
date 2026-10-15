@@ -1624,6 +1624,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="daemon Unix socket (default: %(default)s)",
     )
     commands = parser.add_subparsers(dest="command")
+    image_parser = commands.add_parser(
+        "image", help="generate, edit or animate an image with image-use (JSON result)"
+    )
+    image_parser.add_argument("action", choices=("generate", "edit", "animate"))
+    image_parser.add_argument("--prompt", required=True)
+    image_parser.add_argument("--reference")
+    image_parser.add_argument("--output")
+    image_parser.add_argument("--backend", default="auto", choices=("auto", "web", "codex"))
+    image_parser.add_argument("--timeout", type=int, default=360)
     commands.add_parser("login", help="launch the persistent login browser")
     auth_parser = commands.add_parser(
         "auth", help="verify the saved ChatGPT session"
@@ -1674,6 +1683,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     try:
+        if args.command == "image":
+            from image_backend import generate_image
+            try:
+                result = generate_image(
+                    args.action, args.prompt, reference=args.reference,
+                    output=args.output, backend=args.backend, timeout=args.timeout,
+                )
+            except (ValueError, RuntimeError) as error:
+                print(json.dumps({"ok": False, "error": str(error)}))
+                return 1
+            print(json.dumps({"ok": True, **vars(result)}))
+            return 0
         if args.command == "login":
             print(json.dumps(
                 launch_login_browser(args.cdp_url), separators=(",", ":")

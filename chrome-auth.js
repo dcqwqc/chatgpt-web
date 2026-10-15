@@ -56,10 +56,15 @@ async function main() {
   }
 
   function isTarget(request) {
-    return request.method === "GET" &&
-      request.url.includes("/backend-api/conversations?") &&
-      !request.url.includes("hide_snorlax") &&
-      request.url.includes("limit=28");
+    // Query parameters such as pagination and sidebar visibility may change.
+    try {
+      const url = new URL(request.url);
+      return request.method === "GET" &&
+        url.origin === "https://chatgpt.com" &&
+        url.pathname === "/backend-api/conversations";
+    } catch {
+      return false;
+    }
   }
 
   function finish(requestId) {
@@ -80,7 +85,7 @@ async function main() {
 
   socket.addEventListener("open", () => {
     send("Network.enable");
-    setTimeout(() => send("Page.navigate", { url: "https://chatgpt.com/" }), 200);
+    setTimeout(() => send("Page.reload", { ignoreCache: false }), 400);
   });
   socket.addEventListener("message", (event) => {
     const message = JSON.parse(event.data);
@@ -96,7 +101,11 @@ async function main() {
       finish(requestId);
     }
   });
-  socket.addEventListener("error", () => fail("lost the Chrome debugger connection"));
+  socket.addEventListener("error", () => {
+    // Some Chromium builds emit an error after an intentional WebSocket close.
+    if (finished) return;
+    fail("lost the Chrome debugger connection");
+  });
 }
 
 main().catch((error) => fail(error.message));

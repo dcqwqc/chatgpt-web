@@ -21,15 +21,16 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI, FormattedText
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import Float, FloatContainer, HSplit, Layout, Window
+from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.containers import ConditionalContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import D
-from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.processors import Processor, Transformation
 from prompt_toolkit.styles import Style
 from prompt_toolkit.data_structures import Point
-from prompt_toolkit.widgets import Frame, TextArea
+from prompt_toolkit.widgets import TextArea
+
+from image_backend import generate_image
 from rich.console import Console
 from rich.markdown import BlockQuote, CodeBlock, Markdown
 from rich.padding import Padding
@@ -62,8 +63,8 @@ ANNOTATION_PATTERN = re.compile(r"\ue200([^\ue201\ue202]+)(?:\ue202(.*?))?\ue201
 FILE_CITATION_PATTERN = re.compile(
     r"[ \t]*\[F\d+:L\d+(?:[ \t]*[-–—][ \t]*L?\d+)?\]"
 )
-PROMPT_BACKGROUND_TOKEN = "48;2;75;75;75m"
-PROMPT_BACKGROUND_SGR = "\x1b[48;2;75;75;75m"
+PROMPT_BACKGROUND_TOKEN = "48;2;28;37;48m"
+PROMPT_BACKGROUND_SGR = "\x1b[48;2;28;37;48m"
 TRAILING_STYLED_SPACES_PATTERN = re.compile(
     r"(?:\x1b\[[0-9;]*m[ \t]+\x1b\[0m)+(?=\n)"
 )
@@ -178,6 +179,9 @@ class SlashCommandCompleter(Completer):
         ("/history", "reload this conversation"),
         ("/rename", "rename this conversation"),
         ("/copy", "copy the latest response"),
+        ("/image", "generate an image from a prompt"),
+        ("/edit", "edit an image: PATH | prompt"),
+        ("/animate", "generate an animated WebP"),
         ("/remove", "remove the latest image"),
         ("/clear", "clear the displayed transcript"),
         ("/help", "show available commands"),
@@ -338,6 +342,9 @@ class ChatTui:
         self.loading_conversation = False
         self.loading_started: float | None = None
         self.load_on_start = conversation_id is not None and not initial_messages
+        self.image_busy = False
+        self.image_started: float | None = None
+        self.last_generated_image: str | None = None
         self.uploading_image = False
         self.upload_started: float | None = None
         self.pending_attachments: list[dict[str, Any]] = []
@@ -350,6 +357,10 @@ class ChatTui:
         self.resume_filtered: list[dict[str, Any]] = []
         self.resume_index = 0
         self.resume_filter = Condition(lambda: self.resume_visible)
+        self.commands_filter = Condition(
+            lambda: not self.resume_visible and self.input.text.startswith("/")
+            and '\n' not in self.input.text
+        )
         self.follow_output = True
         self.transcript_line_count = 1
         self.active_started: float | None = None
@@ -390,7 +401,8 @@ class ChatTui:
         self.resume_search = TextArea(
             height=1,
             multiline=False,
-            prompt="Search: ",
+            prompt="  Search  ",
+            style="class:picker.search",
         )
         self.resume_search.buffer.on_text_changed += lambda _buffer: self.filter_resume()
         self.resume_list_control = FormattedTextControl(
@@ -401,9 +413,42 @@ class ChatTui:
             content=self.resume_list_control,
             wrap_lines=False,
             always_hide_cursor=True,
+            height=D.exact(7),
+            style="class:picker.list",
         )
         self.bindings = self.make_bindings()
-        base = HSplit(
+        # Command hints and conversation selection stay in normal document flow.
+        # Unlike Float/Frame they never cover the transcript with a full-height modal.
+        command_hints = ConditionalContainer(
+            content=Window(
+                content=FormattedTextControl(self.render_command_hints),
+                height=D.exact(5),
+                style="class:commands",
+            ),
+            filter=self.commands_filter,
+        )
+        resume_picker = ConditionalContainer(
+            content=HSplit([
+                Window(
+                    content=FormattedTextControl(
+                        [("class:picker.title", "  RECENT CONVERSATIONS"),
+                         ("class:picker.hint", "     Search · ↑ ↓ · Enter · Esc")]),
+                    height=1,
+                    style="class:picker.header",
+                ),
+                self.resume_search,
+                self.resume_list_window,
+                Window(
+                    content=FormattedTextControl(
+                        "  Ctrl+R  conversations    Esc  close"
+                    ),
+                    height=1,
+                    style="class:picker.help",
+                ),
+            ]),
+            filter=self.resume_filter,
+        )
+        root = HSplit(
             [
                 self.transcript_window,
                 Window(
@@ -413,6 +458,8 @@ class ChatTui:
                 ),
                 Window(height=1, char=" ", style="class:composer"),
                 self.input,
+                command_hints,
+                resume_picker,
                 Window(height=1, char=" ", style="class:composer"),
                 Window(
                     height=1,
@@ -421,43 +468,6 @@ class ChatTui:
                 ),
             ],
             height=self.viewport_height,
-        )
-        resume_dialog = ConditionalContainer(
-            content=Frame(
-                HSplit([
-                    self.resume_search,
-                    Window(height=1, char="─", style="class:separator"),
-                    self.resume_list_window,
-                    Window(
-                        height=1,
-                        content=FormattedTextControl(
-                            " ↑/↓ select  Enter open  Esc close "
-                        ),
-                        style="class:help",
-                    ),
-                ]),
-                title="Resume conversation",
-            ),
-            filter=self.resume_filter,
-        )
-        root = FloatContainer(
-            content=base,
-            floats=[
-                Float(
-                    xcursor=True,
-                    ycursor=True,
-                    attach_to_window=self.input.window,
-                    allow_cover_cursor=True,
-                    content=CompletionsMenu(max_height=8, scroll_offset=1),
-                ),
-                Float(
-                    content=resume_dialog,
-                    left=4,
-                    right=4,
-                    top=2,
-                    bottom=2,
-                ),
-            ],
         )
         self.app: Application[Any] = Application(
             layout=Layout(root, focused_element=self.input),
@@ -470,25 +480,28 @@ class ChatTui:
             max_render_postpone_time=0.1,
             before_render=self.detect_terminal_resize,
             style=Style.from_dict({
-                "separator": "#6b7280",
-                "activity": "#9ca3af",
-                "composer": "bg:#4b4b4b #f9fafb",
-                "prompt": "bg:#4b4b4b bold #f9fafb",
-                "placeholder": "bg:#4b4b4b #9ca3af",
-                "metadata": "bg:#272727 #9ca3af",
-                "metadata.model": "bg:#272727 #fbbf24",
-                "metadata.ready": "bg:#272727 #86efac",
-                "help": "bg:#1f2937 #9ca3af",
-                "frame.label": "#5eead4",
-                "frame.border": "#4b5563",
-                "resume.selected": "bg:#0f766e #ffffff bold",
-                "resume.item": "#d1d5db",
-                "resume.time": "#9ca3af",
-                "completion-menu": "bg:#303030 #e5e7eb",
-                "completion-menu.completion": "bg:#303030 #e5e7eb",
-                "completion-menu.completion.current": "bg:#0f766e #ffffff bold",
-                "completion-menu.meta.completion": "bg:#303030 #9ca3af",
-                "completion-menu.meta.completion.current": "bg:#0f766e #ccfbf1",
+                # Explicit dark surfaces work even when the terminal's base
+                # background is white; typography stays legible in both modes.
+                "separator": "#42566a",
+                "activity": "bg:#101820 #bac9d9",
+                "composer": "bg:#1c2530 #f5f8fc",
+                "prompt": "bg:#1c2530 bold #67e8f9",
+                "placeholder": "bg:#1c2530 #a8b8c9",
+                "metadata": "bg:#0e141d #acbdce",
+                "metadata.model": "bg:#0e141d bold #72e7f7",
+                "metadata.ready": "bg:#0e141d bold #9bedb5",
+                "commands": "bg:#16212e #c9d9e8",
+                "commands.key": "bg:#16212e bold #72e7f7",
+                "commands.description": "bg:#16212e #a9bacb",
+                "picker.header": "bg:#16212e #c9d9e8",
+                "picker.title": "bg:#16212e bold #f1f7ff",
+                "picker.hint": "bg:#16212e #91a8ba",
+                "picker.search": "bg:#263445 #ffffff",
+                "picker.list": "bg:#16212e #e8f0f9",
+                "picker.help": "bg:#18232e #a8bacb",
+                "resume.selected": "bg:#285266 #ffffff bold",
+                "resume.item": "bg:#16212e #d5e2ef",
+                "resume.time": "bg:#16212e #9fb0c0",
             }),
         )
 
@@ -501,7 +514,7 @@ class ChatTui:
         """
         while True:
             await asyncio.sleep(0.12)
-            if self.busy or self.loading_conversation or self.uploading_image:
+            if self.busy or self.loading_conversation or self.uploading_image or self.image_busy:
                 self.app.invalidate()
 
     def render_prompt(self) -> FormattedText:
@@ -525,6 +538,7 @@ class ChatTui:
         started = (
             self.active_started if self.busy
             else self.loading_started if self.loading_conversation
+            else self.image_started if self.image_busy
             else self.upload_started
         )
         if started is not None:
@@ -552,6 +566,7 @@ class ChatTui:
             "streaming" if self.busy else
             "loading" if self.loading_conversation else
             "uploading" if self.uploading_image else
+            "generating" if self.image_busy else
             "ready"
         )
         title = self.title if len(self.title) <= 42 else self.title[:39] + "…"
@@ -794,13 +809,13 @@ class ChatTui:
             theme=MARKDOWN_THEME,
         )
         if separated and role == "user":
-            console.print(Rule(style="#606060"))
+            console.print(Rule(style="#34485e"))
         if role == "user":
             console.print(
                 Padding(
                     PromptMarkdown(text),
                     (1, 2),
-                    style="#f3f4f6 on #4b4b4b",
+                    style="#f4f8ff on #1c2530",
                     expand=True,
                 )
             )
@@ -838,8 +853,24 @@ class ChatTui:
                     pass
             marker = "›" if index == self.resume_index else " "
             style = "class:resume.selected" if index == self.resume_index else "class:resume.item"
-            fragments.append((style, f" {marker} {str(title)[:72]:<72} "))
+            fragments.append((style, f"  {marker} {str(title).replace(chr(10), chr(32))[:max(20, self.transcript_width() - 26)]}  "))
             fragments.append(("class:resume.time", f"{stamp}\n"))
+        return FormattedText(fragments)
+
+    def render_command_hints(self) -> FormattedText:
+        query = self.input.text.strip().casefold()
+        matches = [
+            (name, description)
+            for name, description in SlashCommandCompleter.COMMANDS
+            if name.startswith(query)
+        ]
+        fragments: list[tuple[str, str]] = []
+        for name, description in matches[:4]:
+            fragments.extend([
+                ("class:commands.key", f"  {name:<11}"),
+                ("class:commands.description", f"{description}\n"),
+            ])
+        fragments.append(("class:commands.description", "  Tab  complete    Enter  run"))
         return FormattedText(fragments)
 
     def make_bindings(self) -> KeyBindings:
@@ -998,8 +1029,8 @@ class ChatTui:
             self.status = "Conversation still loading · draft kept"
             self.app.invalidate()
             return
-        if self.busy:
-            self.status = "Response active · draft kept for the next turn"
+        if self.busy or self.image_busy:
+            self.status = "Operation active · draft kept for the next turn"
             self.app.invalidate()
             return
         prompt = self.input.text.strip()
@@ -1066,6 +1097,8 @@ class ChatTui:
             self.rename_current_conversation(argument)
         elif name == "/copy":
             self.copy_latest_response()
+        elif name in ("/image", "/edit", "/animate"):
+            self.start_image_command(name, argument)
         elif name == "/remove":
             if self.pending_attachments:
                 removed = self.pending_attachments.pop()
@@ -1089,6 +1122,58 @@ class ChatTui:
         else:
             self.status = f"Unknown command: {name}"
             self.app.invalidate()
+
+    def start_image_command(self, name: str, argument: str) -> None:
+        """Run image-use off the UI thread; no shell or browser credentials shared."""
+        if self.image_busy or self.busy:
+            self.status = "Another operation is still running"
+            self.app.invalidate()
+            return
+        action = {"/image": "generate", "/edit": "edit", "/animate": "animate"}[name]
+        source: str | None = None
+        prompt = argument.strip()
+        if action == "edit":
+            if "|" not in argument:
+                self.status = "Usage: /edit PATH | instructions"
+                self.app.invalidate()
+                return
+            reference, _, prompt = argument.partition("|")
+            source = reference.strip().strip('"').strip("'") or self.last_generated_image
+            prompt = prompt.strip()
+            if not source:
+                self.status = "No image yet: specify PATH or generate an image first"
+                self.app.invalidate()
+                return
+        if not prompt:
+            self.status = f"Usage: {name} PROMPT" if action != "edit" else "Usage: /edit PATH | PROMPT"
+            self.app.invalidate()
+            return
+        self.image_busy = True
+        self.image_started = time.monotonic()
+        self.status = {"generate": "Generating image", "edit": "Editing image", "animate": "Rendering animation"}[action]
+        self.app.invalidate()
+
+        def run() -> None:
+            try:
+                backend = os.environ.get("CHATGPT_WEB_IMAGE_BACKEND", "auto")
+                result = generate_image(action, prompt, reference=source, backend=backend)
+                self.last_generated_image = result.output
+                self.append_system(
+                    f"**{action.title()} completed** · {result.elapsed_seconds}s\n\n"
+                    f"Saved to `{result.output}`\n\n"
+                    "Open it with your desktop's image viewer. "
+                    "Image generation runs separately from the active web conversation."
+                )
+                self.status = "Image saved"
+            except Exception as error:
+                self.append_system(f"**Image {action} failed:** {error}")
+                self.status = "Image request failed"
+            finally:
+                self.image_started = None
+                self.image_busy = False
+                self.app.invalidate()
+
+        threading.Thread(target=run, daemon=True).start()
 
     def rename_current_conversation(self, title: str) -> None:
         title = title.strip()

@@ -199,3 +199,54 @@ This project is suitable for experimentation on your own account. Expect
 occasional breakage, rate limits, forced reauthentication, and protocol changes.
 For supported integrations and production applications, use the official OpenAI
 API instead.
+
+## Fork enhancements (dcqwqc)
+
+This fork adds a high-contrast terminal palette, compact **inline** conversation
+selector (Ctrl+R or /resume), and a compact inline slash-command list in
+place of floating dialog windows. Tab completes a command; Enter runs it.
+
+### Image generation, editing and animation
+
+Install [image-use](https://github.com/leeguooooo/image-use) separately.
+The fork delegates media generation to this local executable. It does not
+send generated files into the current ChatGPT conversation automatically.
+
+| Interactive command | Action |
+| --- | --- |
+| /image A cozy solarpunk greenhouse | Generate a PNG |
+| /edit ~/Pictures/room.png \| Add plants | Edit an existing picture |
+| /edit \| Make it purple | Edit last generated image |
+| /animate A pixel kitten walking | Render animated WebP |
+
+The standalone interface also returns machine-readable JSON:
+
+~~~bash
+chatgpt-web image generate --prompt "A tiny house in a forest" --backend auto
+chatgpt-web image edit --reference ./room.png --prompt "Warm sunset light"
+chatgpt-web image animate --prompt "A waving pixel character"
+~~~
+
+The JSON response includes ok and, on success, output, backend, action, and
+elapsed_seconds. Files default to ~/.local/share/chatgpt-web/images/.
+There is **no public service or MCP endpoint**. Connecting this to an MCP
+service later requires authorization, rate limits, and safe file access.
+
+The default image backend is auto. It prefers the browser-backed service
+(requires chrome-use plus its browser extension) but may fall back to Codex
+OAuth, which **consumes metered Codex usage**. To disable fallback, set
+CHATGPT_WEB_IMAGE_BACKEND=web. To force Codex, set
+CHATGPT_WEB_IMAGE_BACKEND=codex. No image generations happen unless explicitly
+requested. The image-use service and the ChatGPT web session are unofficial;
+both may break when providers change.
+
+Run checks:
+
+~~~bash
+python3 -m unittest discover -s tests -v
+chatgpt-web image --help
+image-use doctor
+~~~
+
+The original upstream repository currently does not list a software license;
+review redistribution permissions before packaging this fork elsewhere.
