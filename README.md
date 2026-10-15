@@ -338,3 +338,29 @@ Direct Ghostty and Kitty sessions now use native raster graphics instead of ANSI
 ### ChatGPT Web usage research
 
 The account model catalog and normal quota-related response headers did not reveal a reliable remaining Web message counter. The common usage and limits URL paths returned 404. Codex percentages remain separately labeled and exact Web message balances are not fabricated.
+
+### Persistent image prompts and conversation history
+
+Image commands now appear in the chat transcript as user messages before
+generation starts. The completed response repeats the full image prompt,
+records the image's saved path, and keeps its result after restarting the TUI.
+
+The client maintains an on-disk, private local session journal under
+~/.local/share/chatgpt-web/local-history/. It includes local image-only
+sessions as well as the visible transcript surrounding regular CLI Project
+chats. The active session is restored automatically after quitting and
+restarting. The Ctrl+R and /resume picker merges real CLI Project chats,
+local-only sessions and earlier cached pre-Project chats, labeled read-only.
+
+No previous normal chat is silently moved or given permission to write
+outside the CLI Project. Resuming a pre-Project cached chat displays its
+old messages; a *new* message creates a new CLI Project chat instead.
+When ChatGPT is rate-limited, already cached CLI chats and local image-only
+sessions can still be opened offline. Sending replies still requires the
+live Project-enforced backend.
+
+Older generated images still present in the local images folder are
+automatically indexed as recovered media, without inventing prompts that
+weren't previously recorded. Recovery never deletes or modifies image files
+and never switches the active chat. Local session journals are written
+atomically with private (0600) permissions.

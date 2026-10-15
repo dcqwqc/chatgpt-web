@@ -31,6 +31,7 @@ from prompt_toolkit.data_structures import Point
 from prompt_toolkit.widgets import TextArea
 
 from image_backend import generate_image
+import local_history
 from rich.console import Console
 from rich.markdown import BlockQuote, CodeBlock, Markdown
 from rich.padding import Padding
@@ -333,6 +334,8 @@ class ChatTui:
         list_models: Callable[[], dict[str, Any]] | None = None,
         select_model: Callable[[str], dict[str, Any]] | None = None,
         get_usage: Callable[[], dict[str, Any]] | None = None,
+        local_session_id: str | None = None,
+        last_image: str | None = None,
     ) -> None:
         self.list_conversations = list_conversations
         self.load_conversation = load_conversation
@@ -344,20 +347,31 @@ class ChatTui:
         self.select_model = select_model
         self.get_usage = get_usage
         self.conversation_id = conversation_id
+        self.legacy_read_only = False
+        self.local_session_id = local_session_id or local_history.new_id()
         self.title = title
         self.model = model or os.environ.get("CHATGPT_WEB_MODEL", "gpt-6")
         self.messages: list[Message] = []
         for message in initial_messages or []:
-            visible = visible_chat_message(message)
-            if visible is not None:
-                self.messages.append(visible)
+            if (isinstance(message, dict) and
+                message.get("role") in ("user", "assistant", "system", "image")
+                and isinstance(message.get("text"), str)):
+                self.messages.append({"role": message["role"], "text": message["text"]})
+            else:
+                visible = visible_chat_message(message)
+                if visible is not None:
+                    self.messages.append(visible)
         self.busy = False
         self.loading_conversation = False
         self.loading_started: float | None = None
         self.load_on_start = conversation_id is not None and not initial_messages
         self.image_busy = False
         self.image_started: float | None = None
-        self.last_generated_image: str | None = None
+        self.last_generated_image: str | None = last_image or next(
+            (m["text"] for m in reversed(self.messages)
+             if m["role"] == "image" and Path(m["text"]).expanduser().is_file()),
+            None
+        )
         self.native_image_preview = supports_native()
         self.uploading_image = False
         self.upload_started: float | None = None
@@ -1244,9 +1258,27 @@ class ChatTui:
             return 10
         return max(3, info.window_height - 3)
 
+    def persist_local(self) -> None:
+        """Durably record visible CLI messages, including image-only sessions."""
+        with self.lock:
+            messages = [dict(message) for message in self.messages]
+            session_id = self.local_session_id
+            server_id = self.conversation_id
+            title = self.title
+            last_image = self.last_generated_image
+        try:
+            local_history.save(
+                session_id, server_id=server_id, title=title,
+                messages=messages, last_image=last_image,
+            )
+        except (OSError, ValueError) as error:
+            self.status = f"Local history could not be saved: {error}"
+            if hasattr(self, "app"): self.app.invalidate()
+
     def append_system(self, text: str) -> None:
         with self.lock:
             self.messages.append({"role": "system", "text": text})
+        self.persist_local()
         self.scroll_bottom()
 
     def scroll_bottom(self, force: bool = True) -> None:
@@ -1274,6 +1306,22 @@ class ChatTui:
             self.handle_command(prompt)
             return
         self.pending_attachments.clear()
+        if self.legacy_read_only:
+            # The old conversation was outside the CLI Project. Do not make
+            # the UI imply its context will be sent to the new project chat.
+            self.persist_local()
+            self.local_session_id = local_history.new_id()
+            self.conversation_id = None
+            self.legacy_read_only = False
+            self.title = "New conversation"
+            with self.lock:
+                self.messages = [{
+                    "role": "system",
+                    "text": "Started a fresh CLI Project chat. The older cached conversation "
+                            "is preserved separately, but its contents were not sent to ChatGPT.",
+                }]
+                self.committed_message_count = 0
+                self.history_tail = ""
         prompt = prompt or "Describe the attached image."
         display_prompt = prompt
         if attachments:
@@ -1282,6 +1330,7 @@ class ChatTui:
         with self.lock:
             self.messages.append({"role": "user", "text": display_prompt})
             self.messages.append({"role": "assistant", "text": ""})
+        self.persist_local()
         self.busy = True
         self.active_started = time.monotonic()
         self.last_elapsed = None
@@ -1296,6 +1345,10 @@ class ChatTui:
         if name in ("/exit", "/quit"):
             self.app.exit()
         elif name == "/new":
+            self.persist_local()
+            self.legacy_read_only = False
+            self.local_session_id = local_history.new_id()
+            self.last_generated_image = None
             with self.lock:
                 self.messages.clear()
                 self.committed_message_count = 0
@@ -1306,6 +1359,7 @@ class ChatTui:
             self.title = "New conversation"
             self.pending_attachments.clear()
             self.status = "Started a new conversation"
+            self.persist_local()
             self.scroll_bottom()
         elif name == "/clear":
             with self.lock:
@@ -1313,6 +1367,7 @@ class ChatTui:
                 self.committed_message_count = 0
                 self.history_tail = ""
             self.status = "Transcript cleared"
+            self.persist_local()
             self.scroll_bottom()
         elif name == "/model":
             if argument.strip():
@@ -1457,6 +1512,7 @@ class ChatTui:
         else:
             with self.lock:
                 self.messages.append({"role": "image", "text": self.last_generated_image})
+            self.persist_local()
             self.status = "Image preview shown"
             self.scroll_bottom()
 
@@ -1485,6 +1541,13 @@ class ChatTui:
             self.status = f"Usage: {name} PROMPT" if action != "edit" else "Usage: /edit PATH | PROMPT"
             self.app.invalidate()
             return
+        with self.lock:
+            self.messages.append({
+                "role": "user",
+                "text": f"{name} {argument.strip()}",
+            })
+        self.persist_local()
+        self.scroll_bottom()
         self.image_busy = True
         self.image_started = time.monotonic()
         self.status = {"generate": "Generating image", "edit": "Editing image", "animate": "Rendering animation"}[action]
@@ -1501,9 +1564,11 @@ class ChatTui:
                 else:
                     with self.lock:
                         self.messages.append({"role": "image", "text": result.output})
+                self.persist_local()
                 self.append_system(
                     f"**{action.title()} completed** · {result.elapsed_seconds}s\n\n"
                     f"Saved to `{result.output}`\n\n"
+                    f"**Prompt:** {prompt}\n\n"
                     "Preview displayed above; the original full-resolution file is saved locally. "
                     "Image generation runs separately from the active web conversation."
                 )
@@ -1732,15 +1797,41 @@ class ChatTui:
                 conversation = self.load_conversation(conversation_id)
                 messages = []
                 for message in conversation.get("messages", []):
-                    visible = visible_chat_message(message)
-                    if visible is not None:
-                        messages.append(visible)
+                    if (isinstance(message, dict) and
+                        message.get("role") in ("user", "assistant", "system", "image")
+                        and isinstance(message.get("text"), str)):
+                        messages.append({"role": message["role"], "text": message["text"]})
+                    else:
+                        visible = visible_chat_message(message)
+                        if visible is not None:
+                            messages.append(visible)
+                if conversation.get("offline"):
+                    messages.append({
+                        "role": "system",
+                        "text": "Loaded a locally cached copy because ChatGPT is temporarily unavailable. "
+                                "New messages still require a valid CLI Project connection.",
+                    })
                 with self.lock:
                     self.messages = messages
-                self.conversation_id = conversation_id
+                real_id = conversation.get("server_id", conversation.get("id", conversation_id))
+                if isinstance(real_id, str) and real_id.startswith(("local:", "legacy:")):
+                    real_id = None
+                self.conversation_id = real_id
+                selected_local_id = conversation.get("local_session_id")
+                self.local_session_id = (
+                    selected_local_id if isinstance(selected_local_id, str)
+                    else local_history.new_id()
+                )
+                self.last_generated_image = conversation.get("last_image") or next(
+                    (m["text"] for m in reversed(messages) if m["role"] == "image"), None
+                )
                 if self.set_active_conversation is not None:
-                    self.set_active_conversation(conversation_id)
+                    self.set_active_conversation(real_id)
                 self.title = conversation.get("title") or "Untitled"
+                self.legacy_read_only = bool(conversation.get("legacy"))
+                if self.legacy_read_only:
+                    self.status = "Older cached chat is read-only; your next message creates a CLI Project chat"
+                self.persist_local()
                 self.commit_loaded_history(messages)
             except Exception as error:
                 self.loading_conversation = False
@@ -1817,9 +1908,11 @@ class ChatTui:
             self.active_started = None
             self.cancel_connection = None
             self.busy = False
+            self.persist_local()
             self.commit_completed_turns()
 
     def run(self) -> None:
+        self.persist_local()
         self.reset_terminal_session()
         self.commit_initial_history()
 
@@ -1830,6 +1923,7 @@ class ChatTui:
                 self.resume_conversation(self.conversation_id)
 
         self.app.run(pre_run=started)
+        self.persist_local()
 
 
 def run_tui(
@@ -1846,6 +1940,8 @@ def run_tui(
     list_models: Callable[[], dict[str, Any]] | None = None,
     select_model: Callable[[str], dict[str, Any]] | None = None,
     get_usage: Callable[[], dict[str, Any]] | None = None,
+    local_session_id: str | None = None,
+    last_image: str | None = None,
 ) -> None:
     ChatTui(
         list_conversations,
@@ -1861,4 +1957,6 @@ def run_tui(
         list_models,
         select_model,
         get_usage,
+        local_session_id,
+        last_image,
     ).run()

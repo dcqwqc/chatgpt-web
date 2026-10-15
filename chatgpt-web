@@ -32,6 +32,8 @@ from typing import Any, Iterable
 from urllib.parse import urljoin, urlsplit
 
 import httpx
+import local_history
+
 from cli_preferences import (
     PROJECT_NAME, PROJECT_ID_RE, MODEL_RE, load_preferences, save_preferences,
     parse_projects, parse_models, web_usage_status, summarize_codex_usage,
@@ -1282,22 +1284,110 @@ def run_fullscreen(
     def ensure_service() -> None:
         ensure_daemon(socket_path, cdp_url)
 
+    def local_legacy_items() -> list[dict[str, Any]]:
+        """Old non-Project local caches are readable, never writable."""
+        result = []
+        configured = load_preferences().get("project_id")
+        for path in conversation_cache_dir().glob("*.json"):
+            try:
+                row = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(row, dict) or row.get("gizmo_id") == configured:
+                continue
+            if isinstance(row.get("id"), str):
+                result.append({
+                    "id": row["id"], "title": row.get("title"),
+                    "update_time": row.get("update_time") or row.get("cached_at") or 0,
+                })
+        return result
+
+    def locally_cached_project_items() -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        project = load_preferences().get("project_id")
+        if not project:
+            return items
+        for path in conversation_cache_dir().glob("*.json"):
+            try:
+                row = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if (isinstance(row, dict) and row.get("gizmo_id") == project
+                and isinstance(row.get("id"), str)):
+                items.append({
+                    "id": row["id"],
+                    "title": row.get("title") or "Cached CLI chat",
+                    "update_time": row.get("update_time") or row.get("cached_at") or 0,
+                })
+        return items
+
     def list_recent() -> list[dict[str, Any]]:
-        ensure_service()
-        items = daemon_request(socket_path, {
-            "command": "list", "maximum": 50,
-        }).get("items", [])
-        return items if isinstance(items, list) else []
+        items: list[dict[str, Any]] = []
+        try:
+            ensure_service()
+            result = daemon_request(socket_path, {
+                "command": "list", "maximum": 100,
+            }).get("items", [])
+            items = result if isinstance(result, list) else []
+        except (ChatGPTWebError, OSError):
+            # Local-only histories remain browsable when web rate-limited.
+            pass
+        seen_ids = {row.get("id") for row in items if isinstance(row, dict)}
+        items.extend(row for row in locally_cached_project_items()
+                     if row.get("id") not in seen_ids)
+        return local_history.merge_recent(items, legacy=local_legacy_items())
 
     def load(selected_id: str) -> dict[str, Any]:
-        ensure_service()
-        raw = daemon_request(socket_path, {
-            "command": "show_normalized", "conversation_id": selected_id,
-        }).get("conversation", {})
-        if isinstance(raw, dict):
-            cache_conversation(raw)
-            return raw
-        return {}
+        if selected_id.startswith("local:"):
+            snapshot = local_history.load(selected_id[6:])
+            if snapshot is None:
+                raise ChatGPTWebError("Local session no longer exists")
+            return {
+                "id": snapshot.get("server_id"),
+                "server_id": snapshot.get("server_id"),
+                "local_session_id": snapshot["session_id"],
+                "title": snapshot.get("title"),
+                "messages": snapshot.get("messages", []),
+                "last_image": snapshot.get("last_image"),
+            }
+        if selected_id.startswith("legacy:"):
+            legacy_id = selected_id[7:]
+            cache_path = conversation_cache_path(legacy_id)
+            try:
+                old = json.loads(cache_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                raise ChatGPTWebError("Older cached chat not found") from error
+            if not isinstance(old, dict) or old.get("gizmo_id") == load_preferences().get("project_id"):
+                raise ChatGPTWebError("Invalid older cached chat")
+            return {
+                "id": None, "server_id": None, "legacy": True,
+                "title": (old.get("title") or "Older chat") + " (read-only source)",
+                "messages": old.get("messages", []),
+            }
+        snapshot = local_history.by_server(selected_id)
+        if snapshot is not None:
+            return {
+                "id": selected_id, "server_id": selected_id,
+                "local_session_id": snapshot["session_id"],
+                "title": snapshot.get("title"),
+                "messages": snapshot.get("messages", []),
+                "last_image": snapshot.get("last_image"),
+            }
+        try:
+            ensure_service()
+            raw = daemon_request(socket_path, {
+                "command": "show_normalized", "conversation_id": selected_id,
+            }).get("conversation", {})
+            if isinstance(raw, dict):
+                cache_conversation(raw)
+                return raw
+        except (ChatGPTWebError, OSError):
+            cached = load_cached_conversation(selected_id)
+            if cached is not None:
+                cached["offline"] = True
+                return cached
+            raise
+        raise ChatGPTWebError("Conversation could not be loaded")
 
     def send(
         selected_id: str | None,
@@ -1352,6 +1442,17 @@ def run_fullscreen(
         ensure_service()
         return daemon_request(socket_path, {"command": "usage"})
 
+    local_active = local_history.active()
+    if local_active is not None and (conversation_id is None or
+                                    local_active.get("server_id") == conversation_id):
+        cached_conversation = {
+            "id": local_active.get("server_id"),
+            "title": local_active.get("title"),
+            "messages": local_active.get("messages", []),
+            "model": load_preferences().get("model"),
+            "local_session_id": local_active["session_id"],
+            "last_image": local_active.get("last_image"),
+        }
     cached_id = cached_conversation.get("id") if cached_conversation else None
     cached_messages = cached_conversation.get("messages") if cached_conversation else None
     if isinstance(cached_id, str) and cached_id:
@@ -1374,6 +1475,8 @@ def run_fullscreen(
         list_models=models,
         select_model=select_model,
         get_usage=get_usage,
+        local_session_id=(cached_conversation or {}).get("local_session_id"),
+        last_image=(cached_conversation or {}).get("last_image"),
     )
     return 0
 
