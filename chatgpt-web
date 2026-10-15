@@ -31,6 +31,10 @@ from typing import Any, Iterable
 from urllib.parse import urljoin, urlsplit
 
 import httpx
+from cli_preferences import (
+    PROJECT_NAME, PROJECT_ID_RE, MODEL_RE, load_preferences, save_preferences,
+    parse_projects, parse_models, web_usage_status,
+)
 
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
@@ -137,7 +141,13 @@ def load_cached_conversation(conversation_id: str | None = None) -> dict[str, An
         value = json.loads(conversation_cache_path(conversation_id).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    return value if isinstance(value, dict) else None
+    if not isinstance(value, dict):
+        return None
+    selected_project = load_preferences().get("project_id")
+    if (not PROJECT_ID_RE.fullmatch(str(selected_project)) or
+            value.get("gizmo_id") != selected_project):
+        return None
+    return value
 
 
 def rename_cached_conversation(conversation_id: str, title: str) -> None:
@@ -343,6 +353,94 @@ class ChatGPTWebClient:
     def verify(self) -> dict[str, Any]:
         return self.request("GET", self.list_url).json()
 
+    def target_project_id(self) -> str:
+        """Resolve the exact CLI Project; refuse ambiguous or missing projects."""
+        pinned = load_preferences().get("project_id")
+        saved = getattr(self, "_cli_project_cache", None)
+        if saved is not None and saved[1] > time.monotonic() and (
+            pinned is None or pinned == saved[0]
+        ):
+            return saved[0]
+        response = self.request(
+            "GET", urljoin(CHATGPT_ORIGIN, "/backend-api/gizmos/snorlax/sidebar"),
+            params={"owned_only": "true", "conversations_per_gizmo": 0},
+        ).json()
+        try:
+            projects = parse_projects(response)
+        except ValueError as error:
+            raise ChatGPTWebError(str(error)) from error
+        if len(projects) != 1:
+            raise ChatGPTWebError(
+                f'Expected exactly one ChatGPT Project named "{PROJECT_NAME}", '
+                f'found {len(projects)}. New chats are blocked to avoid clutter.'
+            )
+        project_id = projects[0]["id"]
+        pinned = load_preferences().get("project_id")
+        if pinned is not None and pinned != project_id:
+            raise ChatGPTWebError("Configured CLI Project differs from the account's Project; refusing to send")
+        if pinned is None:
+            save_preferences(project_id=project_id)
+        self._cli_project_cache = (project_id, time.monotonic() + 300)
+        return project_id
+
+    def available_models(self) -> list[dict[str, str]]:
+        try:
+            models = parse_models(self.request(
+                "GET", urljoin(CHATGPT_ORIGIN, "/backend-api/models"),
+            ).json())
+        except ValueError as error:
+            raise ChatGPTWebError(str(error)) from error
+        if not models:
+            raise ChatGPTWebError("No selectable ChatGPT models were reported")
+        return models
+
+    def model_status(self) -> dict[str, Any]:
+        models = self.available_models()
+        selected = load_preferences().get("model")
+        if selected is not None and selected not in {row["slug"] for row in models}:
+            raise ChatGPTWebError("Saved model is no longer selectable; run /model to choose another")
+        default = "gpt-6" if any(row["slug"] == "gpt-6" for row in models) else models[0]["slug"]
+        return {"selected": selected or default, "models": models}
+
+    def set_model(self, slug: str) -> dict[str, Any]:
+        if not MODEL_RE.fullmatch(slug):
+            raise ChatGPTWebError("Invalid model identifier")
+        models = self.available_models()
+        matched = next((item for item in models if item["slug"] == slug), None)
+        if matched is None:
+            raise ChatGPTWebError("Model isn't currently listed as selectable on your account")
+        save_preferences(model=slug)
+        return {"selected": slug, "title": matched["title"]}
+
+    def list_project_conversations(self, maximum: int | None = 50) -> list[dict[str, Any]]:
+        project_id = self.target_project_id()
+        rows: list[dict[str, Any]] = []
+        cursor = "0"
+        visited = set()
+        while cursor and cursor not in visited:
+            visited.add(cursor)
+            response = self.request(
+                "GET", urljoin(CHATGPT_ORIGIN, f"/backend-api/gizmos/{project_id}/conversations"),
+                params={"cursor": cursor},
+            ).json()
+            if not isinstance(response, dict) or not isinstance(response.get("items"), list):
+                raise ChatGPTWebError("ChatGPT Project conversation listing is invalid")
+            for row in response["items"]:
+                if isinstance(row, dict) and row.get("gizmo_id") == project_id:
+                    rows.append(row)
+            if maximum is not None and len(rows) >= maximum:
+                return rows[:maximum]
+            next_cursor = response.get("cursor")
+            cursor = next_cursor if isinstance(next_cursor, str) and next_cursor else ""
+        return rows
+
+    def usage_status(self) -> dict[str, Any]:
+        """Only expose ordinary-chat usage data, never Codex rates mislabeled as Web."""
+        value = web_usage_status()
+        value["selected_model"] = load_preferences().get("model") or "gpt-6"
+        value["project"] = PROJECT_NAME
+        return value
+
     def list_conversations(self, maximum: int | None) -> list[dict[str, Any]]:
         offset = 0
         conversations: list[dict[str, Any]] = []
@@ -403,10 +501,15 @@ class ChatGPTWebClient:
     ) -> tuple[str, dict[str, Any], set[str]]:
         if attachments and os.environ.get("CHATGPT_WEB_SEND_MODE", "node") != "node":
             raise ChatGPTWebError("image attachments require the direct node send mode")
+        if os.environ.get("CHATGPT_WEB_SEND_MODE", "node") == "chrome":
+            raise ChatGPTWebError("Browser send mode cannot guarantee CLI Project routing; use the default direct mode")
+        project_id = self.target_project_id()
         previous_ids: set[str] = set()
         previous: dict[str, Any] | None = None
         if conversation_id:
             previous = self.get_conversation(conversation_id)
+            if previous.get("gizmo_id") != project_id:
+                raise ChatGPTWebError("This conversation is outside the CLI Project; /new starts a Project chat")
             previous_messages = previous.get("messages", [])
             if isinstance(previous_messages, list):
                 previous_ids = {
@@ -419,6 +522,20 @@ class ChatGPTWebClient:
                 previous, prompt, attachments or [], on_event
             )
             conversation = self.get_conversation(resolved_id)
+            if conversation.get("gizmo_id") != project_id:
+                if conversation_id is None:
+                    # Only delete the new, incorrectly routed chat created by this request.
+                    try:
+                        self.request(
+                            "DELETE",
+                            urljoin(CHATGPT_ORIGIN, f"/backend-api/conversation/{resolved_id}"),
+                        )
+                    except (ChatGPTWebError, httpx.HTTPError):
+                        pass
+                raise ChatGPTWebError(
+                    "ChatGPT did not confirm CLI Project ownership; response blocked. "
+                    "Any misrouted new conversation was queued for cleanup."
+                )
             messages = conversation.get("messages", [])
             attached = isinstance(messages, list) and any(
                 isinstance(message, dict) and message.get("id") == submitted_message_id
@@ -523,6 +640,10 @@ class ChatGPTWebClient:
                     conversation, prompt, attachments
                 )
 
+        project_id = self.target_project_id()
+        body["conversation_mode"] = {"kind": "gizmo_interaction", "gizmo_id": project_id}
+        body["gizmo_id"] = project_id
+        body["conversation_template_id"] = project_id
         headers.pop("x-openai-web-sse-compression", None)
         headers["x-openai-target-path"] = "/backend-api/f/conversation"
         headers["x-openai-target-route"] = "/backend-api/f/conversation"
@@ -667,7 +788,7 @@ class ChatGPTWebClient:
         now = datetime.now().astimezone()
         offset = now.utcoffset()
         offset_minutes = -int(offset.total_seconds() / 60) if offset else 0
-        model = os.environ.get("CHATGPT_WEB_MODEL")
+        model = load_preferences().get("model") or os.environ.get("CHATGPT_WEB_MODEL")
         if not model and conversation:
             candidate = conversation.get("default_model_slug")
             if isinstance(candidate, str) and candidate:
@@ -725,11 +846,11 @@ class ChatGPTWebClient:
                 },
             }],
             "parent_message_id": parent,
-            "model": model or "gpt-5-6-thinking",
+            "model": model or "gpt-6",
             "client_prepare_state": "sent",
             "timezone_offset_min": offset_minutes,
             "timezone": os.environ.get("TZ", "Europe/Lisbon"),
-            "conversation_mode": {"kind": "primary_assistant"},
+            "conversation_mode": {"kind": "gizmo_interaction", "gizmo_id": self.target_project_id()},
             "enable_message_followups": True,
             "system_hints": [],
             "supports_buffering": False,
@@ -739,6 +860,8 @@ class ChatGPTWebClient:
             "thinking_effort": "extended",
             "local_function_names": ["local.continue_in_work"],
         }
+        body["gizmo_id"] = self.target_project_id()
+        body["conversation_template_id"] = body["gizmo_id"]
         if conversation:
             conversation_id = conversation.get("conversation_id") or conversation.get("id")
             if isinstance(conversation_id, str) and conversation_id:
@@ -887,6 +1010,7 @@ def normalize_conversation(conversation: dict[str, Any]) -> dict[str, Any]:
         "update_time": conversation.get("update_time"),
         "current_node": conversation.get("current_node"),
         "model": conversation.get("default_model_slug"),
+        "gizmo_id": conversation.get("gizmo_id"),
         "messages": [normalize_message(item) for item in messages if isinstance(item, dict)],
         "page_info": conversation.get("page_info"),
     }
@@ -1210,6 +1334,18 @@ def run_fullscreen(
         })
         rename_cached_conversation(selected_id, new_title)
 
+    def models() -> dict[str, Any]:
+        ensure_service()
+        return daemon_request(socket_path, {"command": "models"})
+
+    def select_model(slug: str) -> dict[str, Any]:
+        ensure_service()
+        return daemon_request(socket_path, {"command": "set_model", "model": slug})
+
+    def get_usage() -> dict[str, Any]:
+        ensure_service()
+        return daemon_request(socket_path, {"command": "usage"})
+
     cached_id = cached_conversation.get("id") if cached_conversation else None
     cached_messages = cached_conversation.get("messages") if cached_conversation else None
     if isinstance(cached_id, str) and cached_id:
@@ -1223,10 +1359,15 @@ def run_fullscreen(
               if cached_conversation else
               ("Loading conversation" if conversation_id else "New conversation"),
         initial_messages=cached_messages if isinstance(cached_messages, list) else None,
-        model=cached_conversation.get("model") if cached_conversation else None,
+        model=load_preferences().get("model") or (
+            cached_conversation.get("model") if cached_conversation else None
+        ),
         upload_image=upload_image,
         rename_conversation=rename,
         set_active_conversation=set_active_conversation,
+        list_models=models,
+        select_model=select_model,
+        get_usage=get_usage,
     )
     return 0
 
@@ -1447,21 +1588,37 @@ def handle_daemon_command(
             "send_mode": os.environ.get("CHATGPT_WEB_SEND_MODE", "node"),
             "sentinel_cache": sentinel_cache_status(),
         }, False
+    if command == "project":
+        return {"project": PROJECT_NAME, "project_id": client.target_project_id()}, False
+    if command == "models":
+        return client.model_status(), False
+    if command == "set_model":
+        slug = request.get("model")
+        if not isinstance(slug, str):
+            raise ChatGPTWebError("Model slug is required")
+        return client.set_model(slug), False
+    if command == "usage":
+        return client.usage_status(), False
     if command == "list":
         maximum = request.get("maximum")
         if maximum is not None and (not isinstance(maximum, int) or maximum < 1):
             raise ChatGPTWebError("invalid conversation limit")
-        return {"items": client.list_conversations(maximum)}, False
+        return {"items": client.list_project_conversations(maximum)}, False
     if command == "show":
         conversation_id = request.get("conversation_id")
         if not isinstance(conversation_id, str) or not conversation_id:
             raise ChatGPTWebError("conversation ID is required")
-        return {"conversation": client.get_conversation(conversation_id)}, False
+        conversation = client.get_conversation(conversation_id)
+        if conversation.get("gizmo_id") != client.target_project_id():
+            raise ChatGPTWebError("This conversation is outside the CLI Project")
+        return {"conversation": conversation}, False
     if command == "show_normalized":
         conversation_id = request.get("conversation_id")
         if not isinstance(conversation_id, str) or not conversation_id:
             raise ChatGPTWebError("conversation ID is required")
         conversation = client.get_conversation(conversation_id)
+        if conversation.get("gizmo_id") != client.target_project_id():
+            raise ChatGPTWebError("This conversation is outside the CLI Project")
         return {"conversation": cache_conversation(conversation)}, False
     if command == "rename":
         conversation_id = request.get("conversation_id")
@@ -1473,6 +1630,8 @@ def handle_daemon_command(
         title = title.strip()
         if len(title) > 256:
             raise ChatGPTWebError("conversation title must be 256 characters or fewer")
+        if client.get_conversation(conversation_id).get("gizmo_id") != client.target_project_id():
+            raise ChatGPTWebError("This conversation is outside the CLI Project")
         client.rename_conversation(conversation_id, title)
         return {"conversation_id": conversation_id, "title": title}, False
     if command == "send":
@@ -1675,6 +1834,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     daemon_parser.add_argument("--socket", dest="daemon_socket", type=Path)
     commands.add_parser("status", help="show daemon, session, and browser state")
+    commands.add_parser("usage", help="show the honest ChatGPT Web quota status")
+    model_parser = commands.add_parser("model", help="list models or select one")
+    model_parser.add_argument("slug", nargs="?")
+    commands.add_parser("project", help="show the enforced CLI Project")
     commands.add_parser("stop", help="stop the background daemon")
     commands.add_parser("logout", help="stop the daemon and delete saved credentials")
     return parser
@@ -1741,6 +1904,13 @@ def main() -> int:
         elif args.command == "status":
             result = daemon_request(args.socket, {"command": "status"})
             print(json.dumps(result, separators=(",", ":")))
+        elif args.command == "project":
+            print(json.dumps(daemon_request(args.socket, {"command": "project"}), ensure_ascii=False))
+        elif args.command == "usage":
+            print(json.dumps(daemon_request(args.socket, {"command": "usage"}), ensure_ascii=False, indent=2))
+        elif args.command == "model":
+            request = {"command": "set_model", "model": args.slug} if args.slug else {"command": "models"}
+            print(json.dumps(daemon_request(args.socket, request), ensure_ascii=False, indent=2))
         elif args.command == "list":
             if args.limit is not None and args.limit < 1:
                 raise ChatGPTWebError("--limit must be greater than zero")

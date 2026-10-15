@@ -21,6 +21,27 @@ class TuiTests(unittest.TestCase):
         self.assertIsInstance(tui.app.layout.container, HSplit)
         self.assertEqual(tui.resume_list_window.height.preferred, 7)
 
+    def test_model_panel_is_inline(self):
+        tui = self.make_tui()
+        self.assertIsInstance(tui.app.layout.container, HSplit)
+        self.assertEqual(tui.model_list_window.height.preferred, 7)
+
+    def test_model_selector_filters_by_slug_and_title(self):
+        tui = self.make_tui()
+        tui.model_items = [
+            {"slug":"gpt-6", "title":"GPT-6"},
+            {"slug":"gpt-5-6-thinking", "title":"GPT-5.6 Sol"},
+        ]
+        tui.model_search.text = "thinking"
+        tui.filter_models()
+        self.assertEqual([item["slug"] for item in tui.model_filtered], ["gpt-5-6-thinking"])
+
+    def test_usage_command_is_exposed(self):
+        from chatgpt_tui import SlashCommandCompleter
+        names = [item[0] for item in SlashCommandCompleter.COMMANDS]
+        self.assertIn("/model", names)
+        self.assertIn("/usage", names)
+
     def test_commands_show_image_actions(self):
         tui = self.make_tui()
         tui.input.text = "/im"

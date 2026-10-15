@@ -69,10 +69,18 @@ def prepare_image_command(
     if destination.suffix.lower() not in allowed_extensions:
         raise ValueError(f"Output must have one of: {', '.join(sorted(allowed_extensions))}")
 
+    # Keep browser-backed media inside the same CLI Project as chat.
+    # When Chrome automation is unavailable, Codex can render without adding
+    # a ChatGPT Web conversation to the top-level chat history.
+    resolved_backend = backend
+    if backend == "auto":
+        resolved_backend = "web" if shutil.which("chrome-use") else "codex"
     command = [executable]
     if action == "animate":
         command.append("animate")
-    command += [prompt, "--backend", backend, "--out", str(destination), "--no-progress"]
+    command += [prompt, "--backend", resolved_backend, "--out", str(destination), "--no-progress"]
+    if resolved_backend == "web":
+        command += ["--project", "CLI", "--require-project"]
     if action == "edit":
         command += ["--ref", str(ref_path)]
     return command, destination

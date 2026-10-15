@@ -250,3 +250,48 @@ image-use doctor
 
 The original upstream repository currently does not list a software license;
 review redistribution permissions before packaging this fork elsewhere.
+
+### Model selection and CLI Project isolation
+
+All newly created chats (interactive or scripted) are routed to the ChatGPT
+Project named **CLI**. Project resolution uses the authenticated account's
+Project listing and requires exactly one exact-name match. A new chat must
+also be confirmed as belonging to that Project after submission; if the
+server returns another parent, the request fails and the client attempts
+to delete only that newly created, misrouted chat. Resuming or sending to
+existing chats outside the CLI Project is blocked. There is deliberately
+no silent fallback to the top-level chat history. Earlier chats are not moved.
+
+Project and model selections are stored privately under
+~/.config/chatgpt-web/settings.json (mode 0600), never in the git repository.
+The UI shows the selected model and CLI Project.
+
+Interactive commands:
+
+- /model opens the compact inline model picker (search, arrows, Enter, Esc).
+- /model gpt-6-thinking changes and persists the selected model.
+- /usage explains the available ChatGPT Web quota information.
+
+Scripted commands:
+
+~~~bash
+chatgpt-web project
+chatgpt-web model
+chatgpt-web model gpt-6-thinking
+chatgpt-web usage
+chatgpt-web list
+chatgpt-web new "Hello from the CLI Project"
+~~~
+
+The model picker reads the current model catalog from your signed-in ChatGPT
+account; eligibility, output quality, and model availability are controlled
+by ChatGPT. ChatGPT Web does not expose a reliable numeric remaining-message
+counter to this client. The Codex/Work quota endpoint is a **different**
+allowance and is not mislabeled as regular Web usage. The usage command
+returns null rather than inventing a remaining amount.
+
+For image-use: browser-backed image conversations use the CLI Project with
+strict project verification (no fallback to the ordinary chat list).
+When chrome-use is absent, the auto backend uses Codex image generation,
+which does not create a regular ChatGPT Web conversation but consumes Codex
+usage. To require the web-based image workflow use the web backend explicitly.

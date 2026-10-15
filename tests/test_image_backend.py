@@ -8,6 +8,19 @@ from image_backend import prepare_image_command, generate_image
 
 
 class ImageBackendTests(unittest.TestCase):
+    def test_explicit_web_enforces_cli_project(self):
+        with patch("image_backend.shutil.which", return_value="/usr/bin/image-use"):
+            argv, _ = prepare_image_command("generate", "cat", backend="web")
+        self.assertIn("--require-project", argv)
+        self.assertEqual(argv[argv.index("--project")+1], "CLI")
+
+    def test_auto_uses_codex_when_web_bridge_missing(self):
+        def executable(name):
+            return "/usr/bin/image-use" if name == "image-use" else None
+        with patch("image_backend.shutil.which", side_effect=executable):
+            argv, _ = prepare_image_command("generate", "cat")
+        self.assertEqual(argv[argv.index("--backend")+1], "codex")
+
     def test_generate_builds_safe_argument_array(self):
         with patch("image_backend.shutil.which", return_value="/usr/bin/image-use"):
             argv, path = prepare_image_command("generate", "A cat; rm -rf /", backend="codex")

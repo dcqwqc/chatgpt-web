@@ -175,7 +175,9 @@ class PromptMarkdown:
 class SlashCommandCompleter(Completer):
     COMMANDS = (
         ("/new", "start a new conversation"),
-        ("/resume", "search recent conversations"),
+        ("/resume", "search CLI Project conversations"),
+        ("/model", "select from available ChatGPT models"),
+        ("/usage", "view current ChatGPT Web usage status"),
         ("/history", "reload this conversation"),
         ("/rename", "rename this conversation"),
         ("/copy", "copy the latest response"),
@@ -323,6 +325,9 @@ class ChatTui:
         upload_image: UploadImage | None = None,
         rename_conversation: RenameConversation | None = None,
         set_active_conversation: SetActiveConversation | None = None,
+        list_models: Callable[[], dict[str, Any]] | None = None,
+        select_model: Callable[[str], dict[str, Any]] | None = None,
+        get_usage: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self.list_conversations = list_conversations
         self.load_conversation = load_conversation
@@ -330,9 +335,12 @@ class ChatTui:
         self.upload_image = upload_image
         self.rename_conversation = rename_conversation
         self.set_active_conversation = set_active_conversation
+        self.list_models = list_models
+        self.select_model = select_model
+        self.get_usage = get_usage
         self.conversation_id = conversation_id
         self.title = title
-        self.model = model or os.environ.get("CHATGPT_WEB_MODEL", "gpt-5-6-thinking")
+        self.model = model or os.environ.get("CHATGPT_WEB_MODEL", "gpt-6")
         self.messages: list[Message] = []
         for message in initial_messages or []:
             visible = visible_chat_message(message)
@@ -358,8 +366,15 @@ class ChatTui:
         self.resume_filtered: list[dict[str, Any]] = []
         self.resume_index = 0
         self.resume_filter = Condition(lambda: self.resume_visible)
+        self.model_visible = False
+        self.model_loading = False
+        self.model_items: list[dict[str, str]] = []
+        self.model_filtered: list[dict[str, str]] = []
+        self.model_index = 0
+        self.model_error: str | None = None
+        self.model_filter = Condition(lambda: self.model_visible)
         self.commands_filter = Condition(
-            lambda: not self.resume_visible and self.input.text.startswith("/")
+            lambda: not self.resume_visible and not self.model_visible and self.input.text.startswith("/")
             and '\n' not in self.input.text
         )
         self.follow_output = True
@@ -406,6 +421,13 @@ class ChatTui:
             style="class:picker.search",
         )
         self.resume_search.buffer.on_text_changed += lambda _buffer: self.filter_resume()
+        self.model_search = TextArea(height=1, multiline=False, prompt="  Filter  ", style="class:picker.search")
+        self.model_search.buffer.on_text_changed += lambda _buffer: self.filter_models()
+        self.model_list_window = Window(
+            content=FormattedTextControl(self.render_model_list, focusable=True),
+            wrap_lines=False, always_hide_cursor=True, height=D.exact(7),
+            style="class:picker.list",
+        )
         self.resume_list_control = FormattedTextControl(
             text=self.render_resume_list,
             focusable=True,
@@ -449,6 +471,19 @@ class ChatTui:
             ]),
             filter=self.resume_filter,
         )
+        model_picker = ConditionalContainer(
+            content=HSplit([
+                Window(content=FormattedTextControl([
+                    ("class:picker.title", "  SELECT CHATGPT MODEL"),
+                    ("class:picker.hint", "    Filter · ↑ ↓ · Enter · Esc")]),
+                    height=1, style="class:picker.header"),
+                self.model_search,
+                self.model_list_window,
+                Window(content=FormattedTextControl("  Enter  select    Esc  close"),
+                       height=1, style="class:picker.help"),
+            ]),
+            filter=self.model_filter,
+        )
         root = HSplit(
             [
                 self.transcript_window,
@@ -461,6 +496,7 @@ class ChatTui:
                 self.input,
                 command_hints,
                 resume_picker,
+                model_picker,
                 Window(height=1, char=" ", style="class:composer"),
                 Window(
                     height=1,
@@ -574,7 +610,7 @@ class ChatTui:
         return FormattedText([
             ("class:metadata.model", f" {self.model} "),
             ("class:metadata.ready", f"{state} "),
-            ("class:metadata", f"· {title} · {cwd} "),
+            ("class:metadata", f"· CLI Project · {title} · {cwd} "),
         ])
 
     def render_transcript(self) -> str:
@@ -860,6 +896,114 @@ class ChatTui:
             fragments.append(("class:resume.time", f"{stamp}\n"))
         return FormattedText(fragments)
 
+    def render_model_list(self) -> FormattedText:
+        if self.model_loading:
+            return FormattedText([("class:resume.time", "  Loading your models…")])
+        if self.model_error:
+            return FormattedText([("class:resume.time", f"  Failed: {self.model_error[:80]}")])
+        if not self.model_filtered:
+            return FormattedText([("class:resume.time", "  No matching models")])
+        fragments: list[tuple[str, str]] = []
+        for index, item in enumerate(self.model_filtered):
+            marker = "›" if index == self.model_index else " "
+            style = "class:resume.selected" if index == self.model_index else "class:resume.item"
+            fragments.append((style, f"  {marker} {item['slug'][:24]:<24} {item['title'][:28]}" + chr(10)))
+        return FormattedText(fragments)
+
+    def filter_models(self) -> None:
+        query = self.model_search.text.strip().casefold()
+        self.model_filtered = [
+            model for model in self.model_items
+            if query in model["slug"].casefold() or query in model["title"].casefold()
+        ]
+        self.model_index = min(self.model_index, max(0, len(self.model_filtered)-1))
+        if hasattr(self, "app"): self.app.invalidate()
+
+    def open_models(self) -> None:
+        if self.busy or self.model_visible or self.resume_visible:
+            return
+        if self.list_models is None:
+            self.status = "Model selection unavailable"
+            self.app.invalidate()
+            return
+        self.model_visible = True
+        self.model_loading = True
+        self.model_error = None
+        self.model_items = []
+        self.model_filtered = []
+        self.model_index = 0
+        self.model_search.text = ""
+        self.app.layout.focus(self.model_search)
+        self.app.invalidate()
+
+        def fetch() -> None:
+            try:
+                status = self.list_models()
+                self.model_items = status.get("models", [])
+                self.model = status.get("selected") or self.model
+                self.filter_models()
+            except Exception as error:
+                self.model_error = str(error)
+            finally:
+                self.model_loading = False
+                self.app.invalidate()
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def close_models(self) -> None:
+        self.model_visible = False
+        self.app.layout.focus(self.input)
+        self.app.invalidate()
+
+    def choose_model(self) -> None:
+        if self.model_loading or not self.model_filtered:
+            return
+        slug = self.model_filtered[self.model_index]["slug"]
+        self.close_models()
+        self.change_model(slug)
+
+    def change_model(self, slug: str) -> None:
+        if self.select_model is None:
+            self.status = "Model selection unavailable"
+            self.app.invalidate()
+            return
+        self.status = "Switching ChatGPT model…"
+        self.app.invalidate()
+        def worker() -> None:
+            try:
+                result = self.select_model(slug)
+                self.model = result["selected"]
+                self.status = f"Model: {self.model}"
+            except Exception as error:
+                self.status = f"Model selection failed: {error}"
+            self.app.invalidate()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def display_usage(self) -> None:
+        if self.get_usage is None:
+            self.status = "Usage information unavailable"
+            self.app.invalidate()
+            return
+        self.status = "Checking ChatGPT Web usage…"
+        self.app.invalidate()
+        def worker() -> None:
+            try:
+                usage = self.get_usage()
+                remaining = usage.get("remaining_messages")
+                if remaining is None:
+                    self.append_system(
+                        "**ChatGPT Web usage**" + chr(10)*2 +
+                        "Exact remaining messages: **not exposed by ChatGPT Web**." + chr(10)*2 +
+                        "Codex/Work usage is a separate allowance, not a ChatGPT Web balance. "
+                        "Check the ChatGPT model picker for visible restrictions."
+                    )
+                else:
+                    self.append_system(f"**Web messages remaining:** {remaining}")
+                self.status = "Usage checked"
+            except Exception as error:
+                self.status = f"Usage check failed: {error}"
+            self.app.invalidate()
+        threading.Thread(target=worker, daemon=True).start()
+
     def render_command_hints(self) -> FormattedText:
         query = self.input.text.strip().casefold()
         matches = [
@@ -948,6 +1092,28 @@ class ChatTui:
         @bindings.add("c-v", eager=True)
         def paste_image(_event: Any) -> None:
             self.paste_clipboard_image()
+
+        @bindings.add("up", filter=self.model_filter, eager=True)
+        def model_up(_event: Any) -> None:
+            if self.model_filtered:
+                self.model_index = max(0, self.model_index - 1)
+                self.model_list_window.vertical_scroll = max(0, self.model_index - 2)
+                self.app.invalidate()
+
+        @bindings.add("down", filter=self.model_filter, eager=True)
+        def model_down(_event: Any) -> None:
+            if self.model_filtered:
+                self.model_index = min(len(self.model_filtered) - 1, self.model_index + 1)
+                self.model_list_window.vertical_scroll = max(0, self.model_index - 2)
+                self.app.invalidate()
+
+        @bindings.add("enter", filter=self.model_filter, eager=True)
+        def model_choose(_event: Any) -> None:
+            self.choose_model()
+
+        @bindings.add("escape", filter=self.model_filter, eager=True)
+        def model_close(_event: Any) -> None:
+            self.close_models()
 
         @bindings.add("up", filter=self.resume_filter, eager=True)
         def resume_up(_event: Any) -> None:
@@ -1085,6 +1251,13 @@ class ChatTui:
                 self.history_tail = ""
             self.status = "Transcript cleared"
             self.scroll_bottom()
+        elif name == "/model":
+            if argument.strip():
+                self.change_model(argument.strip())
+            else:
+                self.open_models()
+        elif name == "/usage":
+            self.display_usage()
         elif name == "/resume":
             if argument.strip():
                 self.resume_conversation(argument.strip())
@@ -1503,6 +1676,9 @@ def run_tui(
     upload_image: UploadImage | None = None,
     rename_conversation: RenameConversation | None = None,
     set_active_conversation: SetActiveConversation | None = None,
+    list_models: Callable[[], dict[str, Any]] | None = None,
+    select_model: Callable[[str], dict[str, Any]] | None = None,
+    get_usage: Callable[[], dict[str, Any]] | None = None,
 ) -> None:
     ChatTui(
         list_conversations,
@@ -1515,4 +1691,7 @@ def run_tui(
         upload_image,
         rename_conversation,
         set_active_conversation,
+        list_models,
+        select_model,
+        get_usage,
     ).run()
