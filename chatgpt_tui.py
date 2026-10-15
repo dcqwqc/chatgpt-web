@@ -43,6 +43,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 from image_preview import render_preview
 from terminal_native import supports_native, render_native
+from kitty_placeholders import prepare_virtual_image, placeholder_rows, id_to_rgb
 from rich.theme import Theme
 
 
@@ -382,7 +383,13 @@ class ChatTui:
              if m["role"] == "image" and Path(m["text"]).expanduser().is_file()),
             None
         )
-        self.native_image_preview = supports_native()
+        self.native_image_preview = (
+            supports_native()
+            and os.environ.get("CHATGPT_WEB_IMAGE_MODE", "native").lower()
+                not in ("ansi", "blocks", "off", "fallback")
+        )
+        self.virtual_image_registry: dict[str, tuple[int, int, int]] = {}
+        self.virtual_image_lock = threading.RLock()
         self.uploading_image = False
         self.upload_started: float | None = None
         self.pending_attachments: list[dict[str, Any]] = []
@@ -778,6 +785,7 @@ class ChatTui:
 
         def replay() -> None:
             self.reset_terminal_session()
+            self.reload_virtual_placements(completed)
             self.write_terminal_history(committed)
 
         future = run_in_terminal(replay, render_cli_done=False)
@@ -870,6 +878,7 @@ class ChatTui:
         def schedule_write() -> None:
             def replay() -> None:
                 self.reset_terminal_session()
+                self.reload_virtual_placements(messages)
                 self.write_terminal_history(committed)
 
             future = run_in_terminal(
@@ -923,6 +932,38 @@ class ChatTui:
             self.formatted_transcript = ANSI(rendered)
         return self.formatted_transcript
 
+    def reload_virtual_placements(self, messages: list[Message]) -> None:
+        """After a terminal screen clear, repopulate its image registry."""
+        if not self.native_image_preview or not sys.stdout.isatty():
+            return
+        self.virtual_image_registry.clear()
+        for message in messages:
+            if message.get("role") != "image":
+                continue
+            try:
+                self.register_virtual_image(str(message["text"]), self.transcript_width())
+            except (OSError, ValueError, RuntimeError):
+                continue
+
+    def register_virtual_image(self, path: str, width: int) -> tuple[int, int, int]:
+        """Upload pixel data as a virtual placement (no cursor movement).
+
+        Kitty/Ghostty use the colored Unicode cells to position this image.
+        The cells themselves survive prompt_toolkit and scrollback redraws.
+        """
+        source = Path(path).expanduser().resolve()
+        identifier, columns, rows, packets = prepare_virtual_image(source, width)
+        key = str(source)
+        current = (identifier, columns, rows)
+        with self.virtual_image_lock:
+            if self.virtual_image_registry.get(key) != current:
+                output = sys.stdout.buffer
+                for packet in packets:
+                    output.write(packet)
+                output.flush()
+                self.virtual_image_registry[key] = current
+        return current
+
     def render_message(
         self,
         role: str,
@@ -958,18 +999,51 @@ class ChatTui:
             )
             console.print(Padding(content, (0, 2), style="#f2f0ec on #151413", expand=True))
         elif role == "image":
-            from rich.text import Text as RichText
-            try:
-                preview = render_preview(text,
-                    max_columns=max(10, min(88, width - 7)),
-                    max_rows=26)
-                console.print(Padding(
-                    RichText.from_ansi(preview), (0, 2),
-                    style="#f2f0ec on #151413", expand=True,
-                ))
-            except (OSError, ValueError, ImportError) as error:
+            source = Path(text).expanduser()
+            path = source.resolve()
+            # Prefer full-pixel Kitty images in Ghostty/Kitty. ANSI half-blocks
+            # are the cross-terminal fallback, not the default on Mirai.
+            displayed_native = False
+            if self.native_image_preview and sys.stdout.isatty():
+                try:
+                    image_id, columns, rows = self.register_virtual_image(str(path), width)
+                    red, green, blue = id_to_rgb(image_id)
+                    color = f"#{red:02x}{green:02x}{blue:02x} on #151413"
+                    for unicode_row in placeholder_rows(image_id, columns, rows):
+                        console.print(Padding(
+                            Text(unicode_row, style=color, no_wrap=True),
+                            (0, 2), expand=True,
+                            style="#f2f0ec on #151413",
+                        ))
+                    displayed_native = True
+                except (OSError, ValueError, RuntimeError) as error:
+                    console.print(Text(
+                        f"  Native image unavailable ({error}); showing fallback",
+                        style="#c4a7e7",
+                    ))
+            if not displayed_native:
+                try:
+                    preview = render_preview(str(path),
+                        max_columns=max(10, min(88, width - 7)),
+                        max_rows=26)
+                    console.print(Padding(
+                        Text.from_ansi(preview), (0, 2),
+                        style="#f2f0ec on #151413", expand=True,
+                    ))
+                except (OSError, ValueError, ImportError) as error:
+                    console.print(Padding(Text(
+                        f"Image preview unavailable: {error}", style="#c4a7e7"
+                    ), (0, 2), style="#f2f0ec on #151413", expand=True))
+            # This explicit path is always present—even if the terminal cannot
+            # render a preview or the original image was generated via chat.
+            if path.is_file():
+                caption = Text()
+                caption.append("  Saved original: ", style="#bfb8c9")
+                caption.append(path.as_uri(), style="underline #c4a7e7")
+                console.print(Padding(caption, (0, 2),
+                    style="#f2f0ec on #151413", expand=True))
                 console.print(Padding(Text(
-                    f"Preview unavailable: {error}", style="#c4a7e7"
+                    "  Open full resolution with /open", style="#c4a7e7"
                 ), (0, 2), style="#f2f0ec on #151413", expand=True))
         else:
             console.print(Padding(ChatMarkdown(text, code_theme="monokai"),

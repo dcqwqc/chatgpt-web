@@ -416,3 +416,29 @@ the countdown survives a restart without resetting to the original duration.
 There is **no automatic retry** and no polling or artificial rate-limit
 bypass. Retry-After is a temporary request cooldown, not the ChatGPT Web
 subscription usage balance.
+
+### Ghostty/Kitty native HD inline images and saved original links
+
+On a **direct Ghostty or Kitty** terminal, the image renderer now uses the
+Kitty graphics protocol's **virtual placements and Unicode placeholders**
+(`U=1`, `U+10EEEE`, row/column diacritics). This is different from the old
+half-block ANSI preview: real PNG pixel data is uploaded to the terminal, and
+the placement is anchored to ordinary text cells so it stays in the terminal
+layout across redrawing and scrolling. The original image remains unmodified.
+
+Beneath **every** inline image the CLI displays an explicit, selectable
+`file:///...` URI showing exactly where the original was saved, along with
+the `/open` command. The link/path is still displayed if the image preview
+cannot be drawn. Use `/open` to view and zoom into the full-resolution file
+in your desktop image viewer.
+
+If Ghostty is being run inside tmux, over SSH or a terminal without Kitty
+Unicode placeholders, the app conservatively uses the older ANSI fallback.
+For debugging a terminal that claims native support but renders blank cells,
+launch with `CHATGPT_WEB_IMAGE_MODE=ansi chatgpt-web`; the saved file URI and
+`/open` command are available in either mode.
+
+This protocol implementation is tested for the exact image upload packets,
+consistent per-cell foreground color and Unicode diacritics, terminal
+redraw, session reflow, and saved file links. It does not require the image
+to be regenerated or change ChatGPT account usage.
