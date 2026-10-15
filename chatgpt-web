@@ -416,16 +416,27 @@ class ChatGPTWebClient:
         save_preferences(model=slug)
         return {"selected": slug, "title": matched["title"]}
 
-    def list_project_conversations(self, maximum: int | None = 50) -> list[dict[str, Any]]:
-        project_id = self.target_project_id()
+    def list_project_conversations(
+        self, maximum: int | None = 50, *, max_pages: int | None = None,
+        page_timeout: float | None = None,
+    ) -> list[dict[str, Any]]:
+        # A verified, pinned Project ID is sufficient for read-only listings.
+        # Sending still calls target_project_id() and verifies Project ownership.
+        pinned = load_preferences().get("project_id")
+        project_id = (pinned if max_pages is not None
+                      and isinstance(pinned, str) and PROJECT_ID_RE.fullmatch(pinned)
+                      else self.target_project_id())
         rows: list[dict[str, Any]] = []
         cursor = "0"
         visited = set()
         while cursor and cursor not in visited:
+            if max_pages is not None and len(visited) >= max_pages:
+                break
             visited.add(cursor)
             response = self.request(
                 "GET", urljoin(CHATGPT_ORIGIN, f"/backend-api/gizmos/{project_id}/conversations"),
                 params={"cursor": cursor},
+                **({"timeout": page_timeout} if page_timeout is not None else {}),
             ).json()
             if not isinstance(response, dict) or not isinstance(response.get("items"), list):
                 raise ChatGPTWebError("ChatGPT Project conversation listing is invalid")
@@ -1322,21 +1333,41 @@ def run_fullscreen(
                 })
         return items
 
+    def list_recent_cached() -> list[dict[str, Any]]:
+        """Synchronous local-only listing; never contacts Chrome or the daemon."""
+        return local_history.merge_recent(
+            locally_cached_project_items(), legacy=local_legacy_items()
+        )
+
     def list_recent() -> list[dict[str, Any]]:
-        items: list[dict[str, Any]] = []
-        try:
+        """Optional fast remote refresh; cached sessions remain available offline."""
+        # The daemon processes calls sequentially. Limit this discovery request
+        # to its first page so opening the picker cannot starve chat sends.
+        if not socket_path.exists():
             ensure_service()
-            result = daemon_request(socket_path, {
-                "command": "list", "maximum": 100,
-            }).get("items", [])
-            items = result if isinstance(result, list) else []
-        except (ChatGPTWebError, OSError):
-            # Local-only histories remain browsable when web rate-limited.
-            pass
-        seen_ids = {row.get("id") for row in items if isinstance(row, dict)}
-        items.extend(row for row in locally_cached_project_items()
-                     if row.get("id") not in seen_ids)
-        return local_history.merge_recent(items, legacy=local_legacy_items())
+        else:
+            # A ChatGPT send holds the daemon's single worker. If it's busy,
+            # skip the optional listing rather than queue another slow call
+            # behind it. Cached conversations have already been displayed.
+            ready = daemon_request(
+                socket_path, {"command": "ping"}, timeout_seconds=0.6
+            )
+            if ready.get("ready") is not True:
+                raise ChatGPTWebError("Chat daemon is busy; showing cached chats")
+        result = daemon_request(socket_path, {
+            "command": "list", "maximum": 35, "quick": True,
+        }, timeout_seconds=9)
+        online = result.get("items", [])
+        if not isinstance(online, list):
+            raise ChatGPTWebError("ChatGPT returned an invalid conversations list")
+        cached_ids = {row.get("id") for row in online if isinstance(row, dict)}
+        online.extend(
+            row for row in locally_cached_project_items()
+            if row.get("id") not in cached_ids
+        )
+        # Add local-only sessions exactly once via merge_recent(); feeding
+        # their local: IDs in as remote rows would duplicate them.
+        return local_history.merge_recent(online, legacy=local_legacy_items())
 
     def load(selected_id: str) -> dict[str, Any]:
         if selected_id.startswith("local:"):
@@ -1374,6 +1405,11 @@ def run_fullscreen(
                 "messages": snapshot.get("messages", []),
                 "last_image": snapshot.get("last_image"),
             }
+        cached = load_cached_conversation(selected_id)
+        if cached is not None:
+            # Only records already verified as CLI Project chats are eligible.
+            cached["offline"] = True
+            return cached
         try:
             ensure_service()
             raw = daemon_request(socket_path, {
@@ -1463,7 +1499,7 @@ def run_fullscreen(
     if isinstance(cached_id, str) and cached_id:
         set_active_conversation(cached_id)
     run_tui(
-        list_recent,
+        list_recent_cached,
         load,
         send,
         conversation_id=conversation_id or (cached_id if isinstance(cached_id, str) else None),
@@ -1482,6 +1518,7 @@ def run_fullscreen(
         get_usage=get_usage,
         local_session_id=(cached_conversation or {}).get("local_session_id"),
         last_image=(cached_conversation or {}).get("last_image"),
+        refresh_conversations=list_recent,
     )
     return 0
 
@@ -1521,9 +1558,12 @@ def send_json_line(connection: socket.socket, value: dict[str, Any]) -> None:
     ) + "\n").encode("utf-8"))
 
 
-def daemon_request(socket_path: Path, request: dict[str, Any]) -> dict[str, Any]:
+def daemon_request(
+    socket_path: Path, request: dict[str, Any], *,
+    timeout_seconds: float = 120,
+) -> dict[str, Any]:
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    connection.settimeout(120)
+    connection.settimeout(timeout_seconds)
     try:
         connection.connect(str(socket_path))
         send_json(connection, request)
@@ -1717,7 +1757,13 @@ def handle_daemon_command(
         maximum = request.get("maximum")
         if maximum is not None and (not isinstance(maximum, int) or maximum < 1):
             raise ChatGPTWebError("invalid conversation limit")
-        return {"items": client.list_project_conversations(maximum)}, False
+        quick = request.get("quick") is True
+        return {
+            "items": client.list_project_conversations(
+                maximum, max_pages=1 if quick else None,
+                page_timeout=6.0 if quick else None,
+            )
+        }, False
     if command == "show":
         conversation_id = request.get("conversation_id")
         if not isinstance(conversation_id, str) or not conversation_id:

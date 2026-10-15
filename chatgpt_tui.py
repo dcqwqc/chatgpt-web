@@ -336,10 +336,14 @@ class ChatTui:
         list_models: Callable[[], dict[str, Any]] | None = None,
         select_model: Callable[[str], dict[str, Any]] | None = None,
         get_usage: Callable[[], dict[str, Any]] | None = None,
+        refresh_conversations: Callable[[], list[dict[str, Any]]] | None = None,
         local_session_id: str | None = None,
         last_image: str | None = None,
     ) -> None:
         self.list_conversations = list_conversations
+        self.refresh_conversations = refresh_conversations
+        self.resume_generation = 0
+        self.resume_refreshing = False
         self.load_conversation = load_conversation
         self.send_prompt = send_prompt
         self.upload_image = upload_image
@@ -498,7 +502,7 @@ class ChatTui:
                 Window(
                     content=FormattedTextControl(
                         [("class:picker.title", "  RECENT CONVERSATIONS"),
-                         ("class:picker.hint", "     Search · ↑ ↓ · Enter · Esc")]),
+                         ("class:picker.hint", "     Cached first · ↑ ↓ · Enter · Esc")]),
                     height=1,
                     style="class:picker.header",
                 ),
@@ -1057,12 +1061,13 @@ class ChatTui:
         return Point(x=0, y=max(0, self.transcript_window.vertical_scroll))
 
     def render_resume_list(self) -> FormattedText:
-        if self.resume_loading:
-            return FormattedText([("class:resume.time", " Loading conversations…")])
-        if self.resume_error:
+        if self.resume_loading and not self.resume_items:
+            return FormattedText([("class:resume.time", "  Refreshing online…")])
+        if self.resume_error and not self.resume_items:
             return FormattedText([("class:resume.time", f"  Could not load chats: {self.resume_error[:90]}")])
         if not self.resume_filtered:
-            return FormattedText([("class:resume.time", " No matching conversations")])
+            message = "  No matching saved conversations"
+            return FormattedText([("class:resume.time", message)])
         fragments: list[tuple[str, str]] = []
         for index, item in enumerate(self.resume_filtered):
             title = item.get("title") or "Untitled"
@@ -1959,32 +1964,62 @@ class ChatTui:
     def open_resume(self) -> None:
         if self.busy or self.loading_conversation or self.resume_visible:
             return
+        self.resume_generation += 1
+        generation = self.resume_generation
         self.resume_visible = True
         self.resume_error = None
-        self.resume_loading = True
+        self.resume_loading = False
+        self.resume_refreshing = self.refresh_conversations is not None
         self.resume_items = []
         self.resume_filtered = []
         self.resume_index = 0
         self.resume_search.text = ""
-        self.status = "Loading recent conversations…"
         self.app.layout.focus(self.resume_search)
+        try:
+            # Never wait on the daemon to show local sessions.
+            self.resume_items = self.list_conversations()
+            self.filter_resume()
+            self.status = f"{len(self.resume_items)} saved chats · refreshing online" if self.resume_refreshing else f"{len(self.resume_items)} saved chats"
+        except Exception as error:
+            self.resume_error = f"Local history unavailable: {error}"
+            self.status = self.resume_error
+        if not self.resume_items and self.resume_refreshing:
+            self.resume_loading = True
         self.app.invalidate()
+        if not self.resume_refreshing:
+            return
 
-        def load_items() -> None:
+        def refresh() -> None:
             try:
-                items = self.list_conversations()
-                self.resume_items = items
+                online_items = self.refresh_conversations()
+                if generation != self.resume_generation or not self.resume_visible:
+                    return
+                if not isinstance(online_items, list):
+                    raise ValueError("Invalid conversations response")
+                # Keep current selection, even while the list is reordered.
+                chosen = (self.resume_filtered[self.resume_index].get("id")
+                          if self.resume_filtered else None)
+                self.resume_items = online_items
                 self.resume_error = None
-                self.resume_loading = False
                 self.filter_resume()
-                self.status = f"{len(items)} recent conversations"
+                for i, item in enumerate(self.resume_filtered):
+                    if chosen and item.get("id") == chosen:
+                        self.resume_index = i
+                        break
+                self.status = f"{len(online_items)} recent conversations"
             except Exception as error:
-                self.resume_loading = False
-                self.resume_error = str(error)
-                self.status = f"Conversation list failed: {error}"
-            self.app.invalidate()
+                if generation == self.resume_generation and self.resume_visible:
+                    # Existing cached results are still usable.
+                    self.status = "Saved chats ready · online refresh unavailable"
+                    if not self.resume_items:
+                        self.resume_error = f"Could not refresh online: {error}"
+            finally:
+                if generation == self.resume_generation:
+                    self.resume_loading = False
+                    self.resume_refreshing = False
+                    self.app.invalidate()
 
-        threading.Thread(target=load_items, daemon=True).start()
+        threading.Thread(target=refresh, daemon=True).start()
 
     def filter_resume(self) -> None:
         query = self.resume_search.text.strip().casefold()
@@ -2001,6 +2036,7 @@ class ChatTui:
             self.app.invalidate()
 
     def close_resume(self) -> None:
+        self.resume_generation += 1
         self.resume_visible = False
         self.status = "Ready"
         self.app.layout.focus(self.input)
@@ -2259,6 +2295,7 @@ def run_tui(
     get_usage: Callable[[], dict[str, Any]] | None = None,
     local_session_id: str | None = None,
     last_image: str | None = None,
+    refresh_conversations: Callable[[], list[dict[str, Any]]] | None = None,
 ) -> None:
     ChatTui(
         list_conversations,
@@ -2274,6 +2311,7 @@ def run_tui(
         list_models,
         select_model,
         get_usage,
+        refresh_conversations,
         local_session_id,
         last_image,
     ).run()

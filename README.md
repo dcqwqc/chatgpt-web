@@ -442,3 +442,26 @@ This protocol implementation is tested for the exact image upload packets,
 consistent per-cell foreground color and Unicode diacritics, terminal
 redraw, session reflow, and saved file links. It does not require the image
 to be regenerated or change ChatGPT account usage.
+
+### Fast recent-conversation loading (cache-first)
+
+The /resume (Ctrl+R) conversation picker now opens from the **local journal
+and saved CLI Project cache immediately**, without waiting for the ChatGPT
+website, authentication refresh or the background daemon. The cached list is
+searchable and selectable while a separate online refresh runs. When remote
+data arrives, the picker merges it with the local entries and preserves the
+current filter and selection. A failed or slow request leaves the local list
+fully usable and visibly reports that refreshing is unavailable.
+
+To avoid tying up the single-threaded chat daemon, the picker requests only
+the newest page of online CLI Project conversations, with a **6-second HTTP
+timeout** and a **9-second IPC timeout**. Older Project chats remain accessible
+through their cached entries; this quick online refresh is not a claim that
+every historical server chat has been enumerated. The ordinary complete
+listing command remains available separately. Chat submission still validates
+Project membership and never routes new messages into personal chat history.
+
+Selecting a conversation already cached locally loads it without a network
+round-trip. Online-only conversations still require one ChatGPT request.
+Closing/reopening the picker invalidates earlier in-flight refresh results
+so stale network responses cannot replace the current selection.
