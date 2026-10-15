@@ -907,7 +907,8 @@ class ChatTui:
         for index, item in enumerate(self.model_filtered):
             marker = "›" if index == self.model_index else " "
             style = "class:resume.selected" if index == self.model_index else "class:resume.item"
-            fragments.append((style, f"  {marker} {item['slug'][:24]:<24} {item['title'][:28]}" + chr(10)))
+            current = "●" if item["slug"] == self.model else " "
+            fragments.append((style, f"  {marker}{current} {item['slug'][:24]:<24} {item['title'][:28]}" + chr(10)))
         return FormattedText(fragments)
 
     def filter_models(self) -> None:
@@ -942,6 +943,11 @@ class ChatTui:
                 self.model_items = status.get("models", [])
                 self.model = status.get("selected") or self.model
                 self.filter_models()
+                self.model_index = next(
+                    (i for i, item in enumerate(self.model_filtered)
+                     if item["slug"] == self.model), 0
+                )
+                self.model_list_window.vertical_scroll = max(0, self.model_index - 2)
             except Exception as error:
                 self.model_error = str(error)
             finally:
