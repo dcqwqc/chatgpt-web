@@ -32,6 +32,7 @@ from prompt_toolkit.widgets import TextArea
 
 from image_backend import generate_image
 import local_history
+from cooldown import retry_after_seconds, remaining_seconds, format_remaining, display_rate_limit
 from rich.console import Console
 from rich.markdown import BlockQuote, CodeBlock, Markdown
 from rich.padding import Padding
@@ -45,7 +46,7 @@ from terminal_native import supports_native, render_native
 from rich.theme import Theme
 
 
-Message = dict[str, str]
+Message = dict[str, Any]
 LoadConversation = Callable[[str], dict[str, Any]]
 ListConversations = Callable[[], list[dict[str, Any]]]
 SendPrompt = Callable[
@@ -356,11 +357,20 @@ class ChatTui:
             if (isinstance(message, dict) and
                 message.get("role") in ("user", "assistant", "system", "image")
                 and isinstance(message.get("text"), str)):
-                self.messages.append({"role": message["role"], "text": message["text"]})
+                restored = {"role": message["role"], "text": message["text"]}
+                until = message.get("rate_limit_until")
+                if isinstance(until, (int, float)):
+                    restored["rate_limit_until"] = until
+                self.messages.append(restored)
             else:
                 visible = visible_chat_message(message)
                 if visible is not None:
                     self.messages.append(visible)
+        self.rate_limit_until: float | None = max((
+            m["rate_limit_until"] for m in self.messages
+            if isinstance(m.get("rate_limit_until"), (int, float))
+            and remaining_seconds(m["rate_limit_until"]) > 0
+        ), default=None)
         self.busy = False
         self.loading_conversation = False
         self.loading_started: float | None = None
@@ -425,6 +435,9 @@ class ChatTui:
             on_manual_scroll=self.pause_following,
             style="class:transcript",
         )
+        self.history_entries: list[str] = self.load_prompt_history()
+        self.history_position = -1
+        self.history_draft = ""
         self.input = TextArea(
             height=D(min=1, max=6),
             multiline=True,
@@ -436,6 +449,7 @@ class ChatTui:
             input_processors=[ComposerPlaceholderProcessor()],
             style="class:composer",
         )
+        self.input.buffer.on_text_changed += self.on_input_changed
         self.resume_search = TextArea(
             height=1,
             multiline=False,
@@ -548,6 +562,7 @@ class ChatTui:
                 "metadata": "bg:#1c1b19 #c5c0b8",
                 "metadata.model": "bg:#1c1b19 bold #f2eee6",
                 "metadata.ready": "bg:#1c1b19 bold #a6d1ad",
+                "metadata.rate": "bg:#1c1b19 bold #e3b2cd",
                 "commands": "bg:#21201e #f1ede7",
                 "commands.key": "bg:#21201e bold #c4a7e7",
                 "commands.description": "bg:#21201e #d0cac1",
@@ -570,8 +585,22 @@ class ChatTui:
         when the UI is idle. Those writes clear native terminal selections,
         making copied text lose its highlight almost immediately.
         """
+        previous_remaining = self.cooldown_remaining()
         while True:
             await asyncio.sleep(0.12)
+            remaining = self.cooldown_remaining()
+            if remaining != previous_remaining:
+                previous_remaining = remaining
+                self.app.invalidate()
+                if not remaining:
+                    if self.status.startswith(("Rate limit", "Rate limited")):
+                        self.status = "Ready"
+                    if not self.busy and self.has_pending_messages():
+                        # Rebuild once instead of appending a second copy of the
+                        # old terminal scrollback when the countdown expires.
+                        with self.lock:
+                            self.committed_message_count = len(self.messages)
+                        self.reflow_committed_history()
             if self.busy or self.loading_conversation or self.uploading_image or self.image_busy:
                 self.app.invalidate()
 
@@ -604,6 +633,10 @@ class ChatTui:
             frame = frames[int((time.monotonic() - started) * 10) % len(frames)]
             elapsed = self.format_elapsed(time.monotonic() - started)
             return FormattedText([("", f" {frame} {self.status} · {elapsed} ")])
+        cooldown = self.cooldown_remaining()
+        if cooldown:
+            return FormattedText([("class:metadata.rate",
+                f" • Rate limited · retry in {format_remaining(cooldown)} · draft kept ")])
         if self.status not in ("Ready", ""):
             return FormattedText([("", f" • {self.status} ")])
         if self.pending_attachments:
@@ -615,23 +648,47 @@ class ChatTui:
             ])
         return FormattedText([("", "")])
 
+    def cooldown_remaining(self) -> int:
+        return remaining_seconds(self.rate_limit_until)
+
+    def has_pending_messages(self) -> bool:
+        with self.lock:
+            return self.committed_message_count < len(self.messages)
+
     def render_metadata(self) -> FormattedText:
         cwd = str(Path.cwd())
         home = str(Path.home())
         if cwd == home or cwd.startswith(home + os.sep):
             cwd = "~" + cwd[len(home):]
+        cooldown = self.cooldown_remaining()
         state = (
             "streaming" if self.busy else
             "loading" if self.loading_conversation else
             "uploading" if self.uploading_image else
             "generating" if self.image_busy else
-            "ready"
+            "rate limited" if cooldown else "ready"
         )
-        title = self.title if len(self.title) <= 42 else self.title[:39] + "…"
+        title = self.title if len(self.title) <= 34 else self.title[:31] + "…"
+        model_text = f" {self.model} "
+        state_text = f"{state} "
+        context = f"· CLI Project · {title} · {cwd} "
+        width = self.transcript_width() + 3
+        if not cooldown:
+            return FormattedText([
+                ("class:metadata.model", model_text),
+                ("class:metadata.ready", state_text),
+                ("class:metadata", context),
+            ])
+        badge = f" RATE LIMIT · {format_remaining(cooldown)} "
+        left_width = max(0, width - len(badge))
+        if len(model_text + state_text + context) > left_width:
+            context = context[:max(0, left_width - len(model_text + state_text))]
+        padding = max(1, width - len(model_text + state_text + context + badge))
         return FormattedText([
-            ("class:metadata.model", f" {self.model} "),
-            ("class:metadata.ready", f"{state} "),
-            ("class:metadata", f"· CLI Project · {title} · {cwd} "),
+            ("class:metadata.model", model_text),
+            ("class:metadata.rate", state_text),
+            ("class:metadata", context + " " * padding),
+            ("class:metadata.rate", badge),
         ])
 
     def render_transcript(self) -> str:
@@ -660,11 +717,12 @@ class ChatTui:
             pieces = [self.history_tail] if self.history_tail else []
         for index, message in enumerate(messages):
             role = message["role"]
-            text = render_chatgpt_annotations(message["text"])
+            text = render_chatgpt_annotations(self.present_message(message))
             active = self.busy and index == len(messages) - 1 and role == "assistant"
+            dynamic = remaining_seconds(message.get("rate_limit_until")) > 0
             separated = index > 0 or bool(self.history_tail)
             key = (role, text, width, separated)
-            if active or key not in self.render_cache:
+            if active or dynamic or key not in self.render_cache:
                 value = self.render_message(role, text, width, separated, active)
                 if not active:
                     if len(self.render_cache) > 256:
@@ -734,12 +792,17 @@ class ChatTui:
 
         future.add_done_callback(finished)
 
+    def present_message(self, message: Message) -> str:
+        return display_rate_limit(
+            message["text"], message.get("rate_limit_until")
+        )
+
     def render_history(self, messages: list[Message]) -> str:
         width = self.transcript_width()
         return "".join(
             self.render_message(
                 message["role"],
-                render_chatgpt_annotations(message["text"]),
+                render_chatgpt_annotations(self.present_message(message)),
                 width,
                 index > 0,
                 False,
@@ -785,12 +848,21 @@ class ChatTui:
             messages = [dict(message) for message in self.messages]
         if not messages:
             return
+        if self.cooldown_remaining():
+            self.committed_message_count = 0
+            return
         rendered = self.render_history(messages)
         committed = self.partition_history(rendered)
         self.write_terminal_history(committed)
         self.committed_message_count = len(messages)
 
     def commit_loaded_history(self, messages: list[Message]) -> None:
+        if self.cooldown_remaining():
+            self.committed_message_count = 0
+            self.loading_conversation = False
+            self.loading_started = None
+            self.scroll_bottom()
+            return
         rendered = self.render_history(messages)
         committed = self.partition_history(rendered)
         self.committed_message_count = len(messages)
@@ -817,6 +889,9 @@ class ChatTui:
             self.event_loop.call_soon_threadsafe(schedule_write)
 
     def commit_completed_turns(self) -> None:
+        if self.cooldown_remaining():
+            self.app.invalidate()
+            return
         with self.lock:
             end = len(self.messages)
             messages = [
@@ -1092,6 +1167,10 @@ class ChatTui:
 
     def make_bindings(self) -> KeyBindings:
         bindings = KeyBindings()
+        editor_active = Condition(
+            lambda: self.app.layout.current_control is self.input.control
+            and not self.model_visible and not self.resume_visible
+        )
         completion_visible = Condition(
             lambda: self.app.layout.current_control is self.input.control
             and self.input.buffer.complete_state is not None
@@ -1169,6 +1248,22 @@ class ChatTui:
         @bindings.add("c-v", eager=True)
         def paste_image(_event: Any) -> None:
             self.paste_clipboard_image()
+
+        @bindings.add("up", filter=editor_active, eager=True)
+        def prompt_history_up(event: Any) -> None:
+            buffer = self.input.buffer
+            if buffer.document.cursor_position_row > 0:
+                buffer.cursor_up()
+                return
+            self.move_prompt_history(-1)
+
+        @bindings.add("down", filter=editor_active, eager=True)
+        def prompt_history_down(event: Any) -> None:
+            buffer = self.input.buffer
+            if buffer.document.cursor_position_row < buffer.document.line_count - 1:
+                buffer.cursor_down()
+                return
+            self.move_prompt_history(1)
 
         @bindings.add("up", filter=self.model_filter, eager=True)
         def model_up(_event: Any) -> None:
@@ -1260,6 +1355,65 @@ class ChatTui:
             return 10
         return max(3, info.window_height - 3)
 
+    def load_prompt_history(self) -> list[str]:
+        """Recent prompts across saved CLI sessions, newest first."""
+        entries: list[str] = []
+        for session in local_history.list_recent(100):
+            for message in reversed(session.get("messages", [])):
+                if message.get("role") != "user":
+                    continue
+                content = message.get("text")
+                if (isinstance(content, str) and content.strip()
+                        and (not entries or entries[-1] != content)):
+                    entries.append(content)
+                if len(entries) >= 200:
+                    return entries
+        for message in reversed(self.messages):
+            text = message.get("text")
+            if (message.get("role") == "user" and isinstance(text, str)
+                    and text.strip() and (not entries or entries[-1] != text)):
+                entries.append(text)
+        return entries
+
+    def on_input_changed(self, _buffer: Any) -> None:
+        if not getattr(self, "_changing_prompt_history", False):
+            self.history_position = -1
+            self.history_draft = ""
+
+    def move_prompt_history(self, direction: int) -> None:
+        """Up browses older prompts; Down restores the unsent draft."""
+        if not self.history_entries:
+            return
+        if self.history_position == -1:
+            if direction > 0:
+                return
+            self.history_draft = self.input.text
+            self.history_position = 0
+        else:
+            candidate = self.history_position - direction
+            if candidate < 0:
+                self.history_position = -1
+            else:
+                self.history_position = min(candidate, len(self.history_entries) - 1)
+        content = (self.history_draft if self.history_position == -1
+                   else self.history_entries[self.history_position])
+        self._changing_prompt_history = True
+        try:
+            self.input.text = content
+            self.input.buffer.cursor_position = len(content)
+        finally:
+            self._changing_prompt_history = False
+        self.app.invalidate()
+
+    def record_prompt_history(self, prompt: str) -> None:
+        if not prompt.strip():
+            return
+        if not self.history_entries or self.history_entries[0] != prompt:
+            self.history_entries.insert(0, prompt)
+            self.history_entries = self.history_entries[:200]
+        self.history_position = -1
+        self.history_draft = ""
+
     def persist_local(self) -> None:
         """Durably record visible CLI messages, including image-only sessions."""
         with self.lock:
@@ -1303,10 +1457,15 @@ class ChatTui:
         attachments = list(self.pending_attachments)
         if not prompt and not attachments:
             return
+        if not prompt.startswith("/") and self.cooldown_remaining():
+            self.status = f"Rate limit · retry in {format_remaining(self.cooldown_remaining())} · draft kept"
+            self.app.invalidate()
+            return
         self.input.text = ""
         if prompt.startswith("/"):
             self.handle_command(prompt)
             return
+        self.record_prompt_history(prompt)
         self.pending_attachments.clear()
         if self.legacy_read_only:
             # The old conversation was outside the CLI Project. Do not make
@@ -1797,7 +1956,11 @@ class ChatTui:
                     if (isinstance(message, dict) and
                         message.get("role") in ("user", "assistant", "system", "image")
                         and isinstance(message.get("text"), str)):
-                        messages.append({"role": message["role"], "text": message["text"]})
+                        restored = {"role": message["role"], "text": message["text"]}
+                        until = message.get("rate_limit_until")
+                        if isinstance(until, (int, float)):
+                            restored["rate_limit_until"] = until
+                        messages.append(restored)
                     else:
                         visible = visible_chat_message(message)
                         if visible is not None:
@@ -1824,6 +1987,11 @@ class ChatTui:
                     })
                 with self.lock:
                     self.messages = messages
+                self.rate_limit_until = max((
+                    m.get("rate_limit_until", 0) for m in messages
+                    if isinstance(m.get("rate_limit_until"), (int, float))
+                    and remaining_seconds(m["rate_limit_until"]) > 0
+                ), default=None)
                 real_id = conversation.get("server_id", conversation.get("id", conversation_id))
                 if isinstance(real_id, str) and real_id.startswith(("local:", "legacy:")):
                     real_id = None
@@ -1839,6 +2007,8 @@ class ChatTui:
                 if self.set_active_conversation is not None:
                     self.set_active_conversation(real_id)
                 self.title = conversation.get("title") or "Untitled"
+                self.history_entries = self.load_prompt_history()
+                self.history_position = -1
                 self.legacy_read_only = bool(conversation.get("legacy"))
                 if self.legacy_read_only:
                     self.status = "Older cached chat is read-only; your next message creates a CLI Project chat"
@@ -1851,6 +2021,17 @@ class ChatTui:
                 self.app.invalidate()
 
         threading.Thread(target=load_selected, daemon=True).start()
+
+    def recover_rate_limited_draft(self, prompt: str) -> None:
+        def restore() -> None:
+            if not self.input.text.strip():
+                self.input.text = prompt
+                self.input.buffer.cursor_position = len(prompt)
+            self.app.invalidate()
+        if self.event_loop is not None:
+            self.event_loop.call_soon_threadsafe(restore)
+        else:
+            restore()
 
     def run_send(self, prompt: str, attachments: list[dict[str, Any]]) -> None:
         rendered = ""
@@ -1928,18 +2109,31 @@ class ChatTui:
             self.status = "Ready"
         except Exception as error:
             self.pending_attachments[0:0] = attachments
-            if not rendered:
+            retry = retry_after_seconds(str(error))
+            if retry is not None:
+                deadline = time.time() + retry
+                self.rate_limit_until = max(self.rate_limit_until or 0, deadline)
                 with self.lock:
+                    # An error after a partial stream should also be visible.
                     self.messages[-1]["text"] = f"*Request stopped: {error}*"
-            self.status = "Response stopped"
+                    self.messages[-1]["rate_limit_until"] = deadline
+                self.status = f"Rate limit · retry in {format_remaining(retry)}"
+                self.recover_rate_limited_draft(prompt)
+            else:
+                if not rendered:
+                    with self.lock:
+                        self.messages[-1]["text"] = f"*Request stopped: {error}*"
+                self.status = "Response stopped"
         finally:
             if self.active_started is not None:
                 self.last_elapsed = time.monotonic() - self.active_started
             self.active_started = None
             self.cancel_connection = None
-            self.busy = False
+            # Complete durable state before announcing the worker is idle.
             self.persist_local()
             self.commit_completed_turns()
+            self.busy = False
+            self.app.invalidate()
 
     @staticmethod
     def set_terminal_background() -> None:

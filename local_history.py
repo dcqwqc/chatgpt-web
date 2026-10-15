@@ -69,7 +69,11 @@ def _safe_messages(messages: list) -> list[dict[str, str]]:
             continue
         role, text = message.get("role"), message.get("text")
         if role in _ROLES and isinstance(text, str):
-            output.append({"role": role, "text": text[:150000]})
+            entry = {"role": role, "text": text[:150000]}
+            until = message.get("rate_limit_until")
+            if isinstance(until, (float, int)) and not isinstance(until, bool):
+                entry["rate_limit_until"] = float(until)
+            output.append(entry)
     return output
 
 

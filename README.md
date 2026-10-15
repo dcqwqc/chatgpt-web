@@ -390,3 +390,29 @@ using OSC 11 (including Ghostty's background-colored padding) and restores
 the terminal's original background when exiting using OSC 111. This does not
 edit the user's global Ghostty / Caelestia color configuration. Set
 CHATGPT_WEB_KEEP_TERMINAL_BG=1 to disable these background OSC operations.
+
+### Shell-style prompt history and ChatGPT rate-limit countdowns
+
+The main composer now supports **Up/Down for previous submitted prompts**.
+Up recalls older prompts, Down goes forward and eventually restores the
+unsent draft. Inside a multiline message, the arrows still navigate lines
+until you reach the first/last line. The model and conversation selection
+panels keep their own Up/Down navigation. The CLI reads previous user prompts
+from its private local session history, so recall works after restarting.
+
+When ChatGPT Web returns HTTP 429 with a Retry-After number, the TUI displays
+a **live second-by-second countdown** in the failed assistant message and in
+the bottom-right status bar. These are the same server-provided deadline,
+not two independent estimates. Existing messages remain visible while the
+countdown runs. At expiry, the inline error reads *ready to retry*, the
+status bar returns to Ready, and the finished transcript is committed once
+without duplicating previous scrollback.
+
+While that countdown is running, normal chat sends are held and the draft
+remains in the composer. The failed request is restored to the input if the
+user has not already typed another draft. Slash commands such as /usage and
+/model remain available. The saved local session includes the deadline, so
+the countdown survives a restart without resetting to the original duration.
+There is **no automatic retry** and no polling or artificial rate-limit
+bypass. Retry-After is a temporary request cooldown, not the ChatGPT Web
+subscription usage balance.
