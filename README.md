@@ -295,3 +295,38 @@ strict project verification (no fallback to the ordinary chat list).
 When chrome-use is absent, the auto backend uses Codex image generation,
 which does not create a regular ChatGPT Web conversation but consumes Codex
 usage. To require the web-based image workflow use the web backend explicitly.
+
+### Inline image previews and neutral theme
+
+The terminal now **displays generated and edited images directly in the
+conversation** without opening another application. It renders a compact
+full-color preview using 24-bit ANSI half-block pixels, compatible with
+Ghostty, Kitty, tmux and terminals supporting truecolor. The original PNG
+or WebP is preserved at full resolution, and the displayed preview is
+independent of any browser-session cookie or image-hosting service.
+
+- `/image PROMPT`: generate an image and show its preview.
+- `/edit PATH | PROMPT`: edit a reference and show the result.
+- `/animate PROMPT`: preview the first frame of the WebP/GIF animation.
+- `/preview PATH`: preview a local image without generating another.
+- `/preview`: show the most recently previewed/generated image in this session.
+
+The client uses Pillow for image previews; the preview is embedded in terminal
+scrollback, but animated images are represented by their first frame. The
+palette uses a **charcoal background, warm white text and subtle amber accents**
+with no blue-tinted panels. Assistant messages and scrollback are explicitly
+styled to remain legible when a terminal has a white default background.
+
+The model picker uses a seven-item *sliding viewport*. It always shows the
+selected model when pressing Up/Down, and queues arrow presses made while the
+model list is loading. Pressing Enter on a complete slash command executes it
+immediately; previously a stale completion could swallow the first Enter.
+
+The `/usage` command now reports two separate categories:
+
+- **Ordinary ChatGPT Web:** exact remaining message counts are not supplied
+  to the client, so no number is invented.
+- **Codex / Work:** if available, the actual remaining percentages and reset
+  countdowns from the account's separate usage endpoint.
+
+CLI `chatgpt-web usage` returns the same data as structured JSON.

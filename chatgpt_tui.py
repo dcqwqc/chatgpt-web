@@ -39,6 +39,7 @@ from rich.segment import Segment
 from rich.style import Style as RichStyle
 from rich.syntax import Syntax
 from rich.text import Text
+from image_preview import render_preview
 from rich.theme import Theme
 
 
@@ -63,8 +64,8 @@ ANNOTATION_PATTERN = re.compile(r"\ue200([^\ue201\ue202]+)(?:\ue202(.*?))?\ue201
 FILE_CITATION_PATTERN = re.compile(
     r"[ \t]*\[F\d+:L\d+(?:[ \t]*[-–—][ \t]*L?\d+)?\]"
 )
-PROMPT_BACKGROUND_TOKEN = "48;2;28;37;48m"
-PROMPT_BACKGROUND_SGR = "\x1b[48;2;28;37;48m"
+PROMPT_BACKGROUND_TOKEN = "48;2;38;37;35m"
+PROMPT_BACKGROUND_SGR = "\x1b[48;2;38;37;35m"
 TRAILING_STYLED_SPACES_PATTERN = re.compile(
     r"(?:\x1b\[[0-9;]*m[ \t]+\x1b\[0m)+(?=\n)"
 )
@@ -73,22 +74,22 @@ WRITING_DIRECTIVE_PATTERN = re.compile(
 )
 
 MARKDOWN_THEME = Theme({
-    "markdown.text": "#e5e7eb",
-    "markdown.paragraph": "#e5e7eb",
-    "markdown.h1": "bold #f3f4f6",
-    "markdown.h2": "bold #f3f4f6",
-    "markdown.h3": "bold #f3f4f6",
-    "markdown.h4": "bold #e5e7eb",
-    "markdown.h5": "bold #d1d5db",
-    "markdown.h6": "bold #d1d5db",
-    "markdown.link": "underline #22d3ee",
-    "markdown.link_url": "underline #22d3ee",
-    "markdown.code": "#22d3ee",
-    "markdown.block_quote": "#9ca3af",
-    "markdown.hr": "#606060",
-    "markdown.list": "#e5e7eb",
-    "markdown.item.bullet": "#e5e7eb",
-    "markdown.item.number": "#e5e7eb",
+    "markdown.text": "#f2f0ec",
+    "markdown.paragraph": "#f2f0ec",
+    "markdown.h1": "bold #f8f6f2",
+    "markdown.h2": "bold #f8f6f2",
+    "markdown.h3": "bold #f8f6f2",
+    "markdown.h4": "bold #f2f0ec",
+    "markdown.h5": "bold #d9d6d0",
+    "markdown.h6": "bold #d9d6d0",
+    "markdown.link": "underline #e1c48e",
+    "markdown.link_url": "underline #e1c48e",
+    "markdown.code": "#e1c48e",
+    "markdown.block_quote": "#b8b4ad",
+    "markdown.hr": "#55514b",
+    "markdown.list": "#f2f0ec",
+    "markdown.item.bullet": "#f2f0ec",
+    "markdown.item.number": "#f2f0ec",
 })
 
 
@@ -135,7 +136,7 @@ class CompactBlockQuote(BlockQuote):
     def __rich_console__(self, console: Console, options: Any) -> Any:
         quote_options = options.update(width=max(1, options.max_width - 4))
         lines = console.render_lines(self.elements, quote_options, style=self.style)
-        rail = Segment("│ ", RichStyle(color="#6b7280", dim=True))
+        rail = Segment("│ ", RichStyle(color="#98938c", dim=True))
         for line in lines:
             yield rail
             yield from line
@@ -166,7 +167,7 @@ class PromptMarkdown:
         )
         for index, line in enumerate(lines):
             marker = "› " if index == 0 else "  "
-            style = RichStyle(color="#67e8f9", bold=True) if index == 0 else None
+            style = RichStyle(color="#e1c48e", bold=True) if index == 0 else None
             yield Segment(marker, style)
             yield from line
             yield Segment("\n")
@@ -184,6 +185,7 @@ class SlashCommandCompleter(Completer):
         ("/image", "generate an image from a prompt"),
         ("/edit", "edit an image: PATH | prompt"),
         ("/animate", "generate an animated WebP"),
+        ("/preview", "show an image directly in the terminal"),
         ("/remove", "remove the latest image"),
         ("/clear", "clear the displayed transcript"),
         ("/help", "show available commands"),
@@ -371,6 +373,7 @@ class ChatTui:
         self.model_items: list[dict[str, str]] = []
         self.model_filtered: list[dict[str, str]] = []
         self.model_index = 0
+        self.model_pending_steps = 0
         self.model_error: str | None = None
         self.model_filter = Condition(lambda: self.model_visible)
         self.commands_filter = Condition(
@@ -402,6 +405,7 @@ class ChatTui:
             right_margins=[],
             allow_scroll_beyond_bottom=False,
             on_manual_scroll=self.pause_following,
+            style="class:transcript",
         )
         self.input = TextArea(
             height=D(min=1, max=6),
@@ -517,28 +521,27 @@ class ChatTui:
             max_render_postpone_time=0.1,
             before_render=self.detect_terminal_resize,
             style=Style.from_dict({
-                # Explicit dark surfaces work even when the terminal's base
-                # background is white; typography stays legible in both modes.
-                "separator": "#42566a",
-                "activity": "bg:#101820 #bac9d9",
-                "composer": "bg:#1c2530 #f5f8fc",
-                "prompt": "bg:#1c2530 bold #67e8f9",
-                "placeholder": "bg:#1c2530 #a8b8c9",
-                "metadata": "bg:#0e141d #acbdce",
-                "metadata.model": "bg:#0e141d bold #72e7f7",
-                "metadata.ready": "bg:#0e141d bold #9bedb5",
-                "commands": "bg:#16212e #c9d9e8",
-                "commands.key": "bg:#16212e bold #72e7f7",
-                "commands.description": "bg:#16212e #a9bacb",
-                "picker.header": "bg:#16212e #c9d9e8",
-                "picker.title": "bg:#16212e bold #f1f7ff",
-                "picker.hint": "bg:#16212e #91a8ba",
-                "picker.search": "bg:#263445 #ffffff",
-                "picker.list": "bg:#16212e #e8f0f9",
-                "picker.help": "bg:#18232e #a8bacb",
-                "resume.selected": "bg:#285266 #ffffff bold",
-                "resume.item": "bg:#16212e #d5e2ef",
-                "resume.time": "bg:#16212e #9fb0c0",
+                "transcript": "bg:#151413 #f1efeb",
+                "separator": "#56514b",
+                "activity": "bg:#151413 #c4bfb6",
+                "composer": "bg:#262523 #f9f7f2",
+                "prompt": "bg:#262523 bold #e1c48e",
+                "placeholder": "bg:#262523 #a8a39c",
+                "metadata": "bg:#1c1b19 #c5c0b8",
+                "metadata.model": "bg:#1c1b19 bold #f2eee6",
+                "metadata.ready": "bg:#1c1b19 bold #a6d1ad",
+                "commands": "bg:#21201e #f1ede7",
+                "commands.key": "bg:#21201e bold #e1c48e",
+                "commands.description": "bg:#21201e #d0cac1",
+                "picker.header": "bg:#21201e #f4f1eb",
+                "picker.title": "bg:#21201e bold #f8f5ee",
+                "picker.hint": "bg:#21201e #c1bbb1",
+                "picker.search": "bg:#34312e #ffffff",
+                "picker.list": "bg:#21201e #f3efe9",
+                "picker.help": "bg:#21201e #bfb8ac",
+                "resume.selected": "bg:#4a3e2d #ffffff bold",
+                "resume.item": "bg:#21201e #f3efe9",
+                "resume.time": "bg:#21201e #c0bab0",
             }),
         )
 
@@ -846,26 +849,37 @@ class ChatTui:
             theme=MARKDOWN_THEME,
         )
         if separated and role == "user":
-            console.print(Rule(style="#34485e"))
+            console.print(Rule(style="#56514b on #151413"))
         if role == "user":
             console.print(
                 Padding(
                     PromptMarkdown(text),
                     (1, 2),
-                    style="#f4f8ff on #1c2530",
+                    style="#f8f6f1 on #262523",
                     expand=True,
                 )
             )
         elif role == "assistant":
-            console.print(Text("• ", style="#9ca3af"), end="")
-            if text:
-                console.print(ChatMarkdown(text, code_theme="monokai"))
-            elif active:
-                console.print(Text("Thinking…", style="dim italic"))
+            content = ChatMarkdown(text, code_theme="monokai") if text else Text(
+                "Thinking…" if active else "", style="italic #c4bfb6"
+            )
+            console.print(Padding(content, (0, 2), style="#f2f0ec on #151413", expand=True))
+        elif role == "image":
+            from rich.text import Text as RichText
+            try:
+                preview = render_preview(text, max_columns=max(10, min(42, width - 7)))
+                console.print(Padding(
+                    RichText.from_ansi(preview), (0, 2),
+                    style="#f2f0ec on #151413", expand=True,
+                ))
+            except (OSError, ValueError, ImportError) as error:
+                console.print(Padding(Text(
+                    f"Preview unavailable: {error}", style="#e2bc8a"
+                ), (0, 2), style="#f2f0ec on #151413", expand=True))
         else:
-            console.print(Text("• ", style="bold #fbbf24"), end="")
-            console.print(ChatMarkdown(text, code_theme="monokai"))
-        console.print()
+            console.print(Padding(ChatMarkdown(text, code_theme="monokai"),
+                (0, 2), style="#e1c48e on #151413", expand=True))
+        console.print(Text(" " * width, style="#f2f0ec on #151413"))
         return buffer.getvalue()
 
     def transcript_cursor_position(self) -> Point:
@@ -898,13 +912,20 @@ class ChatTui:
 
     def render_model_list(self) -> FormattedText:
         if self.model_loading:
-            return FormattedText([("class:resume.time", "  Loading your models…")])
+            return FormattedText([("class:resume.time", "  Fetching models…")])
         if self.model_error:
             return FormattedText([("class:resume.time", f"  Failed: {self.model_error[:80]}")])
         if not self.model_filtered:
             return FormattedText([("class:resume.time", "  No matching models")])
+        count = len(self.model_filtered)
+        visible_rows = 7
+        # Never rely on prompt_toolkit's automatic scroll: focus is on the
+        # search input, so selecting off-screen models used to appear frozen.
+        start = min(max(0, self.model_index - visible_rows // 2),
+                    max(0, count - visible_rows))
         fragments: list[tuple[str, str]] = []
-        for index, item in enumerate(self.model_filtered):
+        for index in range(start, min(count, start + visible_rows)):
+            item = self.model_filtered[index]
             marker = "›" if index == self.model_index else " "
             style = "class:resume.selected" if index == self.model_index else "class:resume.item"
             current = "●" if item["slug"] == self.model else " "
@@ -933,6 +954,7 @@ class ChatTui:
         self.model_items = []
         self.model_filtered = []
         self.model_index = 0
+        self.model_pending_steps = 0
         self.model_search.text = ""
         self.app.layout.focus(self.model_search)
         self.app.invalidate()
@@ -947,7 +969,11 @@ class ChatTui:
                     (i for i, item in enumerate(self.model_filtered)
                      if item["slug"] == self.model), 0
                 )
-                self.model_list_window.vertical_scroll = max(0, self.model_index - 2)
+                self.model_index = max(
+                    0, min(len(self.model_filtered)-1,
+                           self.model_index + self.model_pending_steps)
+                )
+                self.model_pending_steps = 0
             except Exception as error:
                 self.model_error = str(error)
             finally:
@@ -994,16 +1020,34 @@ class ChatTui:
         def worker() -> None:
             try:
                 usage = self.get_usage()
-                remaining = usage.get("remaining_messages")
-                if remaining is None:
-                    self.append_system(
-                        "**ChatGPT Web usage**" + chr(10)*2 +
-                        "Exact remaining messages: **not exposed by ChatGPT Web**." + chr(10)*2 +
-                        "Codex/Work usage is a separate allowance, not a ChatGPT Web balance. "
-                        "Check the ChatGPT model picker for visible restrictions."
-                    )
-                else:
-                    self.append_system(f"**Web messages remaining:** {remaining}")
+                rows = [
+                    "**ChatGPT Web**",
+                    "Remaining messages: **not available from ChatGPT Web**.",
+                    "",
+                    "**Codex / Work (separate allowance)**",
+                ]
+                codex = usage.get("codex", {})
+                windows = codex.get("windows", {}) if isinstance(codex, dict) else {}
+                for key, title in (("primary_window", "Short window"), ("secondary_window", "Long window")):
+                    info = windows.get(key)
+                    if not isinstance(info, dict):
+                        continue
+                    remaining = info.get("remaining_percent")
+                    reset = info.get("reset_after_seconds")
+                    if isinstance(remaining, (float, int)):
+                        line = f"{title}: **{remaining:g}% remaining**"
+                        if isinstance(reset, int):
+                            if reset >= 86400:
+                                eta = f"{reset // 86400}d {(reset % 86400)//3600}h"
+                            elif reset >= 3600:
+                                eta = f"{reset // 3600}h {(reset % 3600)//60}m"
+                            else:
+                                eta = f"{reset // 60}m"
+                            line += f" · resets in {eta}"
+                        rows.append(line)
+                if not windows:
+                    rows.append("Currently unavailable.")
+                self.append_system((chr(10) + chr(10)).join(rows))
                 self.status = "Usage checked"
             except Exception as error:
                 self.status = f"Usage check failed: {error}"
@@ -1037,9 +1081,16 @@ class ChatTui:
         def submit(event: Any) -> None:
             if event.app.layout.current_control is self.input.control:
                 state = self.input.buffer.complete_state
-                if state is not None and state.completions:
+                typed = self.input.text.strip()
+                names = {name for name, _ in SlashCommandCompleter.COMMANDS}
+                if typed.split(" ", 1)[0] in names:
+                    self.input.buffer.cancel_completion()
+                    self.submit_prompt()
+                elif state is not None and state.completions:
                     completion = state.current_completion or state.completions[0]
                     self.input.buffer.apply_completion(completion)
+                    if completion.text in names and typed.startswith("/"):
+                        self.submit_prompt()
                 else:
                     self.submit_prompt()
 
@@ -1101,17 +1152,19 @@ class ChatTui:
 
         @bindings.add("up", filter=self.model_filter, eager=True)
         def model_up(_event: Any) -> None:
-            if self.model_filtered:
+            if self.model_loading:
+                self.model_pending_steps -= 1
+            elif self.model_filtered:
                 self.model_index = max(0, self.model_index - 1)
-                self.model_list_window.vertical_scroll = max(0, self.model_index - 2)
-                self.app.invalidate()
+            self.app.invalidate()
 
         @bindings.add("down", filter=self.model_filter, eager=True)
         def model_down(_event: Any) -> None:
-            if self.model_filtered:
+            if self.model_loading:
+                self.model_pending_steps += 1
+            elif self.model_filtered:
                 self.model_index = min(len(self.model_filtered) - 1, self.model_index + 1)
-                self.model_list_window.vertical_scroll = max(0, self.model_index - 2)
-                self.app.invalidate()
+            self.app.invalidate()
 
         @bindings.add("enter", filter=self.model_filter, eager=True)
         def model_choose(_event: Any) -> None:
@@ -1281,6 +1334,8 @@ class ChatTui:
             self.copy_latest_response()
         elif name in ("/image", "/edit", "/animate"):
             self.start_image_command(name, argument)
+        elif name == "/preview":
+            self.preview_image_command(argument)
         elif name == "/remove":
             if self.pending_attachments:
                 removed = self.pending_attachments.pop()
@@ -1304,6 +1359,25 @@ class ChatTui:
         else:
             self.status = f"Unknown command: {name}"
             self.app.invalidate()
+
+    def preview_image_command(self, argument: str) -> None:
+        path = argument.strip().strip('"').strip("'") or self.last_generated_image
+        if not path:
+            self.status = "Usage: /preview PATH (or generate an image first)"
+            self.app.invalidate()
+            return
+        try:
+            # Validate the preview before inserting it in the transcript.
+            render_preview(path, max_columns=8, max_rows=3)
+        except (OSError, ValueError, ImportError) as error:
+            self.status = f"Cannot preview image: {error}"
+            self.app.invalidate()
+            return
+        self.last_generated_image = str(Path(path).expanduser())
+        with self.lock:
+            self.messages.append({"role": "image", "text": self.last_generated_image})
+        self.status = "Image preview shown"
+        self.scroll_bottom()
 
     def start_image_command(self, name: str, argument: str) -> None:
         """Run image-use off the UI thread; no shell or browser credentials shared."""
@@ -1340,10 +1414,12 @@ class ChatTui:
                 backend = os.environ.get("CHATGPT_WEB_IMAGE_BACKEND", "auto")
                 result = generate_image(action, prompt, reference=source, backend=backend)
                 self.last_generated_image = result.output
+                with self.lock:
+                    self.messages.append({"role": "image", "text": result.output})
                 self.append_system(
                     f"**{action.title()} completed** · {result.elapsed_seconds}s\n\n"
                     f"Saved to `{result.output}`\n\n"
-                    "Open it with your desktop's image viewer. "
+                    "Preview displayed above; the original full-resolution file is saved locally. "
                     "Image generation runs separately from the active web conversation."
                 )
                 self.status = "Image saved"

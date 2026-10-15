@@ -107,3 +107,24 @@ def web_usage_status() -> dict:
         "available": "not reported",
         "note": "ChatGPT Web does not provide a reliable remaining-message counter via this client. Codex/Work usage is a different allowance.",
     }
+
+def summarize_codex_usage(payload: object) -> dict:
+    """Return window percentages only; no account identifiers."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("rate_limit"), dict):
+        raise ValueError("Codex usage response has no rate limit")
+    rate = payload["rate_limit"]
+    result = {"service": "Codex / Work (separate allowance)", "windows": {}}
+    for key in ("primary_window", "secondary_window"):
+        window = rate.get(key)
+        if not isinstance(window, dict):
+            continue
+        used = window.get("used_percent")
+        reset = window.get("reset_after_seconds")
+        if not isinstance(used, (int, float)) or isinstance(used, bool) or not 0 <= used <= 100:
+            continue
+        result["windows"][key] = {
+            "used_percent": round(used, 1),
+            "remaining_percent": round(100 - used, 1),
+            "reset_after_seconds": int(reset) if isinstance(reset, (int, float)) and reset >= 0 else None,
+        }
+    return result
