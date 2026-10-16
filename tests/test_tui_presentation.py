@@ -122,8 +122,9 @@ class PersistedMediaTests(unittest.TestCase):
             first=tui.render_transcript()
             tui.status="Ready"
             second=tui.render_transcript()
-            self.assertIn("▀",first)
-            self.assertIn("▀",second)
+            self.assertIn("Image ready", first)
+            self.assertIn("Image ready", second)
+            self.assertIn(img.as_uri(), first)
             self.assertEqual(first,second)
 
     def test_lavender_palette_and_terminal_background(self):

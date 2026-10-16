@@ -523,6 +523,8 @@ class ChatGPTWebClient:
             raise ChatGPTWebError("image attachments require the direct node send mode")
         if os.environ.get("CHATGPT_WEB_SEND_MODE", "node") == "chrome":
             raise ChatGPTWebError("Browser send mode cannot guarantee CLI Project routing; use the default direct mode")
+        if on_event:
+            on_event({"type":"phase", "status":"Checking CLI Project…"})
         project_id = self.target_project_id()
         previous_ids: set[str] = set()
         previous: dict[str, Any] | None = None
@@ -541,6 +543,8 @@ class ChatGPTWebClient:
             resolved_id, submitted_message_id = self.send_prompt_direct(
                 previous, prompt, attachments or [], on_event
             )
+            if on_event:
+                on_event({"type":"phase", "status":"Verifying saved conversation…"})
             conversation = self.get_conversation(resolved_id)
             if conversation.get("gizmo_id") != project_id:
                 if conversation_id is None:
@@ -642,7 +646,10 @@ class ChatGPTWebClient:
             )
         else:
             try:
-                sentinel_headers = self.create_sentinel_headers()
+                sentinel_headers = self.create_sentinel_headers(
+                    on_phase=(lambda label: on_event({"type":"phase","status":label}))
+                    if on_event else None
+                )
             except SentinelCompatibilityError as error:
                 if not chrome_is_ready(self.cdp_url):
                     raise ChatGPTWebError(
@@ -674,6 +681,8 @@ class ChatGPTWebClient:
             raise ChatGPTWebError("conversation request has no user message ID")
         resolved_id: str | None = conversation_id
         rendered = ""
+        if on_event:
+            on_event({"type":"phase","status":"Submitting request to ChatGPT…"})
         with self.http.stream(
             method,
             url,
@@ -694,6 +703,9 @@ class ChatGPTWebClient:
                 raise ChatGPTWebError(
                     f"ChatGPT returned unexpected content type {content_type or '<missing>'}"
                 )
+            if on_event:
+                on_event({"type":"phase", "status":"Waiting for ChatGPT response…",
+                          "submitted": True})
             for line in response.iter_lines():
                 if not line.startswith("data: "):
                     continue
@@ -740,7 +752,7 @@ class ChatGPTWebClient:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=30,
+                timeout=15,
                 check=False,
                 env=environment,
             )
@@ -765,19 +777,26 @@ class ChatGPTWebClient:
             )
         return value
 
-    def create_sentinel_headers(self) -> dict[str, str]:
+    def create_sentinel_headers(self, on_phase: Any = None) -> dict[str, str]:
+        if on_phase:
+            on_phase("Preparing verification proof…")
         initial = self.run_sentinel_node(["--emit-initial"]).get("initial")
         if not isinstance(initial, str) or not initial:
             raise SentinelCompatibilityError(
                 "Sentinel signer did not generate an initial proof"
             )
+        if on_phase:
+            on_phase("Checking verification requirements…")
         requirements = self.request(
             "POST",
             urljoin(CHATGPT_ORIGIN, "/backend-api/sentinel/chat-requirements/prepare"),
             json={"p": initial},
+            timeout=12,
         ).json()
         if not isinstance(requirements, dict):
             raise ChatGPTWebError("Sentinel prepare returned an invalid response")
+        if on_phase:
+            on_phase("Completing secure verification…")
         enforcement = self.run_sentinel_node(
             ["--requirements-stdin", "--emit-enforcement-json"], requirements
         )
@@ -1616,7 +1635,9 @@ def daemon_stream_request(
 
 def daemon_is_ready(socket_path: Path) -> bool:
     try:
-        return daemon_request(socket_path, {"command": "ping"}).get("ready") is True
+        return daemon_request(
+            socket_path, {"command": "ping"}, timeout_seconds=1.5
+        ).get("ready") is True
     except (ChatGPTWebError, OSError):
         return False
 
@@ -1714,8 +1735,22 @@ def launch_login_browser(cdp_url: str) -> dict[str, Any]:
 
 
 def ensure_daemon(socket_path: Path, cdp_url: str) -> None:
-    if daemon_is_ready(socket_path):
-        return
+    if socket_path.exists():
+        try:
+            if daemon_request(
+                socket_path, {"command": "ping"}, timeout_seconds=1.5,
+            ).get("ready") is True:
+                return
+        except socket.timeout as error:
+            # A socket exists but the single-worker daemon is answering
+            # another ChatGPT request; do not launch a competing daemon or
+            # queue another generation request behind it for two minutes.
+            raise ChatGPTWebError(
+                "CLI backend is busy with another request; your prompt was not "
+                "submitted by this attempt. Wait for the other request to finish."
+            ) from error
+        except (ChatGPTWebError, OSError):
+            pass
     start_daemon(socket_path, cdp_url)
 
 
@@ -1912,6 +1947,10 @@ def run_daemon(socket_path: Path, cdp_url: str) -> int:
                             media_paths = []
                             media_warning = None
                             if image_asset_ids(conversation):
+                                send_json_line(connection, {"ok": True, "event": {
+                                    "type": "phase", "status": "Saving generated image locally…",
+                                    "submitted": True,
+                                }})
                                 try:
                                     media_paths = download_generated_images(
                                         client, conversation,

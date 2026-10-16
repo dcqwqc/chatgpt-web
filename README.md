@@ -465,3 +465,30 @@ Selecting a conversation already cached locally loads it without a network
 round-trip. Online-only conversations still require one ChatGPT request.
 Closing/reopening the picker invalidates earlier in-flight refresh results
 so stale network responses cannot replace the current selection.
+
+### Ghostty HD images: visually verified, 2026-10-16
+
+The old Kitty Unicode-placeholder placement (U=1) produced a blank rectangle
+in a REAL Ghostty 1.3.1 window. A direct Kitty PNG placement rendered correctly.
+The production CLI now sends full-color PNG images to terminal scrollback while
+prompt_toolkit is suspended, using a compact input footer that does not erase
+the picture on redraw. Image height is bounded by available terminal rows.
+The saved original file URI and /open remain visible underneath.
+
+We verified the updated CLI by taking a real Ghostty screenshot AFTER a
+normal-language synthetic image request had finished: the PNG, prompt,
+caption and composer were all visible. Non-Kitty terminals use ANSI fallback.
+
+### Prompt submission progress and bounded preparation
+
+The secure-request status now distinguishes CLI Project validation,
+verification proof generation, requirements retrieval, proof completion,
+request submission, waiting for ChatGPT, and media saving. A single-worker
+daemon previously could block its readiness ping for 120 seconds. The new
+1.5-second ping fails fast and preserves the draft while the backend is busy.
+The proof processes have 15-second limits, requirements retrieval has a
+12-second limit. Normal service verification is still required.
+
+All failed sends preserve the unsent prompt; no automatic retry occurs because
+network errors may leave submission status uncertain. The 429 cooldown
+continues to report only real Retry-After times.

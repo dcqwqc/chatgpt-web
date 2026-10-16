@@ -377,6 +377,7 @@ class ChatTui:
             and remaining_seconds(m["rate_limit_until"]) > 0
         ), default=None)
         self.busy = False
+        self.request_submitted = False
         self.loading_conversation = False
         self.loading_started: float | None = None
         self.load_on_start = conversation_id is not None and not initial_messages
@@ -623,6 +624,11 @@ class ChatTui:
             rows = self.app.output.get_size().rows
         except Exception:
             rows = shutil.get_terminal_size((100, 24)).lines
+        # Leave completed Kitty images in terminal scrollback above the
+        # interactive footer. A full-screen repaint destroys cursor-anchored
+        # images even when the PNG transfer itself succeeds.
+        if self.native_image_preview:
+            return D.exact(max(6, min(rows, 10)))
         return D.exact(max(6, rows))
 
     @staticmethod
@@ -673,7 +679,7 @@ class ChatTui:
             cwd = "~" + cwd[len(home):]
         cooldown = self.cooldown_remaining()
         state = (
-            "streaming" if self.busy else
+            ("waiting" if self.request_submitted else "preparing") if self.busy else
             "loading" if self.loading_conversation else
             "uploading" if self.uploading_image else
             "generating" if self.image_busy else
@@ -779,21 +785,15 @@ class ChatTui:
             return
         self.resize_reflowing = True
         with self.lock:
-            completed = [
-                dict(message)
-                for message in self.messages[:self.committed_message_count]
-            ]
-        rendered = self.render_history(completed) if completed else ""
-        committed = self.partition_history(rendered)
+            completed = [dict(m) for m in self.messages[:self.committed_message_count]]
+        self.history_tail = ""
         self.formatted_transcript_source = ""
 
         def replay() -> None:
             self.reset_terminal_session()
-            self.reload_virtual_placements(completed)
-            self.write_terminal_history(committed)
+            self.write_complete_messages(completed)
 
         future = run_in_terminal(replay, render_cli_done=False)
-
         def finished(_future: Any) -> None:
             self.resize_reflowing = False
             self.scroll_bottom()
@@ -801,7 +801,6 @@ class ChatTui:
                 self.resize_reflow_pending = False
                 if self.event_loop is not None:
                     self.event_loop.call_soon(self.reflow_committed_history)
-
         future.add_done_callback(finished)
 
     def present_message(self, message: Message) -> str:
@@ -821,6 +820,47 @@ class ChatTui:
             )
             for index, message in enumerate(messages)
         )
+
+    def write_complete_messages(self, messages: list[Message]) -> None:
+        """Print completed messages into real terminal scrollback.
+
+        Kitty pixel placements are cursor-anchored there, not transient
+        prompt_toolkit repaint cells. The next TUI redraw cannot erase them.
+        """
+        width = self.transcript_width()
+        for index, message in enumerate(messages):
+            role = message["role"]
+            path = Path(message.get("text", "")).expanduser()
+            if role == "image" and self.native_image_preview and sys.stdout.isatty():
+                try:
+                    sys.stdout.write("  ")
+                    sys.stdout.flush()
+                    window_rows = self.app.output.get_size().rows
+                    # Leave space for the input footer, surrounding messages
+                    # and file URI, so the HD image isn't cropped at the top.
+                    image_rows = min(24, max(8, window_rows - 21))
+                    render_native(
+                        str(path), sys.stdout.buffer,
+                        columns=min(72, max(6, width - 6)), rows=image_rows,
+                    )
+                    sys.stdout.write(self.render_message(
+                        role, str(path), width, False, False
+                    ).replace("Image ready · native HD is rendered in conversation scrollback",
+                              "High-quality PNG displayed above"))
+                    sys.stdout.flush()
+                    continue
+                except (ValueError, OSError) as error:
+                    sys.stdout.write(
+                        f"  Native image failed: {error}. Using ANSI fallback." + chr(10)
+                    )
+                    sys.stdout.flush()
+            sys.stdout.write(self.render_message(
+                role,
+                render_chatgpt_annotations(self.present_message(message)),
+                width,
+                index > 0, False,
+            ))
+        sys.stdout.flush()
 
     @staticmethod
     def write_terminal_history(rendered: str) -> None:
@@ -857,16 +897,15 @@ class ChatTui:
 
     def commit_initial_history(self) -> None:
         with self.lock:
-            messages = [dict(message) for message in self.messages]
+            messages = [dict(m) for m in self.messages]
         if not messages:
             return
         if self.cooldown_remaining():
             self.committed_message_count = 0
             return
-        rendered = self.render_history(messages)
-        committed = self.partition_history(rendered)
-        self.write_terminal_history(committed)
+        self.history_tail = ""
         self.committed_message_count = len(messages)
+        self.write_complete_messages(messages)
 
     def commit_loaded_history(self, messages: list[Message]) -> None:
         if self.cooldown_remaining():
@@ -875,31 +914,27 @@ class ChatTui:
             self.loading_started = None
             self.scroll_bottom()
             return
-        rendered = self.render_history(messages)
-        committed = self.partition_history(rendered)
+        self.history_tail = ""
         self.committed_message_count = len(messages)
 
-        def schedule_write() -> None:
-            def replay() -> None:
-                self.reset_terminal_session()
-                self.reload_virtual_placements(messages)
-                self.write_terminal_history(committed)
+        def write_loaded() -> None:
+            self.reset_terminal_session()
+            self.write_complete_messages(messages)
 
-            future = run_in_terminal(
-                replay,
-                render_cli_done=False,
-            )
-
+        def schedule() -> None:
+            future = run_in_terminal(write_loaded, render_cli_done=False)
             def finished(_future: Any) -> None:
                 self.loading_conversation = False
                 self.loading_started = None
                 self.status = "Ready"
                 self.scroll_bottom()
-
             future.add_done_callback(finished)
 
         if self.event_loop is not None:
-            self.event_loop.call_soon_threadsafe(schedule_write)
+            self.event_loop.call_soon_threadsafe(schedule)
+        else:
+            self.write_complete_messages(messages)
+            self.loading_conversation = False
 
     def commit_completed_turns(self) -> None:
         if self.cooldown_remaining():
@@ -907,27 +942,23 @@ class ChatTui:
             return
         with self.lock:
             end = len(self.messages)
-            messages = [
-                dict(message)
-                for message in self.messages[self.committed_message_count:end]
-            ]
-            # Remove completed turns from the live layout immediately. Rich
-            # rendering and terminal output happen off the input event loop.
+            messages = [dict(m) for m in self.messages[self.committed_message_count:end]]
             self.committed_message_count = end
         if not messages:
             return
-        rendered = self.render_history(messages)
-        committed = self.partition_history(self.history_tail + rendered)
+        self.history_tail = ""
 
-        def schedule_write() -> None:
+        def schedule() -> None:
             future = run_in_terminal(
-                lambda: self.write_terminal_history(committed),
+                lambda: self.write_complete_messages(messages),
                 render_cli_done=False,
             )
-            future.add_done_callback(lambda _future: self.scroll_bottom())
+            future.add_done_callback(lambda _: self.scroll_bottom())
 
         if self.event_loop is not None:
-            self.event_loop.call_soon_threadsafe(schedule_write)
+            self.event_loop.call_soon_threadsafe(schedule)
+        else:
+            self.write_complete_messages(messages)
 
     def render_formatted_transcript(self) -> ANSI:
         rendered = self.render_transcript()
@@ -1003,43 +1034,26 @@ class ChatTui:
             )
             console.print(Padding(content, (0, 2), style="#f2f0ec on #151413", expand=True))
         elif role == "image":
-            source = Path(text).expanduser()
-            path = source.resolve()
-            # Prefer full-pixel Kitty images in Ghostty/Kitty. ANSI half-blocks
-            # are the cross-terminal fallback, not the default on Mirai.
-            displayed_native = False
-            if self.native_image_preview and sys.stdout.isatty():
+            path = Path(text).expanduser().resolve()
+            if self.native_image_preview:
+                console.print(Padding(Text(
+                    "Image ready · native HD is rendered in conversation scrollback",
+                    style="#c4a7e7"
+                ), (0, 2), style="#f2f0ec on #151413", expand=True))
+            else:
                 try:
-                    image_id, columns, rows = self.register_virtual_image(str(path), width)
-                    red, green, blue = id_to_rgb(image_id)
-                    color = f"#{red:02x}{green:02x}{blue:02x} on #151413"
-                    for unicode_row in placeholder_rows(image_id, columns, rows):
-                        console.print(Padding(
-                            Text(unicode_row, style=color, no_wrap=True),
-                            (0, 2), expand=True,
-                            style="#f2f0ec on #151413",
-                        ))
-                    displayed_native = True
-                except (OSError, ValueError, RuntimeError) as error:
-                    console.print(Text(
-                        f"  Native image unavailable ({error}); showing fallback",
-                        style="#c4a7e7",
-                    ))
-            if not displayed_native:
-                try:
-                    preview = render_preview(str(path),
-                        max_columns=max(10, min(88, width - 7)),
-                        max_rows=26)
+                    preview = render_preview(
+                        str(path), max_columns=max(10, min(88, width - 7)),
+                        max_rows=26,
+                    )
                     console.print(Padding(
                         Text.from_ansi(preview), (0, 2),
                         style="#f2f0ec on #151413", expand=True,
                     ))
                 except (OSError, ValueError, ImportError) as error:
                     console.print(Padding(Text(
-                        f"Image preview unavailable: {error}", style="#c4a7e7"
+                        f"Preview unavailable: {error}", style="#c4a7e7"
                     ), (0, 2), style="#f2f0ec on #151413", expand=True))
-            # This explicit path is always present—even if the terminal cannot
-            # render a preview or the original image was generated via chat.
             if path.is_file():
                 caption = Text()
                 caption.append("  Saved original: ", style="#bfb8c9")
@@ -1572,6 +1586,7 @@ class ChatTui:
             self.messages.append({"role": "assistant", "text": ""})
         self.persist_local()
         self.busy = True
+        self.request_submitted = False
         self.active_started = time.monotonic()
         self.last_elapsed = None
         self.status = "Preparing secure request…"
@@ -2152,6 +2167,14 @@ class ChatTui:
         def on_event(event: dict[str, Any]) -> None:
             nonlocal rendered
             event_type = event.get("type")
+            if event_type == "phase":
+                value = event.get("status")
+                if isinstance(value, str) and len(value) < 120:
+                    self.status = value
+                if event.get("submitted") is True:
+                    self.request_submitted = True
+                self.app.invalidate()
+                return
             text = event.get("text")
             if event_type == "delta" and isinstance(text, str):
                 rendered += text
@@ -2219,6 +2242,9 @@ class ChatTui:
             self.status = "Ready"
         except Exception as error:
             self.pending_attachments[0:0] = attachments
+            # Preserve unsent text on every failure, not only on HTTP 429.
+            # A network timeout may have reached the server: never auto-retry.
+            self.recover_rate_limited_draft(prompt)
             retry = retry_after_seconds(str(error))
             if retry is not None:
                 deadline = time.time() + retry
@@ -2228,12 +2254,16 @@ class ChatTui:
                     self.messages[-1]["text"] = f"*Request stopped: {error}*"
                     self.messages[-1]["rate_limit_until"] = deadline
                 self.status = f"Rate limit · retry in {format_remaining(retry)}"
-                self.recover_rate_limited_draft(prompt)
             else:
                 if not rendered:
                     with self.lock:
-                        self.messages[-1]["text"] = f"*Request stopped: {error}*"
-                self.status = "Response stopped"
+                        self.messages[-1]["text"] = (
+                            f"*Request stopped: {error}*" + chr(10) * 2 +
+                            "Your prompt is preserved in the input. "
+                            "Submission status may be uncertain; check the CLI Project "
+                            "before retrying to avoid a duplicate."
+                        )
+                self.status = "Request failed · draft preserved"
         finally:
             if self.active_started is not None:
                 self.last_elapsed = time.monotonic() - self.active_started

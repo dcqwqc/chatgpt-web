@@ -76,36 +76,27 @@ class NativeInlineTests(unittest.TestCase):
         with patch("chatgpt_tui.sys.stdout", terminal):
             return tui.render_message("image", str(self.file), 92, False, False)
 
-    def test_inline_is_real_image_cells_and_file_link(self):
-        tui = ChatTui(lambda: [],lambda _: {},lambda *args: {})
+    def test_native_image_uses_direct_pixel_packets_in_scrollback(self):
+        tui = ChatTui(lambda: [], lambda _: {}, lambda *args: {})
+        tui.native_image_preview = True
+        terminal = TTYStub()
+        with patch("chatgpt_tui.sys.stdout", terminal):
+            tui.write_complete_messages([{"role":"image", "text":str(self.file)}])
+        data = terminal.buffer.getvalue()
+        self.assertIn(b"a=T,f=100", data)
+        self.assertNotIn(b"U=1", data)
+        self.assertIn("Saved original:", tui.render_message("image", str(self.file), 90, False, False))
+        self.assertIn(self.file.as_uri(), tui.render_message("image", str(self.file), 90, False, False))
+
+    def test_live_image_is_non_blank_placeholder_with_saved_path(self):
+        tui = ChatTui(lambda: [], lambda _: {}, lambda *args: {})
         tui.native_image_preview = True
         terminal = TTYStub()
         output = self.render(tui, terminal)
-        self.assertIn(PLACEHOLDER, output)
-        self.assertNotIn("▀", output)
+        self.assertNotIn(PLACEHOLDER, output)
+        self.assertIn("Image ready", output)
         self.assertIn(self.file.as_uri(), output)
-        self.assertIn("/open", output)
-        self.assertIn(b"U=1",terminal.buffer.getvalue())
-
-        # prompt_toolkit's ANSI parser preserves the same colored placeholder
-        # cells and combining diacritics across TUI repaint.
-        pairs = ANSI(output).__pt_formatted_text__()
-        text = "".join(part for _,part,*_ in pairs)
-        self.assertIn(PLACEHOLDER + DIACRITICS[0] + DIACRITICS[0],text)
-        self.assertEqual(text.count(PLACEHOLDER), 72 * 22)
-        colors = {style for style,part,*_ in pairs if part == PLACEHOLDER}
-        self.assertEqual(len(colors),1)
-
-    def test_redraw_keeps_cells_without_reuploading(self):
-        tui = ChatTui(lambda: [],lambda _: {},lambda *args: {})
-        tui.native_image_preview = True
-        terminal = TTYStub()
-        first = self.render(tui, terminal)
-        uploaded = len(terminal.buffer.getvalue())
-        self.assertGreater(uploaded,100)
-        second = self.render(tui, terminal)
-        self.assertEqual(first,second)
-        self.assertEqual(len(terminal.buffer.getvalue()),uploaded)
+        self.assertEqual(len(terminal.buffer.getvalue()), 0)
 
     def test_terminal_reload_resends_virtual_placement(self):
         tui = ChatTui(lambda: [],lambda _: {},lambda *args: {})
