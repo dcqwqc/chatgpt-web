@@ -62,7 +62,9 @@ class SentinelCompatibilityError(ChatGPTWebError):
 def default_socket_path() -> Path:
     runtime = os.environ.get("XDG_RUNTIME_DIR")
     base = Path(runtime) if runtime else Path("/tmp") / f"chatgpt-web-{os.getuid()}"
-    return base / "chatgpt-web" / "daemon.sock" if runtime else base / "daemon.sock"
+    # Versioned socket lets upgraded clients start a new backend safely
+    # without killing an older daemon that may still be serving a live turn.
+    return base / "chatgpt-web" / "daemon-v2.sock" if runtime else base / "daemon-v2.sock"
 
 
 def auth_store_path() -> Path:

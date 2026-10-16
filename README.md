@@ -492,3 +492,12 @@ The proof processes have 15-second limits, requirements retrieval has a
 All failed sends preserve the unsent prompt; no automatic retry occurs because
 network errors may leave submission status uncertain. The 429 cooldown
 continues to report only real Retry-After times.
+
+### Non-disruptive daemon upgrade
+
+CLI version 2 uses a versioned daemon-v2.sock as its default socket.
+An older process still handling a request on daemon.sock is left intact;
+new invocations start and use the upgraded backend without interrupting
+that operation. Explicit --socket PATH can still connect to a particular
+daemon if needed. This is a service migration, not a reset of Project,
+model selection, conversation history, authentication, or generated images.
