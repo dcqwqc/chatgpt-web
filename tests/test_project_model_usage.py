@@ -76,7 +76,7 @@ class BackendTests(unittest.TestCase):
         self.client.send_prompt_direct = Mock(return_value=("test-chat", "user-msg"))
         self.client.get_conversation = Mock(return_value={"gizmo_id": None})
         self.client.request = Mock()
-        with self.assertRaisesRegex(self.app.ChatGPTWebError, "did not confirm CLI Project"):
+        with self.assertRaisesRegex(self.app.ChatGPTWebError, "did not preserve the requested conversation/Project"):
             self.client.send_prompt(None, "hello")
         self.client.request.assert_called_once()
 
@@ -106,3 +106,47 @@ class BackendTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InteractiveContinuationTests(unittest.TestCase):
+    def setUp(self):
+        self.app = load_application()
+        self.client = object.__new__(self.app.ChatGPTWebClient)
+        self.client.target_project_id = Mock(return_value=PROJECT_ID)
+
+    def test_interactive_normal_chat_preserves_original_context(self):
+        before = {"id":"external-chat","gizmo_id":None,"messages":[]}
+        after = {"id":"external-chat","gizmo_id":None,
+                 "messages":[{"id":"submitted-user"}]}
+        self.client.get_conversation = Mock(side_effect=[before, after])
+        self.client.send_prompt_direct = Mock(return_value=("external-chat","submitted-user"))
+        cid, _, _ = self.client.send_prompt(
+            "external-chat", "hello", allow_existing_outside_project=True
+        )
+        self.assertEqual(cid, "external-chat")
+        self.client.send_prompt_direct.assert_called_once()
+
+    def test_cross_project_route_must_not_change(self):
+        before = {"id":"external-chat","gizmo_id":None,"messages":[]}
+        after = {"id":"external-chat","gizmo_id":PROJECT_ID,
+                 "messages":[{"id":"submitted-user"}]}
+        self.client.get_conversation = Mock(side_effect=[before,after])
+        self.client.send_prompt_direct = Mock(return_value=("external-chat","submitted-user"))
+        with self.assertRaisesRegex(self.app.ChatGPTWebError,"did not preserve"):
+            self.client.send_prompt("external-chat","hello",allow_existing_outside_project=True)
+
+    def test_body_for_normal_chat_excludes_cli_project(self):
+        body = self.client.create_conversation_body(
+            {"id":"normal-chat","gizmo_id":None,"current_node":"parent"}, "hello")
+        self.assertNotIn("gizmo_id", body)
+        self.assertNotIn("conversation_template_id", body)
+        self.assertEqual(body["conversation_mode"], {"kind":"primary_assistant"})
+        self.assertEqual(body["conversation_id"], "normal-chat")
+        self.assertEqual(body["parent_message_id"], "parent")
+
+    def test_body_for_other_project_keeps_original_project(self):
+        other = "g-p-" + "b"*32
+        body = self.client.create_conversation_body({"id":"other-chat","gizmo_id":other}, "hi")
+        self.assertEqual(body["gizmo_id"], other)
+        self.assertEqual(body["conversation_template_id"], other)
+        self.assertNotEqual(body["gizmo_id"], PROJECT_ID)

@@ -42,6 +42,7 @@ from rich.style import Style as RichStyle
 from rich.syntax import Syntax
 from rich.text import Text
 from image_preview import render_preview
+from web_content import render_web_elements
 from terminal_native import supports_native, render_native
 from kitty_placeholders import prepare_virtual_image, placeholder_rows, id_to_rgb
 from rich.theme import Theme
@@ -185,7 +186,8 @@ class SlashCommandCompleter(Completer):
         ("/usage", "view current ChatGPT Web usage status"),
         ("/history", "reload this conversation"),
         ("/rename", "rename this conversation"),
-        ("/copy", "copy the latest response"),
+        ("/copy", "copy response, or /copy code 1"),
+        ("/web", "open this chat in the browser"),
         ("/image", "generate an image from a prompt"),
         ("/edit", "edit an image: PATH | prompt"),
         ("/animate", "generate an animated WebP"),
@@ -297,7 +299,7 @@ def render_chatgpt_annotations(text: str) -> str:
     rendered = re.sub(r"\ue200[^\ue201]*$", "", rendered)
     rendered = rendered.replace("\ue200", "").replace("\ue201", "").replace("\ue202", "")
     rendered = re.sub(r"[ \t]+([,.;:!?])", r"\1", rendered)
-    return rendered
+    return render_web_elements(rendered)
 
 
 def visible_chat_message(message: dict[str, Any]) -> Message | None:
@@ -688,7 +690,7 @@ class ChatTui:
         title = self.title if len(self.title) <= 34 else self.title[:31] + "…"
         model_text = f" {self.model} "
         state_text = f"{state} "
-        context = f"· CLI Project · {title} · {cwd} "
+        context = f"· ChatGPT Web · {title} · {cwd} "
         width = self.transcript_width() + 3
         if not cooldown:
             return FormattedText([
@@ -1645,7 +1647,9 @@ class ChatTui:
         elif name == "/rename":
             self.rename_current_conversation(argument)
         elif name == "/copy":
-            self.copy_latest_response()
+            self.copy_latest_response(argument)
+        elif name == "/web":
+            self.open_current_in_browser()
         elif name in ("/image", "/edit", "/animate"):
             self.start_image_command(name, argument)
         elif name == "/preview":
@@ -1670,6 +1674,8 @@ class ChatTui:
                 "- `/history` reload this conversation\n"
                 "- `/rename TITLE` rename this conversation\n"
                 "- `/copy` copy the latest assistant response\n"
+                "- /copy code 1: copy the first code block\n"
+                "- /web: open this conversation in ChatGPT Web\n"
                 "- `/remove` remove the latest pending image\n"
                 "- `/clear` clear the displayed transcript\n"
                 "- `/exit` or `/quit` quit"
@@ -1928,7 +1934,28 @@ class ChatTui:
 
         threading.Thread(target=upload, daemon=True).start()
 
-    def copy_latest_response(self) -> None:
+    def open_current_in_browser(self) -> None:
+        """Use the real web interface for controls a terminal cannot execute."""
+        chat_id = self.conversation_id
+        if chat_id and not re.fullmatch(r"[a-zA-Z0-9_-]{8,100}", chat_id):
+            self.status = "Invalid conversation ID; browser not opened"
+            self.app.invalidate()
+            return
+        url = "https://chatgpt.com/c/" + chat_id if chat_id else "https://chatgpt.com/"
+        executable = shutil.which("xdg-open")
+        if not executable:
+            self.status = "No desktop browser opener installed"
+        else:
+            try:
+                subprocess.Popen([executable, url], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+                self.status = "Opened conversation in the browser"
+            except OSError as error:
+                self.status = f"Could not open browser: {error}"
+        self.app.invalidate()
+
+    def copy_latest_response(self, argument: str = "") -> None:
         with self.lock:
             response = next(
                 (
@@ -1944,6 +1971,21 @@ class ChatTui:
             return
 
         response = render_chatgpt_annotations(response)
+        if argument.strip():
+            parts = argument.split()
+            if parts[0] != "code" or len(parts) > 2 or (
+                len(parts) == 2 and (not parts[1].isdigit() or int(parts[1]) < 1)
+            ):
+                self.status = "Usage: /copy [code [number]]"
+                self.app.invalidate()
+                return
+            blocks = re.findall('(?ms)^```[^\\n]*\\n(.*?)^```', response)
+            selected = int(parts[1]) if len(parts) == 2 else 1
+            if selected > len(blocks):
+                self.status = f"Only {len(blocks)} code blocks in the latest response"
+                self.app.invalidate()
+                return
+            response = blocks[selected - 1].rstrip(chr(10))
         clipboard_commands = (
             ("wl-copy", ["wl-copy"]),
             ("xclip", ["xclip", "-selection", "clipboard"]),
@@ -2108,7 +2150,7 @@ class ChatTui:
                     messages.append({
                         "role": "system",
                         "text": "Loaded a locally cached copy because ChatGPT is temporarily unavailable. "
-                                "New messages still require a valid CLI Project connection.",
+                                "Replies are verified against the original conversation online.",
                     })
                 with self.lock:
                     self.messages = messages
