@@ -114,4 +114,4 @@ class VersionedDaemonTests(unittest.TestCase):
         m=backend()
         with patch.dict(__import__("os").environ, {"XDG_RUNTIME_DIR":"/tmp/unit-runtime"}):
             self.assertEqual(str(m.default_socket_path()),
-                             "/tmp/unit-runtime/chatgpt-web/daemon-v2.sock")
+                             "/tmp/unit-runtime/chatgpt-web/daemon-v3.sock")

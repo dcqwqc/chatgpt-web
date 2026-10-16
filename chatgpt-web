@@ -22,6 +22,9 @@ from pathlib import Path
 import re
 import signal
 import shutil
+import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import socket
 import subprocess
 import sys
@@ -64,7 +67,7 @@ def default_socket_path() -> Path:
     base = Path(runtime) if runtime else Path("/tmp") / f"chatgpt-web-{os.getuid()}"
     # Versioned socket lets upgraded clients start a new backend safely
     # without killing an older daemon that may still be serving a live turn.
-    return base / "chatgpt-web" / "daemon-v2.sock" if runtime else base / "daemon-v2.sock"
+    return base / "chatgpt-web" / "daemon-v3.sock" if runtime else base / "daemon-v3.sock"
 
 
 def auth_store_path() -> Path:
@@ -91,9 +94,11 @@ def active_conversation_path() -> Path:
 
 def atomic_json_write(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor, tmp = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+    )
+    temporary = Path(tmp)
     try:
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             json.dump(value, stream, ensure_ascii=False, separators=(",", ":"))
             stream.write("\n")
@@ -188,8 +193,10 @@ def save_auth_snapshot(url: str, headers: dict[str, str]) -> None:
     path = auth_store_path()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
-    temporary = path.with_suffix(f".tmp-{os.getpid()}")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    descriptor, tmp = tempfile.mkstemp(
+        prefix=".session-", suffix=".tmp", dir=path.parent,
+    )
+    temporary = Path(tmp)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             json.dump({"version": 1, "url": url, "headers": headers}, stream)
@@ -1504,9 +1511,11 @@ def run_fullscreen(
         ensure_service()
         return daemon_request(socket_path, {"command": "usage"})
 
-    local_active = local_history.active()
-    if local_active is not None and (conversation_id is None or
-                                    local_active.get("server_id") == conversation_id):
+    # Each terminal owns its own initial session. Global active.json is just
+    # the most recently saved pointer for explicit /resume, not an implicit
+    # shared chat opened in every terminal.
+    local_active = local_history.active() if conversation_id is not None else None
+    if local_active is not None and local_active.get("server_id") == conversation_id:
         cached_conversation = {
             "id": local_active.get("server_id"),
             "title": local_active.get("title"),
@@ -1884,6 +1893,102 @@ def handle_daemon_command(
     raise ChatGPTWebError(f"unknown daemon command: {command}")
 
 
+
+MAX_CONCURRENT_REQUESTS = 8
+
+
+def client_for_connection(
+    cdp_url: str, initial_url: str, initial_headers: dict[str, str],
+) -> ChatGPTWebClient:
+    """Use isolated session state and HTTP connection per worker.
+
+    Never share the mutable auth headers or the streaming httpx.Client across
+    simultaneous CLI requests. Authenticate the daemon once on startup.
+    """
+    client = object.__new__(ChatGPTWebClient)
+    client.cdp_url = cdp_url
+    client.list_url = initial_url
+    client.headers = initial_headers.copy()
+    client.http = httpx.Client(
+        follow_redirects=False, timeout=httpx.Timeout(30.0),
+    )
+    return client
+
+
+def process_daemon_connection(
+    connection: socket.socket,
+    request: dict[str, Any],
+    client: ChatGPTWebClient,
+    active_conversations: set[str],
+    active_lock: threading.Lock,
+    stop_event: threading.Event,
+) -> None:
+    """Handle a single request without blocking other terminals' requests."""
+    command = request.get("command")
+    conversation_id = request.get("conversation_id")
+    locked_id = None
+    if command in ("send", "send_stream") and isinstance(conversation_id, str):
+        with active_lock:
+            if conversation_id in active_conversations:
+                raise ChatGPTWebError(
+                    "Another terminal is already sending in this conversation. "
+                    "Different CLI Project chats can run concurrently."
+                )
+            active_conversations.add(conversation_id)
+            locked_id = conversation_id
+    try:
+        if command == "send_stream":
+            prompt = request.get("prompt")
+            attachments = request.get("attachments", [])
+            if conversation_id is not None and not isinstance(conversation_id, str):
+                raise ChatGPTWebError("invalid conversation ID")
+            if not isinstance(prompt, str) or (
+                not prompt.strip() and not attachments
+            ):
+                raise ChatGPTWebError("prompt or attachment is required")
+            if not isinstance(attachments, list):
+                raise ChatGPTWebError("invalid attachment list")
+            resolved_id, conversation, previous_ids = client.send_prompt(
+                conversation_id, prompt, attachments,
+                lambda event: send_json_line(connection, {"ok": True, "event": event}),
+            )
+            normalized = cache_conversation(conversation)
+            media_paths: list[str] = []
+            media_warning = None
+            if image_asset_ids(conversation):
+                send_json_line(connection, {"ok": True, "event": {
+                    "type": "phase", "status": "Saving generated image locally…",
+                    "submitted": True,
+                }})
+                try:
+                    media_paths = download_generated_images(
+                        client, conversation,
+                        conversation_cache_dir().parent / "images" / "web-generated",
+                    )
+                except (ValueError, httpx.HTTPError, OSError, ChatGPTWebError) as error:
+                    media_warning = str(error)[:200]
+            normalized["media_files"] = media_paths
+            if media_warning:
+                normalized["media_warning"] = media_warning
+            cache_conversation(normalized)
+            send_json_line(connection, {"ok": True, "result": {
+                "conversation_id": resolved_id,
+                "conversation": conversation,
+                "previous_ids": sorted(previous_ids),
+                "media_files": media_paths,
+                "media_warning": media_warning,
+            }})
+        else:
+            result, should_stop = handle_daemon_command(client, request)
+            send_json(connection, {"ok": True, "result": result})
+            if should_stop:
+                stop_event.set()
+    finally:
+        if locked_id is not None:
+            with active_lock:
+                active_conversations.discard(locked_id)
+
+
 def run_daemon(socket_path: Path, cdp_url: str) -> int:
     socket_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(socket_path.parent, 0o700)
@@ -1898,98 +2003,98 @@ def run_daemon(socket_path: Path, cdp_url: str) -> int:
     if socket_path.exists():
         socket_path.unlink()
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    stopping = False
+    stop_event = threading.Event()
+    active_lock = threading.Lock()
+    active_conversations: set[str] = set()
+    slots = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
 
     def request_stop(_signum: int, _frame: object) -> None:
-        nonlocal stopping
-        stopping = True
-        server.close()
+        stop_event.set()
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
-    try:
-        with ChatGPTWebClient(cdp_url) as client:
-            server.bind(str(socket_path))
-            os.chmod(socket_path, 0o600)
-            server.listen(8)
-            while not stopping:
-                try:
-                    connection, _ = server.accept()
-                except OSError:
-                    if stopping:
-                        break
-                    raise
-                stop_after_response = False
-                with connection:
+
+    def handle_worker(
+        connection: socket.socket,
+        request: dict[str, Any],
+        auth_url: str,
+        auth_headers: dict[str, str],
+    ) -> None:
+        try:
+            with connection:
+                with client_for_connection(cdp_url, auth_url, auth_headers) as client:
                     try:
-                        request = receive_json(connection)
-                        if request.get("command") == "send_stream":
-                            conversation_id = request.get("conversation_id")
-                            prompt = request.get("prompt")
-                            attachments = request.get("attachments", [])
-                            if conversation_id is not None and not isinstance(
-                                conversation_id, str
-                            ):
-                                raise ChatGPTWebError("invalid conversation ID")
-                            if not isinstance(prompt, str) or (
-                                not prompt.strip() and not attachments
-                            ):
-                                raise ChatGPTWebError("prompt or attachment is required")
-                            if not isinstance(attachments, list):
-                                raise ChatGPTWebError("invalid attachment list")
-                            resolved_id, conversation, previous_ids = client.send_prompt(
-                                conversation_id,
-                                prompt,
-                                attachments,
-                                lambda event: send_json_line(connection, {
-                                    "ok": True, "event": event,
-                                }),
-                            )
-                            normalized = cache_conversation(conversation)
-                            media_paths = []
-                            media_warning = None
-                            if image_asset_ids(conversation):
-                                send_json_line(connection, {"ok": True, "event": {
-                                    "type": "phase", "status": "Saving generated image locally…",
-                                    "submitted": True,
-                                }})
-                                try:
-                                    media_paths = download_generated_images(
-                                        client, conversation,
-                                        conversation_cache_dir().parent / "images" / "web-generated",
-                                    )
-                                except (ValueError, httpx.HTTPError, OSError, ChatGPTWebError) as error:
-                                    media_warning = str(error)[:200]
-                            normalized["media_files"] = media_paths
-                            if media_warning:
-                                normalized["media_warning"] = media_warning
-                            cache_conversation(normalized)
-                            send_json_line(connection, {
-                                "ok": True,
-                                "result": {
-                                    "conversation_id": resolved_id,
-                                    "conversation": conversation,
-                                    "previous_ids": sorted(previous_ids),
-                                    "media_files": media_paths,
-                                    "media_warning": media_warning,
-                                },
-                            })
-                            continue
-                        result, stop_after_response = handle_daemon_command(client, request)
-                        send_json(connection, {"ok": True, "result": result})
-                    except (ChatGPTWebError, httpx.HTTPError, OSError) as error:
+                        process_daemon_connection(
+                            connection, request, client,
+                            active_conversations, active_lock, stop_event,
+                        )
+                    except (ChatGPTWebError, httpx.HTTPError, OSError, ValueError) as error:
                         try:
-                            send_json_line(connection, {
-                                "ok": False, "error": str(error),
-                            })
+                            send_json_line(connection, {"ok": False, "error": str(error)})
                         except OSError:
                             pass
-                if stop_after_response:
-                    stopping = True
+        finally:
+            slots.release()
+
+    try:
+        with ChatGPTWebClient(cdp_url) as bootstrap:
+            server.bind(str(socket_path))
+            os.chmod(socket_path, 0o600)
+            server.listen(32)
+            server.settimeout(0.25)
+            with ThreadPoolExecutor(
+                max_workers=MAX_CONCURRENT_REQUESTS, thread_name_prefix="cli-web"
+            ) as workers:
+                while not stop_event.is_set():
+                    try:
+                        connection, _ = server.accept()
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        if stop_event.is_set():
+                            break
+                        raise
+                    # Read only a small control envelope on the accept loop.
+                    # An unresponsive client cannot keep this loop blocked.
+                    connection.settimeout(3.0)
+                    try:
+                        request = receive_json(connection)
+                        connection.settimeout(None)
+                    except (OSError, ChatGPTWebError) as error:
+                        with connection:
+                            try:
+                                send_json_line(connection, {"ok": False, "error": str(error)})
+                            except OSError:
+                                pass
+                        continue
+                    command = request.get("command")
+                    if command == "ping":
+                        with connection:
+                            send_json(connection, {"ok": True, "result": {"ready": True}})
+                        continue
+                    if not slots.acquire(blocking=False):
+                        with connection:
+                            send_json_line(connection, {"ok": False, "error":
+                                "CLI has 8 active requests. Wait for a free slot."
+                            })
+                        continue
+                    # Refresh each worker's credentials from the atomic shared
+                    # auth snapshot when available; this also picks up a recent
+                    # account session refresh performed by another worker.
+                    try:
+                        auth_url, auth_headers = load_auth_snapshot()
+                    except ChatGPTWebError:
+                        auth_url, auth_headers = bootstrap.list_url, bootstrap.headers.copy()
+                    try:
+                        workers.submit(handle_worker, connection, request, auth_url, auth_headers)
+                    except RuntimeError:
+                        slots.release()
+                        connection.close()
+                        if not stop_event.is_set():
+                            raise
     finally:
         server.close()
-        if socket_path.exists():
-            socket_path.unlink()
+        socket_path.unlink(missing_ok=True)
         lock.close()
     return 0
 
@@ -2107,10 +2212,8 @@ def main() -> int:
                 raise ChatGPTWebError(
                     "interactive mode requires a terminal; use new or send for piped input"
                 )
-            cached = load_cached_conversation()
-            return run_fullscreen(
-                args.socket, cached_conversation=cached, cdp_url=args.cdp_url
-            )
+            # Fresh terminal, fresh session; past chats remain in /resume.
+            return run_fullscreen(args.socket, cdp_url=args.cdp_url)
         if args.command == "resume":
             cached = load_cached_conversation(args.conversation_id)
             return run_fullscreen(

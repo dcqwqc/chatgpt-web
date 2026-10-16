@@ -501,3 +501,29 @@ new invocations start and use the upgraded backend without interrupting
 that operation. Explicit --socket PATH can still connect to a particular
 daemon if needed. This is a service migration, not a reset of Project,
 model selection, conversation history, authentication, or generated images.
+
+### Simultaneous CLI terminals (2026-10-16)
+
+The daemon now serves independent terminal requests concurrently (up to eight
+active requests per local server), rather than keeping every new client behind
+a single long-running image-generation or text-stream operation. Each worker
+has independent authenticated HTTP state and stream events. Pings are handled
+on the accepting thread and stay responsive during active generations.
+A separate session's /resume, /model and /usage can also run while another
+chat is generating.
+
+Launching chatgpt-web starts a NEW local conversation for that terminal;
+this avoids silently opening the same last-active conversation twice.
+Old chats are still available in /resume (Ctrl+R), and explicit
+chatgpt-web resume CONVERSATION_ID still restores the requested chat.
+
+If two terminals select the SAME conversation and attempt to send together,
+the later send receives a clear same-conversation conflict; independent
+conversations proceed in parallel. This protects against losing a branch
+or overwriting messages in shared conversation history. ChatGPT account
+quota and rate limits remain shared and cannot be bypassed by parallel clients.
+
+The upgraded backend uses daemon-v3.sock so an older busy daemon and its
+existing CLI session can finish safely without being killed. Restart both
+CLI windows to use the concurrent server. Per-thread temporary files prevent
+auth/session and conversation cache corruption during parallel writes.
