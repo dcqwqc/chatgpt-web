@@ -1623,7 +1623,11 @@ def daemon_stream_request(
     on_connection: Any = None,
 ) -> dict[str, Any]:
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    connection.settimeout(330)
+    # Coding responses can legitimately run much longer than five minutes.
+    # The external fleet still enforces its own bounded 1,250-second worker
+    # deadline. A short idle socket timeout was incorrectly aborting valid
+    # ChatGPT Web conversations before their source output was finished.
+    connection.settimeout(1160)
     result: dict[str, Any] | None = None
     try:
         connection.connect(str(socket_path))
