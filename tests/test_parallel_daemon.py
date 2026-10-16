@@ -98,6 +98,43 @@ def background_daemon():
 
 
 class ParallelDaemonIntegrationTests(TestCase):
+    def test_bootstrap_uses_saved_auth_without_waiting_for_browser_capture(self):
+        m = backend()
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {
+            "XDG_DATA_HOME": root, "XDG_RUNTIME_DIR": root,
+        }):
+            path = Path(root) / "auth-bootstrap.sock"
+            control = {"entered": [], "started": threading.Event(),
+                       "first_started": threading.Event(),
+                       "second_started": threading.Event(),
+                       "release": threading.Event()}
+            errors = []
+            with patch.object(m, "load_auth_snapshot", return_value=(
+                "https://chatgpt.com/backend-api/conversations",
+                {"authorization": "test-only"},
+            )), patch.object(m, "ChatGPTWebClient", side_effect=AssertionError(
+                "browser capture should not run when saved auth exists"
+            )), patch.object(m, "client_for_connection",
+                side_effect=lambda *_: FakeClient(control)
+            ), patch.object(m.signal, "signal"):
+                def launch():
+                    try:
+                        m.run_daemon(path, "http://127.0.0.1:9334")
+                    except Exception as error:
+                        errors.append(error)
+                daemon = threading.Thread(target=launch, daemon=True)
+                daemon.start()
+                for _ in range(100):
+                    if path.exists():
+                        break
+                    time.sleep(0.02)
+                self.assertTrue(path.exists(), repr(errors))
+                self.assertTrue(m.daemon_request(path, {"command": "ping"})["ready"])
+                m.daemon_request(path, {"command": "stop"})
+                daemon.join(5)
+                self.assertFalse(daemon.is_alive())
+                self.assertFalse(errors, repr(errors))
+
     def test_two_terminals_stream_simultaneously_without_cross_talk(self):
         with background_daemon() as (m,path,control):
             outcomes = {}

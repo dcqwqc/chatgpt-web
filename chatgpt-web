@@ -256,7 +256,12 @@ def capture_auth(cdp_url: str) -> tuple[str, dict[str, str]]:
         raise ChatGPTWebError(detail)
     try:
         captured = json.loads(result.stdout)
-        url = captured["url"]
+        captured_url = captured["url"]
+        origin = urlsplit(captured_url)
+        if (origin.scheme != "https" or origin.netloc != "chatgpt.com"
+                or not origin.path.startswith("/backend-api/")):
+            raise ChatGPTWebError("Chrome auth capture had an invalid origin")
+        url = urljoin(CHATGPT_ORIGIN, "/backend-api/conversations")
         headers = {
             key.lower(): value for key, value in captured["headers"].items()
             if key.lower() not in FORBIDDEN_REPLAY_HEADERS
@@ -2037,7 +2042,18 @@ def run_daemon(socket_path: Path, cdp_url: str) -> int:
             slots.release()
 
     try:
-        with ChatGPTWebClient(cdp_url) as bootstrap:
+        # A valid saved session is enough to start the local daemon. Avoid
+        # re-capturing browser traffic on every restart: Chrome may be open
+        # but unable to produce the auth probe while other work is running.
+        try:
+            bootstrap_url, bootstrap_headers = load_auth_snapshot()
+        except ChatGPTWebError:
+            bootstrap = ChatGPTWebClient(cdp_url)
+        else:
+            bootstrap = client_for_connection(
+                cdp_url, bootstrap_url, bootstrap_headers,
+            )
+        with bootstrap:
             server.bind(str(socket_path))
             os.chmod(socket_path, 0o600)
             server.listen(32)

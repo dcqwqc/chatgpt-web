@@ -59,9 +59,12 @@ async function main() {
     // Query parameters such as pagination and sidebar visibility may change.
     try {
       const url = new URL(request.url);
+      // The SPA no longer reliably fetches /backend-api/conversations on
+      // reload. Any same-origin authenticated backend GET supplies the
+      // browser's current auth headers; Python normalizes the verification URL.
       return request.method === "GET" &&
         url.origin === "https://chatgpt.com" &&
-        url.pathname === "/backend-api/conversations";
+        url.pathname.startsWith("/backend-api/");
     } catch {
       return false;
     }
