@@ -575,6 +575,34 @@ extension in `bb-plugin-provider-icons/` overrides native Codex and Codex
 Lina with the Codex mark, and ChatGPT Web CLI with the ChatGPT knot, using
 BB's supported providerIcon slot and local validated SVG assets.
 
+#### Login and send compatibility (2026-10-29)
+
+Philipedia's owner-controlled Chrome profile is displayed in Xpra :140.
+Launch it as a normal visible browser (the service's `login_native.py`),
+**not** Playwright's `launch_persistent_context`: Cloudflare's repeated
+challenge previously blocked all sends despite valid saved cookies.
+The existing profile was backed up outside the repository before this
+change, and CDP remains restricted to `127.0.0.1:9334`. Human login
+and security verification stay manual; there is no CAPTCHA bypass.
+
+The ChatGPT UI now uses a ProseMirror `[data-chatgpt-composer]`
+contenteditable and a `button[type=submit][aria-label=Send]` rather
+than the retired `#prompt-textarea` and `data-testid=send-button`.
+`chrome-recipe.js` handles both selectors. The first-party
+sentinel signature can change; the CLI then uses the authenticated
+browser's own send recipe and verifies the saved conversation.
+BB supplies its plugin tools as a large `<system_instructions>...`
+envelope inside ACP prompt text. The adapter deliberately removes that
+BB-only wrapper; the text-only ChatGPT Web account has no BB tools,
+so forwarding those instructions caused long composer input and errors.
+All actual user text after the closing tag is preserved.
+
+Verified by a real CLI conversation (QW8-OK), a BB round-trip (BB9-OK),
+and recovery of an existing failed BB thread (reply received, idle).
+If a failed BB turn cannot be recovered by `bb thread retry`, send the
+user's prompt again through the **same** thread: BB's retry may submit
+"Please continue" rather than the original text.
+
 The agent is **text-only advisory**: it does not implement coding tool calls, filesystem access, shell execution, or BB workspace mutation. Never interpret its prose as evidence that repository changes were made. It uses the browser-authenticated ChatGPT Web service, not the OpenAI API or Codex quota; account/rate limits and account model access apply.
 
 The CLI requires an existing authenticated Chrome profile and its existing ChatGPT Project named `CLI`. The project lookup follows all sidebar pagination cursors and verifies the saved Project ID. If ChatGPT's signer changes or the Chrome session presents a human verification challenge, sending **fails closed**; the user must resolve interactive verification or use a supported alternative provider. This adapter does not bypass website verification.

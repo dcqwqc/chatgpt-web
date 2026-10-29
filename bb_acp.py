@@ -151,6 +151,26 @@ def load_session(sid: str) -> dict[str, Any]:
     return s
 
 
+def remove_bb_system_envelope(text: str) -> str:
+    """BB passes host/plugin tool instructions inside a tagged text envelope.
+
+    The Web CLI is text-only and has no BB tool runtime. Forwarding this
+    enormous agent-only envelope as the user's message is misleading, can
+    exceed browser composer limits, and can cause send failures. Preserve
+    every byte after a properly delimited envelope (the actual user input).
+    Never remove arbitrary user text appearing elsewhere in the prompt.
+    """
+    raw = text.lstrip()
+    prefix = "<system_instructions>"
+    suffix = "</system_instructions>"
+    if not raw.startswith(prefix):
+        return text
+    end = raw.find(suffix, len(prefix))
+    if end < 0:
+        return text
+    return raw[end + len(suffix):].lstrip()
+
+
 class Server:
     def __init__(self):
         self.sessions: dict[str, dict[str, Any]] = {}
@@ -283,7 +303,9 @@ class Server:
                 pieces.append(str(block["text"]))
         if not pieces:
             raise ValueError("Text prompt is empty")
-        prompt = "\n".join(pieces)
+        prompt = remove_bb_system_envelope("\n".join(pieces))
+        if not prompt.strip():
+            raise ValueError("User prompt is empty after removing BB host instructions")
         if not session.get("conversation_id"):
             prompt = ("[Adapter capability notice: this ChatGPT Web connection has no "
                       "filesystem, shell, code-execution or BB tool access. Never claim "

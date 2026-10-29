@@ -20,6 +20,20 @@ def source_catalog():
     models.append({"slug":"chatgpt_alpha_internal","title":"Internal","efforts":[]})
     return models
 
+class BbInstructionEnvelopeTests(unittest.TestCase):
+    def test_only_the_bb_prefix_is_removed(self):
+        s = "<system_instructions>bb generated tool instructions</system_instructions> Hi!"
+        self.assertEqual(bb_acp.remove_bb_system_envelope(s), "Hi!")
+        self.assertEqual(bb_acp.remove_bb_system_envelope(
+            "What does <system_instructions> mean?"),
+            "What does <system_instructions> mean?")
+        self.assertEqual(bb_acp.remove_bb_system_envelope(
+            "<system_instructions>Unclosed instructions"),
+            "<system_instructions>Unclosed instructions")
+        self.assertEqual(bb_acp.remove_bb_system_envelope(
+            "  <system_instructions>instructions</system_instructions>\nuser text"),
+            "user text")
+
 class FamilyTests(unittest.TestCase):
     def test_four_families_only_available_variants_and_no_fabricated_auto(self):
         x=bb_acp.build_families(source_catalog())
@@ -100,6 +114,35 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         r=(await self.request(9,"session/load",{"sessionId":sid,"cwd":"/tmp","mcpServers":[]}))["result"]
         self.assertEqual(r["configOptions"][1]["currentValue"],"thinking")
         self.assertEqual(bb_acp.load_session(sid)["model"],"gpt-6-mini")
+
+    async def test_bb_system_envelope_is_not_forwarded_as_user_text(self):
+        sid = "c" * 32
+        self.server.sessions[sid] = {
+            "sessionId": sid, "model": "gpt-6", "mode": "instant",
+            "conversation_id": None,
+        }
+        args_seen = []
+        async def fake_exec(*args, **kwargs):
+            args_seen.extend(args)
+            class Process:
+                def __init__(self):
+                    self.stdout = asyncio.StreamReader()
+                    self.stdout.feed_data(
+                        b'{"type":"result","conversation_id":"verified"}\n')
+                    self.stdout.feed_eof()
+                    self.stderr = asyncio.StreamReader()
+                    self.stderr.feed_eof()
+                    self.returncode = 0
+                async def wait(self): return 0
+            return Process()
+        payload = ("<system_instructions>" + "bb-only secret tool instructions "*900
+                   + "</system_instructions>Send exactly USER-TEXT")
+        with patch.object(bb_acp.asyncio, "create_subprocess_exec",
+                          side_effect=fake_exec):
+            await self.server.do_prompt(54, sid, [{"type": "text", "text": payload}])
+        self.assertIn("USER-TEXT", args_seen[-1])
+        self.assertNotIn("bb-only secret tool instructions", args_seen[-1])
+        self.assertEqual(self.records[-1]["result"]["stopReason"], "end_turn")
 
     async def test_every_mode_routes_to_verified_native_slug_and_effort(self):
         for family,mode,slug,effort in (
