@@ -26,6 +26,83 @@ CLI = os.environ.get("CHATGPT_WEB_ACP_CLI", str(Path.home() / ".local/bin/chatgp
 SESSION_RE = re.compile(r"^[a-f0-9]{32}$")
 MODEL_RE = re.compile(r"^[a-zA-Z0-9._/-]+$")
 
+# Generated media is already persisted by chatgpt-web's normal image workflow.
+# Only serve verified local images; never expose arbitrary paths or image tokens.
+MEDIA_ROOT = Path.home() / ".local/share/chatgpt-web/images/web-generated"
+CONVERSATION_ROOT = Path.home() / ".local/share/chatgpt-web/conversations"
+MEDIA_RE = re.compile(r"^file_[A-Za-z0-9]{12,80}\.png$")
+CONVERSATION_RE = re.compile(r"^[a-f0-9-]{36}$")
+BB_IMAGE_ENDPOINT = "/api/v1/plugins/image-generation/http/cli-image"
+BB_WORKER_ENDPOINT = "/api/v1/plugins/image-generation/http/worker-image"
+IMAGE_BRIDGE = "/home/qwqc/Projects/bb-plugin-image-generation/bridge.py"
+
+def explicit_image_intent(prompt: str) -> bool:
+    normalized = prompt.strip().lower()
+    if re.match(r"^(please\s+)?(generate|create|draw|render|illustrate|paint|produce)\b", normalized):
+        return bool(re.search(r"\b(image|picture|photo|illustration|artwork|tree|portrait|landscape|logo|sprite|texture)\b", normalized))
+    return bool(re.search(r"\b(generate|create|draw|render) (?:me |us |an? )?(?:new )?(?:image|picture|photo)\b", normalized))
+
+def image_edit_intent(prompt: str) -> bool:
+    return bool(re.match(r"^\s*(please\s+)?(edit|change|modify|refine|make it|make the image|turn it|remove|add|replace)\b",prompt,re.I))
+
+async def image_bridge_call(action: str, **data: Any) -> dict[str, Any]:
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, IMAGE_BRIDGE,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await asyncio.wait_for(
+        process.communicate(json.dumps({"action": action, **data}).encode("utf8")),timeout=22)
+    if process.returncode:
+        raise RuntimeError(f"Image bridge {action} failed: " +
+                           (err.decode("utf8","replace")[:240] or out.decode("utf8","replace")[:240]))
+    result=json.loads(out)
+    if not isinstance(result,dict):
+        raise ValueError("Image bridge returned an invalid result")
+    return result
+
+
+def generated_media(conversation_id: str | None) -> list[str]:
+    if not isinstance(conversation_id, str) or not CONVERSATION_RE.fullmatch(conversation_id):
+        return []
+    try:
+        record = json.loads((CONVERSATION_ROOT / (conversation_id + ".json")).read_text(encoding="utf8"))
+    except (OSError, UnicodeError, ValueError):
+        return []
+    media = record.get("media_files") if isinstance(record, dict) else None
+    if not isinstance(media, list):
+        return []
+    found = []
+    for item in media[:16]:
+        if not isinstance(item, str):
+            continue
+        path = Path(item)
+        if not MEDIA_RE.fullmatch(path.name):
+            continue
+        try:
+            resolved = path.resolve(strict=True)
+            if resolved.parent != MEDIA_ROOT.resolve() or not resolved.is_file():
+                continue
+            if resolved.stat().st_size > 12 * 1024 * 1024:
+                continue
+            with resolved.open("rb") as inp:
+                if inp.read(8) != b"\x89PNG\r\n\x1a\n":
+                    continue
+        except OSError:
+            continue
+        name = resolved.stem
+        if name not in found:
+            found.append(name)
+    return found
+
+
+def markdown_images(ids: list[str]) -> str:
+    return "".join(
+        f"\n\n![Generated image]({BB_IMAGE_ENDPOINT}?asset={image_id})\n"
+        for image_id in ids
+    )
+
 
 def daemon_request(command: str) -> dict[str, Any]:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -293,6 +370,41 @@ class Server:
                                                    "agent_message_chunk"),
                                  "content": {"type": "text", "text": content}}}})
 
+    async def run_image_fallback(self, sid: str, prompt: str, session: dict[str, Any]) -> None:
+        # BB's web-CLI provider has no dynamic tool runtime. Use the already
+        # authorized owner image worker if CLI request preparation failed, or
+        # continue a prior browser-generated image edit without losing lineage.
+        parent=session.get("image_version_id")
+        prior_session=session.get("image_session_id")
+        editing=bool(prior_session and parent and image_edit_intent(prompt))
+        request={"prompt":prompt,"title":"BB ChatGPT Web image"}
+        if editing:
+            request.update({"session_id":prior_session,"parent_version_id":parent})
+        job=await image_bridge_call("generate",**request)
+        await self.update(sid,"Generating image through ChatGPT Web…")
+        deadline=asyncio.get_running_loop().time()+390
+        result={"state":job.get("state"),"job_id":job.get("job_id")}
+        while asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(3)
+            result=await image_bridge_call("status",job_id=job["job_id"])
+            if result.get("state") in ("completed","blocked","failed","timeout","challenge","login_required","cancelled"):
+                break
+        if result.get("state")=="completed":
+            image=result.get("image") or {}
+            path=Path(str(image.get("path","")))
+            asset=path.name
+            if not re.fullmatch(r"[a-f0-9]{32}",asset) or not path.is_file():
+                raise RuntimeError("Image worker reported completion without a verified local image")
+            session["image_session_id"]=str(image["session_id"])
+            session["image_version_id"]=str(image["version_id"])
+            save_session(session)
+            await self.update(sid, f"\n\n![Generated image]({BB_WORKER_ENDPOINT}?asset={asset})\n")
+            return
+        state=result.get("state","pending")
+        detail=str(result.get("detail") or "")
+        await self.update(sid, f"Image generation did not complete ({state}). {detail}. "
+                          f"Job: {job['job_id']}. No image has been generated for this request.")
+
     async def do_prompt(self, request_id: Any, sid: str, blocks: list):
         session = self.sessions[sid]
         pieces = []
@@ -306,6 +418,26 @@ class Server:
         prompt = remove_bb_system_envelope("\n".join(pieces))
         if not prompt.strip():
             raise ValueError("User prompt is empty after removing BB host instructions")
+        user_prompt = prompt
+
+        previous_image_order = generated_media(session.get("conversation_id"))
+        previous_images = set(previous_image_order)
+        if session.get("image_session_id") and image_edit_intent(prompt):
+            await self.run_image_fallback(sid, prompt, session)
+            await self.emit({"jsonrpc":"2.0","id":request_id,
+                             "result":{"stopReason":"end_turn"}})
+            return
+        # An explicit "show the previous image" follow-up is resolved from the
+        # existing saved image, avoiding unnecessary duplicate generation.
+        if (re.search(r"\b(show|display|open)\b", prompt, re.I)
+                and re.search(r"\b(image|picture|photo|tree)\b", prompt, re.I)
+                and re.search(r"\b(previous|generated|last|already)\b", prompt, re.I)
+                and previous_images):
+            await self.update(sid, "Here is the image from this conversation:" +
+                              markdown_images([previous_image_order[-1]]))
+            await self.emit({"jsonrpc": "2.0", "id": request_id,
+                             "result": {"stopReason": "end_turn"}})
+            return
         if not session.get("conversation_id"):
             prompt = ("[Adapter capability notice: this ChatGPT Web connection has no "
                       "filesystem, shell, code-execution or BB tool access. Never claim "
@@ -368,6 +500,15 @@ class Server:
             if exit_code != 0:
                 errors.append(stderr or f"CLI exited with code {exit_code}")
             if errors:
+                # This specific error occurs before an API request is prepared.
+                # Do not auto-retry any ambiguous send failure: duplicates matter.
+                if (not rendered.strip() and not final.strip()
+                        and any("Chrome request preparation failed" in msg for msg in errors)
+                        and explicit_image_intent(user_prompt)):
+                    await self.run_image_fallback(sid, user_prompt, session)
+                    await self.emit({"jsonrpc":"2.0","id":request_id,
+                                     "result":{"stopReason":"end_turn"}})
+                    return
                 raise RuntimeError("; ".join(errors))
             if not new_conversation_id and not session.get("conversation_id"):
                 raise RuntimeError("ChatGPT Web replied without a conversation ID")
@@ -378,6 +519,12 @@ class Server:
                 await self.update(sid, final[len(rendered):])
             elif final and final != rendered and not rendered:
                 await self.update(sid, final)
+            fresh_images = [image for image in generated_media(session.get("conversation_id"))
+                            if image not in previous_images]
+            if fresh_images:
+                await self.update(sid, markdown_images(fresh_images))
+            elif not rendered.strip() and not final.strip():
+                await self.update(sid, "The provider returned no text or generated image. Check the underlying ChatGPT conversation or retry.")
             await self.emit({"jsonrpc": "2.0", "id": request_id,
                              "result": {"stopReason": "end_turn"}})
         except asyncio.CancelledError:

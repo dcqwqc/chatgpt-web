@@ -181,3 +181,113 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     self.assertNotIn("--thinking-effort",args)
                 self.assertEqual(self.records[-1]["result"]["stopReason"],"end_turn")
+
+class GeneratedMediaTests(unittest.IsolatedAsyncioTestCase):
+    def test_verified_cached_images_only(self):
+        import json
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            media = root / "images"
+            conversations = root / "conversations"
+            media.mkdir(); conversations.mkdir()
+            name = "file_00000000fb3c81f4aa4a0d784f93834b"
+            (media / (name+".png")).write_bytes(b"\x89PNG\r\n\x1a\nrest")
+            cid = "6ae3116a-1fa8-83ed-aa4a-12c775163884"
+            (conversations / (cid+".json")).write_text(json.dumps({"media_files":[
+                str(media / (name+".png")), "/etc/passwd", str(media / "../wrong.png")
+            ]}))
+            with patch.object(bb_acp, "MEDIA_ROOT", media), patch.object(bb_acp, "CONVERSATION_ROOT", conversations):
+                self.assertEqual(bb_acp.generated_media(cid), [name])
+                self.assertEqual(bb_acp.generated_media("../etc/passwd"), [])
+                self.assertIn(name, bb_acp.markdown_images([name]))
+    
+    async def test_image_only_reply_emits_markdown_in_bb(self):
+        import json
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work); media=root/"images"; convs=root/"conversations"
+            media.mkdir(); convs.mkdir()
+            cid = "6ae3116a-1fa8-83ed-aa4a-12c775163884"
+            image_id = "file_00000000fb3c81f4aa4a0d784f93834b"
+            image = media / (image_id + ".png")
+            events=[]
+            server=bb_acp.Server()
+            async def emit(obj): events.append(obj)
+            server.emit=emit
+            sid="a"*32
+            server.sessions[sid]={"sessionId":sid,"conversation_id":None,
+                                  "model":"gpt-6","mode":"instant"}
+            with patch.object(bb_acp, "ROOT", root/"sessions"), patch.object(bb_acp,"MEDIA_ROOT",media),patch.object(bb_acp,"CONVERSATION_ROOT",convs),patch.object(bb_acp,"model_capabilities",return_value=source_catalog()):
+                server.catalog()
+                async def fake_exec(*args,**kwargs):
+                    image.write_bytes(b"\x89PNG\r\n\x1a\nrest")
+                    (convs/(cid+".json")).write_text(json.dumps({"media_files":[str(image)]}))
+                    class Process:
+                        def __init__(self):
+                            self.stdout=asyncio.StreamReader()
+                            self.stdout.feed_data(json.dumps({"type":"result","conversation_id":cid}).encode()+b"\n")
+                            self.stdout.feed_eof()
+                            self.stderr=asyncio.StreamReader();self.stderr.feed_eof()
+                            self.returncode=0
+                        async def wait(self):return 0
+                    return Process()
+                with patch.object(bb_acp.asyncio,"create_subprocess_exec",side_effect=fake_exec):
+                    await server.do_prompt(123,sid,[{"type":"text","text":"generate a tree image"}])
+                chunks=[obj["params"]["update"]["content"]["text"] for obj in events if obj.get("method")=="session/update"]
+                self.assertEqual(len(chunks),1)
+                self.assertIn(image_id,chunks[0])
+                self.assertNotIn("no text",chunks[0])
+                self.assertEqual(events[-1]["result"]["stopReason"],"end_turn")
+
+class ImageFallbackTests(unittest.IsolatedAsyncioTestCase):
+    def test_only_explicit_image_intents_trigger_fallback(self):
+        self.assertTrue(bb_acp.explicit_image_intent("Generate an image of a tree."))
+        self.assertTrue(bb_acp.explicit_image_intent("Please draw a picture of a tree."))
+        self.assertFalse(bb_acp.explicit_image_intent("How does image generation work?"))
+        self.assertFalse(bb_acp.explicit_image_intent("What is a tree?"))
+        self.assertTrue(bb_acp.image_edit_intent("Make it orange"))
+        self.assertFalse(bb_acp.image_edit_intent("Explain the image generation algorithm"))
+
+    async def test_fallback_on_preparation_error_returns_real_worker_image(self):
+        from unittest.mock import AsyncMock
+        import json
+        with tempfile.TemporaryDirectory() as work:
+            root=Path(work)
+            saved=root/("d1c34b5d60824e228fe6ec7e61cfea5d")
+            saved.write_bytes(b"\x89PNG\r\n\x1a\nrest")
+            sid="b"*32
+            server=bb_acp.Server()
+            server.sessions[sid]={"sessionId":sid,"conversation_id":None,"model":"gpt-6","mode":"instant"}
+            records=[]
+            async def emit(obj):records.append(obj)
+            server.emit=emit
+            class FakeProcess:
+                def __init__(self):
+                    self.stdout=asyncio.StreamReader()
+                    self.stdout.feed_eof()
+                    self.stderr=asyncio.StreamReader()
+                    self.stderr.feed_data(b"chatgpt-web: Chrome request preparation failed")
+                    self.stderr.feed_eof()
+                    self.returncode=1
+                async def wait(self):return 1
+            async def fake_exec(*args,**kwargs):return FakeProcess()
+            calls=[]
+            async def fake_bridge(action,**data):
+                calls.append((action,data))
+                if action=="generate":
+                    return {"job_id":"f"*32,"state":"queued"}
+                return {"state":"completed","image":{
+                    "path":str(saved),"session_id":"e"*32,
+                    "version_id":"c"*32}}
+            with patch.object(bb_acp,"ROOT",root/"sessions"),patch.object(
+                bb_acp,"model_capabilities",return_value=source_catalog()),patch.object(
+                bb_acp.asyncio,"create_subprocess_exec",side_effect=fake_exec),patch.object(
+                bb_acp,"image_bridge_call",side_effect=fake_bridge),patch.object(
+                bb_acp.asyncio,"sleep",new_callable=AsyncMock):
+                server.catalog()
+                await server.do_prompt(12,sid,[{"type":"text","text":"Generate an image of a tree."}])
+            updates=[r["params"]["update"]["content"]["text"] for r in records if r.get("method")=="session/update"]
+            self.assertIn("/worker-image?asset=d1c34b5d60824e228fe6ec7e61cfea5d","".join(updates))
+            self.assertEqual(calls[0][0],"generate")
+            self.assertEqual(calls[0][1]["prompt"],"Generate an image of a tree.")
+            self.assertEqual(records[-1]["result"]["stopReason"],"end_turn")
+            self.assertEqual(json.loads((root / "sessions" / (sid+".json")).read_text())["image_version_id"],"c"*32)
