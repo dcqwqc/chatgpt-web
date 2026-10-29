@@ -20,6 +20,25 @@ def source_catalog():
     models.append({"slug":"chatgpt_alpha_internal","title":"Internal","efforts":[]})
     return models
 
+class BbCorePolicyTests(unittest.TestCase):
+    def test_published_policy_is_read_from_bb_data_dir(self):
+        value = bb_acp.load_bb_core_policy()
+        self.assertIn("Shared Agent Operating Contract", value)
+        self.assertGreater(len(value), 1000)
+
+    def test_missing_or_empty_core_policy_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(
+            bb_acp.Path, "home", return_value=Path(d)
+        ):
+            with self.assertRaisesRegex(RuntimeError, "not published"):
+                bb_acp.load_bb_core_policy()
+            folder = Path(d) / ".bb"
+            folder.mkdir()
+            (folder / "AGENTS.md").write_text("")
+            with self.assertRaisesRegex(RuntimeError, "empty"):
+                bb_acp.load_bb_core_policy()
+
+
 class BbInstructionEnvelopeTests(unittest.TestCase):
     def test_only_the_bb_prefix_is_removed(self):
         s = "<system_instructions>bb generated tool instructions</system_instructions> Hi!"
@@ -141,6 +160,8 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                           side_effect=fake_exec):
             await self.server.do_prompt(54, sid, [{"type": "text", "text": payload}])
         self.assertIn("USER-TEXT", args_seen[-1])
+        self.assertIn("[BB Agent Control — published Core Instructions]", args_seen[-1])
+        self.assertIn("Shared Agent Operating Contract", args_seen[-1])
         self.assertNotIn("bb-only secret tool instructions", args_seen[-1])
         self.assertEqual(self.records[-1]["result"]["stopReason"], "end_turn")
 

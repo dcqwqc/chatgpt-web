@@ -248,6 +248,27 @@ def remove_bb_system_envelope(text: str) -> str:
     return raw[end + len(suffix):].lstrip()
 
 
+def load_bb_core_policy() -> str:
+    """Read the explicitly published BB-wide contract, not the mutable draft.
+
+    The Web CLI backend cannot consume native BB ACP tool/system envelopes,
+    so the published core policy is sent as text on the first turn of each
+    newly created Web conversation only.
+    """
+    path = Path.home() / ".bb" / "AGENTS.md"
+    try:
+        if not path.is_file():
+            raise RuntimeError("BB universal Core Instructions are not published")
+        if path.stat().st_size > 256_000:
+            raise RuntimeError("BB Core Instructions exceed safe adapter limit")
+        content = path.read_text(encoding="utf-8")
+        if not content.strip():
+            raise RuntimeError("BB universal Core Instructions are empty")
+        return content
+    except OSError as exc:
+        raise RuntimeError("Unable to load BB Core Instructions") from exc
+
+
 class Server:
     def __init__(self):
         self.sessions: dict[str, dict[str, Any]] = {}
@@ -439,7 +460,11 @@ class Server:
                              "result": {"stopReason": "end_turn"}})
             return
         if not session.get("conversation_id"):
-            prompt = ("[Adapter capability notice: this ChatGPT Web connection has no "
+            core_policy = load_bb_core_policy()
+            prompt = ("[BB Agent Control — published Core Instructions]\n"
+                      + core_policy.rstrip() + "\n"
+                      + "[End published Core Instructions]\n\n"
+                      + "[Adapter capability notice: this ChatGPT Web connection has no "
                       "filesystem, shell, code-execution or BB tool access. Never claim "
                       "to have changed files, run tests, or deployed anything. "
                       "Offer guidance or code as text only.]\n\n" + prompt)
