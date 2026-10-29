@@ -176,7 +176,7 @@ async function main() {
         await call("Page.navigate", { url: target });
       }
       const ready = await call("Runtime.evaluate", {
-        expression: `(async()=>{for(let i=0;i<300;i++){const e=document.querySelector("#prompt-textarea");if(e)return true;await new Promise(r=>setTimeout(r,100));}return false})()`,
+        expression: `(async()=>{for(let i=0;i<300;i++){const e=document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector("#prompt-textarea");if(e)return true;await new Promise(r=>setTimeout(r,100));}return false})()`,
         awaitPromise: true,
         returnByValue: true,
       });
@@ -187,13 +187,13 @@ async function main() {
       });
       baselineAssistantCount = baseline.result.value || 0;
       const focused = await call("Runtime.evaluate", {
-        expression: `(()=>{const e=document.querySelector("#prompt-textarea");if(!e)return false;e.focus();e.replaceChildren();e.dispatchEvent(new InputEvent("input",{bubbles:true,inputType:"deleteContentBackward"}));return true})()`,
+        expression: `(()=>{const e=document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector("#prompt-textarea");if(!e)return false;e.focus();return !e.innerText.trim()})()`,
         returnByValue: true,
       });
       if (!focused.result.value) fail("could not focus the ChatGPT composer");
       await call("Input.insertText", { text: input.prompt });
       const submitted = await call("Runtime.evaluate", {
-        expression: `(async()=>{for(let i=0;i<100;i++){const b=document.querySelector("button[data-testid=send-button]");if(b&&!b.disabled){b.click();return true;}await new Promise(r=>setTimeout(r,100));}return false})()`,
+        expression: `(async()=>{for(let i=0;i<100;i++){const b=document.querySelector('[data-chatgpt-composer] button[type="submit"][aria-label="Send"]')||document.querySelector("button[data-testid=send-button]");if(b&&!b.disabled){b.click();return true;}await new Promise(r=>setTimeout(r,100));}return false})()`,
         awaitPromise: true,
         returnByValue: true,
       });

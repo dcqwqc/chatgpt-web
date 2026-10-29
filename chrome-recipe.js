@@ -154,24 +154,33 @@ async function main() {
       const target = input.conversation_id
         ? `https://chatgpt.com/c/${encodeURIComponent(input.conversation_id)}`
         : "https://chatgpt.com/";
-      // The intercepted request is deliberately aborted in the page. Always
-      // navigate so a prior optimistic send cannot leave the composer disabled.
-      await call("Page.navigate", { url: target });
+      // Reuse the already-ready home composer instead of navigating the
+      // same document. A redundant reload can race Runtime.evaluate and
+      // strand the readiness probe in a destroyed execution context.
+      // Navigation still happens when the target conversation differs.
+      const current = await call("Runtime.evaluate", {
+        expression: "location.href",
+        returnByValue: true,
+      });
+      if (current.result.value !== target) {
+        await call("Page.navigate", { url: target });
+        await new Promise((resolve) => setTimeout(resolve, 700));
+      }
       const ready = await call("Runtime.evaluate", {
-        expression: `(async()=>{for(let i=0;i<300;i++){const e=document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea');if(e)return true;await new Promise(r=>setTimeout(r,100));}return false})()`,
+        expression: `(async()=>{for(let i=0;i<300;i++){const e=document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea');if(e)return true;await new Promise(r=>setTimeout(r,100));}return false})()`,
         awaitPromise: true,
         returnByValue: true,
       });
       if (!ready.result.value) fail("ChatGPT composer did not become ready");
       await call("Runtime.evaluate", {
-        expression: `(()=>{const e=document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea');if(!e)return false;e.focus();return !e.innerText.trim()})()`,
+        expression: `(()=>{const e=document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea');if(!e)return false;e.focus();return !e.innerText.trim()})()`,
         returnByValue: true,
       });
       const focused = await call("Runtime.evaluate", {
-        expression: `document.activeElement?.isContentEditable===true`,
+        expression: `document.activeElement?.isContentEditable===true && !document.activeElement.innerText.trim()`,
         returnByValue: true,
       });
-      if (!focused.result.value) fail("ChatGPT editor did not receive focus");
+      if (!focused.result.value) fail("ChatGPT editor is not empty or did not receive focus");
       await call("Input.insertText", { text: input.prompt });
       const submitted = await call("Runtime.evaluate", {
         expression: `(async()=>{for(let i=0;i<100;i++){const b=document.querySelector('[data-chatgpt-composer] button[type="submit"][aria-label="Send"]')||document.querySelector('button[data-testid=send-button]');if(b&&!b.disabled){b.click();return true;}await new Promise(r=>setTimeout(r,100));}return false})()`,
