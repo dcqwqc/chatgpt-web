@@ -527,3 +527,22 @@ The upgraded backend uses daemon-v3.sock so an older busy daemon and its
 existing CLI session can finish safely without being killed. Restart both
 CLI windows to use the concurrent server. Per-thread temporary files prevent
 auth/session and conversation cache corruption during parallel writes.
+
+### BB / ACP provider (Philipedia)
+
+The BB integration lives in `bb_acp.py`. It exposes this authenticated ChatGPT Web CLI as the custom `acp-chatgpt-web` provider via Agent Client Protocol v1. The provider advertises the live account model catalog, excluding internal/reserved entries, and selects the model **per request** instead of mutating the user's global CLI model. It supports persistent ACP session IDs mapped to CLI Project conversations, model switching, JSONL streaming, cancellation, and history replay on session load. Existing BB custom provider definitions are preserved when registering this provider.
+
+The agent is **text-only advisory**: it does not implement coding tool calls, filesystem access, shell execution, or BB workspace mutation. Never interpret its prose as evidence that repository changes were made. It uses the browser-authenticated ChatGPT Web service, not the OpenAI API or Codex quota; account/rate limits and account model access apply.
+
+The CLI requires an existing authenticated Chrome profile and its existing ChatGPT Project named `CLI`. The project lookup follows all sidebar pagination cursors and verifies the saved Project ID. If ChatGPT's signer changes or the Chrome session presents a human verification challenge, sending **fails closed**; the user must resolve interactive verification or use a supported alternative provider. This adapter does not bypass website verification.
+
+Sanity checks:
+
+```sh
+chatgpt-web status
+chatgpt-web project
+chatgpt-web model
+bb provider list
+bb provider models acp-chatgpt-web --json
+PYTHONPATH=. python3 -m unittest discover -s tests -p 'test_*.py' -q
+```

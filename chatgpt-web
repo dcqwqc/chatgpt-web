@@ -379,14 +379,29 @@ class ChatGPTWebClient:
             pinned is None or pinned == saved[0]
         ):
             return saved[0]
-        response = self.request(
-            "GET", urljoin(CHATGPT_ORIGIN, "/backend-api/gizmos/snorlax/sidebar"),
-            params={"owned_only": "true", "conversations_per_gizmo": 0},
-        ).json()
-        try:
-            projects = parse_projects(response)
-        except ValueError as error:
-            raise ChatGPTWebError(str(error)) from error
+        projects = []
+        cursor = None
+        seen_cursors = set()
+        for _ in range(30):
+            params = {"owned_only": "true", "conversations_per_gizmo": 0}
+            if cursor:
+                params["cursor"] = cursor
+            response = self.request(
+                "GET", urljoin(CHATGPT_ORIGIN, "/backend-api/gizmos/snorlax/sidebar"),
+                params=params,
+            ).json()
+            try:
+                projects.extend(parse_projects(response))
+            except ValueError as error:
+                raise ChatGPTWebError(str(error)) from error
+            cursor = response.get("cursor")
+            if not cursor:
+                break
+            if not isinstance(cursor, str) or cursor in seen_cursors:
+                raise ChatGPTWebError("ChatGPT Project pagination returned invalid or repeated cursor")
+            seen_cursors.add(cursor)
+        else:
+            raise ChatGPTWebError("ChatGPT Project listing exceeded 30 pages")
         if len(projects) != 1:
             raise ChatGPTWebError(
                 f'Expected exactly one ChatGPT Project named "{PROJECT_NAME}", '
@@ -669,6 +684,13 @@ class ChatGPTWebClient:
                     raise ChatGPTWebError(
                         f"{error}; run chatgpt-web login for compatibility fallback"
                     ) from error
+                if chrome_needs_interactive_verification(self.cdp_url):
+                    raise ChatGPTWebError(
+                        "ChatGPT's verification requirements changed and the "
+                        "authenticated Chrome tab is showing an interactive security "
+                        "challenge. Open the existing Philipedia Chrome login window "
+                        "to complete verification; no prompt was submitted."
+                    ) from error
                 method, url, headers, body = self.capture_send_recipe(
                     conversation_id, prompt
                 )
@@ -685,6 +707,8 @@ class ChatGPTWebClient:
         body["conversation_mode"] = {"kind": "gizmo_interaction", "gizmo_id": project_id}
         body["gizmo_id"] = project_id
         body["conversation_template_id"] = project_id
+        if getattr(self, "_request_model", None):
+            body["model"] = self._request_model
         headers.pop("x-openai-web-sse-compression", None)
         headers["x-openai-target-path"] = "/backend-api/f/conversation"
         headers["x-openai-target-route"] = "/backend-api/f/conversation"
@@ -841,7 +865,7 @@ class ChatGPTWebClient:
         now = datetime.now().astimezone()
         offset = now.utcoffset()
         offset_minutes = -int(offset.total_seconds() / 60) if offset else 0
-        model = load_preferences().get("model") or os.environ.get("CHATGPT_WEB_MODEL")
+        model = getattr(self, "_request_model", None) or load_preferences().get("model") or os.environ.get("CHATGPT_WEB_MODEL")
         if not model and conversation:
             candidate = conversation.get("default_model_slug")
             if isinstance(candidate, str) and candidate:
@@ -1146,6 +1170,7 @@ def stream_prompt(
     conversation_id: str | None,
     prompt: str,
     output: str,
+    model: str | None = None,
 ) -> dict[str, Any]:
     rendered = ""
 
@@ -1172,6 +1197,7 @@ def stream_prompt(
         "command": "send_stream",
         "conversation_id": conversation_id,
         "prompt": prompt,
+        "model": model,
     }, on_event)
 
     if output == "text":
@@ -1191,6 +1217,8 @@ def stream_prompt(
         print()
     else:
         print_prompt_result(result, output)
+        if output == "jsonl":
+            print(json.dumps({"type": "result", "conversation_id": result.get("conversation_id")}, ensure_ascii=False, separators=(",", ":")), flush=True)
     return result
 
 
@@ -1701,6 +1729,28 @@ def chrome_is_ready(cdp_url: str) -> bool:
         return False
 
 
+def chrome_needs_interactive_verification(cdp_url: str) -> bool:
+    """Recognize an actual browser-side security challenge; never bypass it."""
+    try:
+        response = httpx.get(f"{cdp_url.rstrip('/')}/json/list", timeout=2.0)
+        response.raise_for_status()
+        pages = response.json()
+        if not isinstance(pages, list):
+            return False
+        return any(
+            isinstance(page, dict)
+            and page.get("type") == "page"
+            and str(page.get("url", "")).startswith(CHATGPT_ORIGIN)
+            and (
+                "just a moment" in str(page.get("title", "")).casefold()
+                or "attention required" in str(page.get("title", "")).casefold()
+            )
+            for page in pages
+        )
+    except (httpx.HTTPError, ValueError):
+        return False
+
+
 def persistent_profile_path() -> Path:
     data_home = os.environ.get("XDG_DATA_HOME")
     root = Path(data_home) if data_home else Path.home() / ".local" / "share"
@@ -1801,6 +1851,8 @@ def handle_daemon_command(
         return {"project": PROJECT_NAME, "project_id": client.target_project_id()}, False
     if command == "models":
         return client.model_status(), False
+    if command == "models_catalog":
+        return {"models": client.available_models()}, False
     if command == "set_model":
         slug = request.get("model")
         if not isinstance(slug, str):
@@ -1957,6 +2009,13 @@ def process_daemon_connection(
                 raise ChatGPTWebError("prompt or attachment is required")
             if not isinstance(attachments, list):
                 raise ChatGPTWebError("invalid attachment list")
+            requested_model = request.get("model")
+            if requested_model is not None:
+                if not isinstance(requested_model, str) or not MODEL_RE.fullmatch(requested_model):
+                    raise ChatGPTWebError("Invalid model identifier")
+                if requested_model not in {item["slug"] for item in client.available_models()}:
+                    raise ChatGPTWebError("Requested model is not selectable for this account")
+            client._request_model = requested_model
             resolved_id, conversation, previous_ids = client.send_prompt(
                 conversation_id, prompt, attachments,
                 lambda event: send_json_line(connection, {"ok": True, "event": event}),
@@ -2169,11 +2228,13 @@ def build_parser() -> argparse.ArgumentParser:
     send_parser = commands.add_parser("send", help="send a prompt")
     send_parser.add_argument("conversation_id")
     send_parser.add_argument("prompt", nargs="*")
+    send_parser.add_argument("--model", help="per-request model override, safe for parallel sessions")
     send_parser.add_argument(
         "--output", choices=("text", "json", "jsonl"), default="text"
     )
     new_parser = commands.add_parser("new", help="start a new conversation")
     new_parser.add_argument("prompt", nargs="*")
+    new_parser.add_argument("--model", help="per-request model override, safe for parallel sessions")
     new_parser.add_argument(
         "--output", choices=("text", "json", "jsonl"), default="text"
     )
@@ -2291,6 +2352,7 @@ def main() -> int:
                 args.conversation_id if args.command == "send" else None,
                 prompt,
                 args.output,
+                args.model,
             )
             if args.command == "new" and args.output == "text":
                 print(f"\n[conversation {result.get('conversation_id')}]", file=sys.stderr)

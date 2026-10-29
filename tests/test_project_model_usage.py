@@ -63,6 +63,39 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(body["conversation_mode"], {"kind": "gizmo_interaction", "gizmo_id": PROJECT_ID})
         self.assertEqual(body["model"], "gpt-6-thinking")
 
+    def test_per_request_model_does_not_touch_global_preference(self):
+        with patch.object(self.client, "target_project_id", return_value=PROJECT_ID), patch.object(
+            self.app, "load_preferences", return_value={"model": "gpt-6-thinking"}
+        ):
+            self.client._request_model = "gpt-6-instant"
+            body = self.client.create_conversation_body(None, "hello")
+        self.assertEqual(body["model"], "gpt-6-instant")
+
+    def test_project_resolution_paginates_to_find_pinned_cli(self):
+        page1 = {"items": [{"gizmo": {"id": "g-p-" + "b"*32,
+                                      "display": {"name": "Plan"}}}],
+                 "cursor": "next-page"}
+        page2 = {"items": [{"gizmo": {"id": PROJECT_ID,
+                                      "display": {"name": "CLI"}}}],
+                 "cursor": None}
+        self.client.request = Mock(side_effect=[
+            Mock(json=lambda: page1), Mock(json=lambda: page2)])
+        with patch.object(self.app, "load_preferences",
+                          return_value={"project_id": PROJECT_ID}):
+            found = self.client.target_project_id()
+        self.assertEqual(found, PROJECT_ID)
+        self.assertEqual(self.client.request.call_count, 2)
+        self.assertEqual(self.client.request.call_args_list[1].kwargs[
+            "params"]["cursor"], "next-page")
+
+    def test_project_resolution_rejects_repeated_cursor(self):
+        page = {"items": [], "cursor": "loop"}
+        self.client.request = Mock(return_value=Mock(json=lambda: page))
+        with patch.object(self.app, "load_preferences",
+                          return_value={"project_id": None}):
+            with self.assertRaisesRegex(self.app.ChatGPTWebError, "repeated cursor"):
+                self.client.target_project_id()
+
     def test_nonproject_continuation_is_blocked_before_submit(self):
         self.client.target_project_id = Mock(return_value=PROJECT_ID)
         self.client.get_conversation = Mock(return_value={"gizmo_id": None})
