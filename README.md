@@ -553,16 +553,27 @@ stop older daemon instances or active requests.
 
 The BB integration lives in `bb_acp.py`. It exposes this authenticated ChatGPT Web CLI as the custom `acp-chatgpt-web` provider via Agent Client Protocol v1. The provider advertises the live account model catalog, excluding internal/reserved entries, and selects the model **per request** instead of mutating the user's global CLI model. It supports persistent ACP session IDs mapped to CLI Project conversations, model switching, JSONL streaming, cancellation, and history replay on session load. Existing BB custom provider definitions are preserved when registering this provider.
 
-BB reads the model config option and its **per-model** `thought_level`
-config option over ACP. Thinking models expose only the levels actually
-advertised by the account: `standard` → BB **Medium** and `extended` →
-BB **High**. These choices are persisted independently per BB thread and
-passed as `--thinking-effort` on each CLI send. Auto, Instant, Mini, and
-fixed-effort models do not falsely advertise Medium/High. BB's
-`session/set_config_option` changes model and reasoning, restoring the
-previous selection when a thread resumes. Extra High is not shown unless
-ChatGPT Web's model metadata actually reports support for an equivalent
-level. New models appear automatically when the account reports them.
+BB displays **four model families** (GPT-6, GPT-6 Mini, GPT-5.6 Sol,
+GPT-5.6 Luna), rather than ten repeated model variants. The native BB
+**Reasoning** row selects the real ChatGPT operating variant: Auto, Instant,
+Thinking, and Extended for full-size models; Instant and Thinking for Mini.
+Auto is available only where the account lists the native `auto` slug;
+there is no synthetic switching or task-based model router. Thinking maps to
+the account's `standard` effort, and Extended to `extended`, on variants
+that advertise configurable thinking. Mini Thinking is a fixed-effort
+model; Extended is deliberately unavailable.
+
+BB does not currently support a conditionally visible thinking-depth
+control in its core model picker: it would advertise Extended even for Mini
+models. Folding depth into the existing native Reasoning row keeps every
+option truthful while retaining BB's original UI and accessibility.
+The ACP adapter resolves model/mode combinations per request, independently
+per conversation, without changing the global CLI model. On load it migrates
+old per-variant session records, preserving conversation IDs and the selected
+thinking effort. Internal/reserved models are excluded. The compact BB icon
+extension in `bb-plugin-provider-icons/` overrides native Codex and Codex
+Lina with the Codex mark, and ChatGPT Web CLI with the ChatGPT knot, using
+BB's supported providerIcon slot and local validated SVG assets.
 
 The agent is **text-only advisory**: it does not implement coding tool calls, filesystem access, shell execution, or BB workspace mutation. Never interpret its prose as evidence that repository changes were made. It uses the browser-authenticated ChatGPT Web service, not the OpenAI API or Codex quota; account/rate limits and account model access apply.
 

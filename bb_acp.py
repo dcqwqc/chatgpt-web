@@ -66,26 +66,53 @@ def model_capabilities() -> list[dict[str, Any]]:
     return [row for row in raw if isinstance(row, dict)]
 
 
+# Family IDs are the account's default model slugs. Variants are resolved
+# from each fresh account catalog, never inferred as available without proof.
+FAMILY_ORDER = ("gpt-6", "gpt-6-mini", "gpt-5-6", "gpt-5-6-mini")
+FAMILY_LABELS = {
+    "gpt-6": "GPT-6", "gpt-6-mini": "GPT-6 Mini",
+    "gpt-5-6": "GPT-5.6 Sol", "gpt-5-6-mini": "GPT-5.6 Luna",
+}
+VARIANT_SUFFIXES = {
+    "gpt-6": {"auto": "gpt-6", "instant": "gpt-6-instant",
+              "thinking": "gpt-6-thinking"},
+    "gpt-6-mini": {"instant": "gpt-6-mini", "thinking": "gpt-6-t-mini"},
+    "gpt-5-6": {"auto": "gpt-5-6", "instant": "gpt-5-6-instant",
+                "thinking": "gpt-5-6-thinking"},
+    "gpt-5-6-mini": {"instant": "gpt-5-6-mini", "thinking": "gpt-5-6-t-mini"},
+}
+MODE_LABELS = {"auto": "Auto", "instant": "Instant",
+               "thinking": "Thinking", "extended": "Extended"}
+
+
+def build_families(raw: list[dict[str, Any]]):
+    available = {item.get("slug"): item for item in raw
+                 if isinstance(item, dict) and isinstance(item.get("slug"), str)
+                 and not item["slug"].startswith("chatgpt_alpha_")}
+    families = {}
+    for family in FAMILY_ORDER:
+        modes = {
+            mode: slug for mode, slug in VARIANT_SUFFIXES[family].items()
+            if slug in available
+        }
+        if "thinking" in modes:
+            capabilities = available[modes["thinking"]]
+            if any(
+                isinstance(x, dict) and x.get("thinking_effort") == "extended"
+                for x in capabilities.get("efforts", [])
+            ):
+                modes["extended"] = modes["thinking"]
+        if modes:
+            families[family] = modes
+    return families
+
+
 def model_rows(raw: list[dict[str, Any]]) -> list[dict[str, str]]:
-    if not isinstance(raw, list):
-        raise RuntimeError("ChatGPT Web model catalog not available")
-    parsed = []
-    seen = set()
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        name = item.get("slug")
-        if (isinstance(name, str) and MODEL_RE.fullmatch(name)
-                and name not in seen and not name.startswith("chatgpt_alpha_")):
-            seen.add(name)
-            title = str(item.get("title") or name)[:80]
-            variant = next((suffix for suffix in ("instant", "thinking", "t-mini", "mini")
-                            if name.endswith("-" + suffix)), None)
-            label = title + (" — " + variant.title() if variant else " (Default)")
-            parsed.append({"modelId": name, "name": label})
-    if not parsed:
-        raise RuntimeError("No models available in the connected ChatGPT account")
-    return parsed
+    families = build_families(raw)
+    if not families:
+        raise RuntimeError("No supported ChatGPT Web models in this account")
+    return [{"modelId": family, "name": FAMILY_LABELS[family]}
+            for family in families]
 
 
 def models() -> list[dict[str, str]]:
@@ -151,53 +178,70 @@ class Server:
             item["slug"]: item for item in details
             if isinstance(item.get("slug"), str)
         }
-        # Keep the model names/slugs from the same single catalog snapshot.
+        self.variants = build_families(details)
         self.model_cache = model_rows(details)
         return self.model_cache
 
-    def reasoning_options(self, model: str) -> list[dict[str, str]]:
-        details = self.model_capabilities_cache.get(model, {})
-        raw = details.get("efforts", [])
-        efforts = [
-            {"value": item["value"], "name": item.get("name") or item["value"]}
-            for item in raw if isinstance(item, dict)
-            and item.get("value") in ("medium", "high")
-        ]
-        if efforts:
-            return efforts
-        reasoning_type = details.get("reasoning_type")
-        if reasoning_type == "none":
-            return [{"value": "none", "name": "None"}]
-        if reasoning_type == "reasoning":
-            return [{"value": "fixed", "name": "Model-controlled"}]
-        return [{"value": "auto", "name": "Automatic"}]
+    def normalize_session(self, session: dict[str, Any]) -> None:
+        """Migrate old slug-based sessions without dropping user preferences."""
+        if not hasattr(self, "variants"):
+            self.catalog()
+        current = session.get("model")
+        if current not in self.variants:
+            for family, modes in self.variants.items():
+                matching = next((mode for mode, slug in modes.items()
+                                 if slug == current), None)
+                if matching:
+                    old_depth = session.get("depth")
+                    legacy_effort = session.get("reasoning")
+                    session["model"] = family
+                    session["mode"] = (
+                        "extended" if matching == "thinking"
+                        and "extended" in modes
+                        and (old_depth == "extended" or legacy_effort == "high")
+                        else matching
+                    )
+                    break
+        elif session.get("mode") == "thinking" and (
+                session.get("depth") == "extended" or
+                session.get("reasoning") == "high") and (
+                "extended" in self.variants[current]):
+            session["mode"] = "extended"
+        if session.get("model") not in self.variants:
+            session["model"] = next(iter(self.variants))
+        modes = self.variants[session["model"]]
+        if session.get("mode") not in modes:
+            session["mode"] = ("thinking" if "thinking" in modes
+                               else "auto" if "auto" in modes
+                               else next(iter(modes)))
+        # Reasoning is represented by a single native BB control, so there
+        # are no unsupported/deceptive extra "depth" options on Mini/Instant.
+        session.pop("depth", None)
+        session.pop("reasoning", None)
 
-    def default_reasoning(self, model: str) -> str:
-        return self.reasoning_options(model)[0]["value"]
-
-    def setup_session_reasoning(self, session: dict[str, Any]):
-        choices = {x["value"] for x in self.reasoning_options(session["model"])}
-        if session.get("reasoning") not in choices:
-            session["reasoning"] = self.default_reasoning(session["model"])
+    def mode_options(self, family: str) -> list[dict[str, str]]:
+        return [{"value": key, "name": MODE_LABELS[key]}
+                for key in self.variants[family]]
 
     def config_options(self, session: dict[str, Any]) -> list[dict[str, Any]]:
-        self.setup_session_reasoning(session)
-        return [{
+        self.normalize_session(session)
+        options = [{
             "id": "model", "name": "Model", "category": "model",
             "type": "select", "currentValue": session["model"],
-            "options": [{"value": r["modelId"], "name": r["name"]}
-                        for r in self.model_cache or self.catalog()],
+            "options": [{"value": m["modelId"], "name": m["name"]}
+                        for m in self.model_cache],
         }, {
-            "id": "thinking_effort", "name": "Reasoning",
-            "category": "thought_level", "type": "select",
-            "currentValue": session["reasoning"],
-            "options": self.reasoning_options(session["model"]),
+            # BB's native reasoning row doubles as the model's operating mode.
+            "id": "mode", "name": "Mode", "category": "thought_level",
+            "type": "select", "currentValue": session["mode"],
+            "options": self.mode_options(session["model"]),
         }]
+        return options
 
     def model_state(self, current: str):
         items = self.model_cache or self.catalog()
-        if current not in [r["modelId"] for r in items]:
-            raise ValueError("Selected model no longer available")
+        if current not in {row["modelId"] for row in items}:
+            raise ValueError("Model family is not available")
         return {"currentModelId": current, "availableModels": items}
 
     async def replay(self, sid: str, session: dict[str, Any]):
@@ -246,13 +290,18 @@ class Server:
                       "to have changed files, run tests, or deployed anything. "
                       "Offer guidance or code as text only.]\n\n" + prompt)
         args = [CLI, "send", session["conversation_id"]] if session.get("conversation_id") else [CLI, "new"]
-        args += ["--model", session["model"]]
-        self.setup_session_reasoning(session)
-        details = self.model_capabilities_cache.get(session["model"], {})
-        effort = next((row["thinking_effort"] for row in details.get("efforts", [])
-                       if row.get("value") == session["reasoning"]), None)
-        if effort is not None:
-            args += ["--thinking-effort", effort]
+        self.normalize_session(session)
+        slug = self.variants[session["model"]][session["mode"]]
+        args += ["--model", slug]
+        if session["mode"] in ("thinking", "extended"):
+            capabilities = self.model_capabilities_cache.get(slug, {})
+            effort = "extended" if session["mode"] == "extended" else "standard"
+            if any(
+                row.get("thinking_effort") == effort
+                for row in capabilities.get("efforts", [])
+                if isinstance(row, dict)
+            ):
+                args += ["--thinking-effort", effort]
         args += ["--output", "jsonl", prompt]
         process = await asyncio.create_subprocess_exec(
             *args, stdin=asyncio.subprocess.DEVNULL,
@@ -341,10 +390,9 @@ class Server:
                     catalog = self.catalog()
                     sid = uuid.uuid4().hex
                     ids = [m["modelId"] for m in catalog]
-                    default = "gpt-6-thinking" if "gpt-6-thinking" in ids else (
-                        "gpt-6" if "gpt-6" in ids else ids[0])
+                    default = "gpt-6" if "gpt-6" in ids else ids[0]
                     session = {"sessionId": sid, "conversation_id": None,
-                               "model": default}
+                               "model": default, "mode": "thinking"}
                     self.sessions[sid] = session
                     save_session(session)
                 else:
@@ -352,7 +400,8 @@ class Server:
                     session = load_session(sid)
                     self.sessions[sid] = session
                     self.catalog()
-                self.setup_session_reasoning(session)
+                self.normalize_session(session)
+                save_session(session)
                 if method == "session/load":
                     await self.replay(sid, session)
                 result = {"sessionId": sid, "models": self.model_state(session["model"]),
@@ -369,18 +418,16 @@ class Server:
                              else params.get("configId"))
                 value = (params.get("modelId") if method == "session/set_model"
                          else params.get("value"))
+                self.normalize_session(session)
                 if config_id == "model":
-                    if value not in [r["modelId"] for r in self.model_cache]:
+                    if value not in self.variants:
                         raise ValueError(f"Model {value!r} is not available")
                     session["model"] = value
-                    self.setup_session_reasoning(session)
-                elif config_id == "thinking_effort":
-                    allowed = {item["value"] for item in self.reasoning_options(session["model"])}
-                    if value not in allowed:
-                        raise ValueError(
-                            f"Reasoning {value!r} is not supported by {session['model']}"
-                        )
-                    session["reasoning"] = value
+                    self.normalize_session(session)
+                elif config_id == "mode":
+                    if value not in self.variants[session["model"]]:
+                        raise ValueError(f"Mode {value!r} not supported by {session['model']}")
+                    session["mode"] = value
                 else:
                     raise ValueError(f"Unsupported config option: {config_id}")
                 save_session(session)

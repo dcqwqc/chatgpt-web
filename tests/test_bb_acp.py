@@ -1,178 +1,140 @@
-"""Local, network-free BB/ChatGPT Web ACP adapter regression tests."""
+"""BB native model/mode picker and CLI routing integration, no external calls."""
 import asyncio
-import json
-import os
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 import bb_acp
 
+def source_catalog():
+    models = []
+    for family, variants in bb_acp.VARIANT_SUFFIXES.items():
+        for mode, slug in variants.items():
+            kind = "auto" if mode == "auto" else "none" if mode == "instant" else "reasoning"
+            efforts = []
+            if mode == "thinking" and family in ("gpt-6", "gpt-5-6"):
+                efforts = [{"thinking_effort":"standard", "value":"medium"},
+                           {"thinking_effort":"extended", "value":"high"}]
+            models.append({"slug":slug, "title":family,
+                           "reasoning_type":kind, "efforts":efforts})
+    models.append({"slug":"chatgpt_alpha_internal","title":"Internal","efforts":[]})
+    return models
 
-class ModelAndSessionTests(unittest.TestCase):
-    def test_live_catalog_filters_internal_gates_and_disambiguates(self):
-        catalog = {"models": [
-            {"slug": "gpt-6", "title": "GPT-6"},
-            {"slug": "gpt-6-thinking", "title": "GPT-6"},
-            {"slug": "chatgpt_alpha_model_external_access_reserved_gate_12",
-             "title": "Internal"},
-            {"slug": "gpt-6", "title": "Duplicate"},
-        ]}
-        with patch.object(bb_acp, "daemon_request", return_value=catalog):
-            result = bb_acp.models()
-        self.assertEqual([r["modelId"] for r in result], ["gpt-6", "gpt-6-thinking"])
-        self.assertNotEqual(result[0]["name"], result[1]["name"])
+class FamilyTests(unittest.TestCase):
+    def test_four_families_only_available_variants_and_no_fabricated_auto(self):
+        x=bb_acp.build_families(source_catalog())
+        self.assertEqual(len(x),4)
+        self.assertEqual(x["gpt-6"],{
+            "auto":"gpt-6","instant":"gpt-6-instant",
+            "thinking":"gpt-6-thinking","extended":"gpt-6-thinking"})
+        self.assertEqual(x["gpt-6-mini"],{
+            "instant":"gpt-6-mini","thinking":"gpt-6-t-mini"})
+        self.assertEqual([r["name"] for r in bb_acp.model_rows(source_catalog())],
+            ["GPT-6","GPT-6 Mini","GPT-5.6 Sol","GPT-5.6 Luna"])
+        self.assertEqual(bb_acp.build_families([{"slug":"gpt-6-instant"}]),
+                         {"gpt-6":{"instant":"gpt-6-instant"}})
 
-    def test_sessions_persist_privately(self):
-        with tempfile.TemporaryDirectory() as d, patch.object(bb_acp, "ROOT", Path(d)):
-            state = {"sessionId": "a" * 32, "model": "gpt-6-thinking", "conversation_id": None}
-            bb_acp.save_session(state)
-            self.assertEqual(bb_acp.load_session("a"*32), state)
-            self.assertEqual(bb_acp.session_path("a"*32).stat().st_mode & 0o777, 0o600)
-            self.assertRaises(ValueError, bb_acp.session_path, "../../wrong")
-
+    def test_private_existing_session_migrates_without_changing_chat_id(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(bb_acp,"ROOT",Path(d)):
+            sid="a"*32
+            original={"sessionId":sid,"model":"gpt-6-thinking",
+                      "reasoning":"high","conversation_id":"existing-id",
+                      "keep":"other-record"}
+            bb_acp.save_session(original)
+            self.assertEqual(bb_acp.load_session(sid),original)
+            self.assertEqual(bb_acp.session_path(sid).stat().st_mode&0o777,0o600)
+            self.assertRaises(ValueError,bb_acp.session_path,"../other")
+            server=bb_acp.Server()
+            with patch.object(bb_acp,"model_capabilities",return_value=source_catalog()):
+                server.catalog()
+            state=bb_acp.load_session(sid)
+            server.normalize_session(state)
+            self.assertEqual((state["model"],state["mode"]),
+                             ("gpt-6","extended"))
+            self.assertEqual(state["conversation_id"],"existing-id")
+            self.assertEqual(state["keep"],"other-record")
+            self.assertNotIn("reasoning",state)
 
 class ProtocolTests(unittest.IsolatedAsyncioTestCase):
-    async def test_v1_handshake_and_model_switch(self):
-        server = bb_acp.Server()
-        messages = []
-        async def emit(obj):
-            messages.append(obj)
-        server.emit = emit
-        model_list = [{"modelId": "gpt-6-thinking", "name": "Thinking"},
-                      {"modelId": "gpt-6-instant", "name": "Instant"}]
-        model_details = {
-            "gpt-6-thinking": {
-                "slug": "gpt-6-thinking", "reasoning_type": "reasoning",
-                "efforts": [
-                    {"value": "medium", "name": "Medium", "thinking_effort": "standard"},
-                    {"value": "high", "name": "High", "thinking_effort": "extended"},
-                ],
-            },
-            "gpt-6-instant": {
-                "slug": "gpt-6-instant", "reasoning_type": "none", "efforts": [],
-            }
-        }
-        def catalog():
-            server.model_cache = model_list
-            server.model_capabilities_cache = model_details
-            return model_list
-        server.catalog = catalog
-        server.catalog()
-        with tempfile.TemporaryDirectory() as d, patch.object(bb_acp, "ROOT", Path(d)):
-            await server.dispatch({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                                   "params": {"protocolVersion": 1}})
-            self.assertEqual(messages[-1]["result"]["protocolVersion"], 1)
-            await server.dispatch({"jsonrpc": "2.0", "id": 2, "method": "session/new",
-                                   "params": {"cwd": d, "mcpServers": []}})
-            sid = messages[-1]["result"]["sessionId"]
-            self.assertEqual(messages[-1]["result"]["models"]["currentModelId"],
-                             "gpt-6-thinking")
-            self.assertEqual([o["value"] for o in
-                              messages[-1]["result"]["configOptions"][1]["options"]],
-                             ["medium", "high"])
-            await server.dispatch({"jsonrpc": "2.0", "id": 20,
-                                   "method": "session/set_config_option",
-                                   "params": {"sessionId": sid,
-                                              "configId": "thinking_effort",
-                                              "value": "high"}})
-            self.assertEqual(bb_acp.load_session(sid)["reasoning"], "high")
-            self.assertEqual(messages[-1]["result"]["configOptions"][1]["currentValue"], "high")
-            await server.dispatch({"jsonrpc": "2.0", "id": 3, "method": "session/set_model",
-                                   "params": {"sessionId": sid, "modelId": "gpt-6-instant"}})
-            self.assertEqual(bb_acp.load_session(sid)["model"], "gpt-6-instant")
-            self.assertEqual(bb_acp.load_session(sid)["reasoning"], "none")
-            self.assertEqual(messages[-1]["result"]["configOptions"][1]["options"],
-                             [{"value": "none", "name": "None"}])
-            await server.dispatch({"jsonrpc": "2.0", "id": 21,
-                                   "method": "session/set_config_option",
-                                   "params": {"sessionId": sid,
-                                              "configId": "thinking_effort",
-                                              "value": "high"}})
-            self.assertIn("error", messages[-1])
-            self.assertEqual(bb_acp.load_session(sid)["reasoning"], "none")
-            await server.dispatch({"jsonrpc": "2.0", "id": 4, "method": "session/set_model",
-                                   "params": {"sessionId": sid, "modelId": "fake-model"}})
-            self.assertIn("error", messages[-1])
-            self.assertEqual(bb_acp.load_session(sid)["model"], "gpt-6-instant")
-            await server.dispatch({"jsonrpc": "2.0", "id": 5, "method": "session/load",
-                                   "params": {"sessionId": sid, "cwd": d, "mcpServers": []}})
-            self.assertEqual(messages[-1]["result"]["models"]["currentModelId"],
-                             "gpt-6-instant")
-            self.assertEqual(messages[-1]["result"]["configOptions"][1]["currentValue"],
-                             "none")
+    async def asyncSetUp(self):
+        self.server=bb_acp.Server()
+        self.records=[]
+        async def emit(record):self.records.append(record)
+        self.server.emit=emit
+        self.catalog_patch=patch.object(bb_acp,"model_capabilities",return_value=source_catalog())
+        self.catalog_patch.start();self.server.catalog()
+        self.temp=tempfile.TemporaryDirectory()
+        self.root_patch=patch.object(bb_acp,"ROOT",Path(self.temp.name));self.root_patch.start()
+    async def asyncTearDown(self):
+        self.root_patch.stop();self.catalog_patch.stop();self.temp.cleanup()
+    async def request(self,id,method,params):
+        await self.server.dispatch({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+        return self.records[-1]
+    async def test_picker_model_mode_and_concurrent_session_settings(self):
+        self.assertEqual((await self.request(1,"initialize",{}))["result"]["protocolVersion"],1)
+        r=(await self.request(2,"session/new",{"cwd":"/tmp","mcpServers":[]}))["result"]
+        sid=r["sessionId"]
+        self.assertEqual(len(r["models"]["availableModels"]),4)
+        self.assertEqual(r["models"]["currentModelId"],"gpt-6")
+        self.assertEqual([x["id"] for x in r["configOptions"]],["model","mode"])
+        self.assertEqual([x["value"] for x in r["configOptions"][1]["options"]],
+                         ["auto","instant","thinking","extended"])
+        r=(await self.request(3,"session/set_config_option",
+             {"sessionId":sid,"configId":"mode","value":"extended"}))["result"]
+        self.assertEqual(r["configOptions"][1]["currentValue"],"extended")
+        r=(await self.request(4,"session/set_config_option",
+             {"sessionId":sid,"configId":"model","value":"gpt-5-6"}))["result"]
+        self.assertEqual(r["configOptions"][0]["currentValue"],"gpt-5-6")
+        self.assertEqual(r["configOptions"][1]["currentValue"],"extended")
+        r=(await self.request(5,"session/set_model",
+             {"sessionId":sid,"modelId":"gpt-6-mini"}))["result"]
+        self.assertEqual(r["configOptions"][1]["currentValue"],"thinking")
+        self.assertEqual([x["value"] for x in r["configOptions"][1]["options"]],
+                         ["instant","thinking"])
+        self.assertIn("error",await self.request(6,"session/set_config_option",
+             {"sessionId":sid,"configId":"mode","value":"extended"}))
+        self.assertIn("error",await self.request(7,"session/set_config_option",
+             {"sessionId":sid,"configId":"mode","value":"auto"}))
+        self.assertIn("error",await self.request(8,"session/set_model",
+             {"sessionId":sid,"modelId":"internal"}))
+        r=(await self.request(9,"session/load",{"sessionId":sid,"cwd":"/tmp","mcpServers":[]}))["result"]
+        self.assertEqual(r["configOptions"][1]["currentValue"],"thinking")
+        self.assertEqual(bb_acp.load_session(sid)["model"],"gpt-6-mini")
 
-    def test_prompt_effort_is_passed_only_for_supported_model(self):
-        server = bb_acp.Server()
-        server.model_capabilities_cache = {
-            "gpt-6-thinking": {
-                "slug": "gpt-6-thinking", "reasoning_type": "reasoning",
-                "efforts": [{"value": "high", "name": "High",
-                             "thinking_effort": "extended"}]
-            }
-        }
-        session = {"model": "gpt-6-thinking", "reasoning": "high"}
-        self.assertEqual(server.reasoning_options("gpt-6-thinking"),
-                         [{"value": "high", "name": "High"}])
-        self.assertEqual(server.reasoning_options("gpt-6-instant"),
-                         [{"value": "auto", "name": "Automatic"}])
-
-class PromptMappingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_selected_reasoning_is_passed_to_cli_without_global_mutation(self):
-        async def run_case(model, reasoning, expected_effort):
-            server = bb_acp.Server()
-            sid = "b" * 32
-            server.sessions[sid] = {
-                "sessionId": sid, "model": model,
-                "reasoning": reasoning, "conversation_id": None
-            }
-            server.model_capabilities_cache = {
-                "gpt-6-thinking": {
-                    "slug": "gpt-6-thinking", "reasoning_type": "reasoning",
-                    "efforts": [
-                        {"value": "medium", "thinking_effort": "standard"},
-                        {"value": "high", "thinking_effort": "extended"},
-                    ]
-                },
-                "gpt-6-instant": {
-                    "slug": "gpt-6-instant", "reasoning_type": "none",
-                    "efforts": []
-                }
-            }
-            emitted = []
-            async def emit(message):
-                emitted.append(message)
-            server.emit = emit
-            commands = []
-            async def fake_exec(*args, **kwargs):
-                commands.append(args)
-                class FakeProc:
-                    def __init__(self):
-                        self.stdout = asyncio.StreamReader()
-                        self.stdout.feed_data(b'{"type":"result","conversation_id":"mock"}\n')
-                        self.stdout.feed_eof()
-                        self.stderr = asyncio.StreamReader()
-                        self.stderr.feed_eof()
-                        self.returncode = 0
-                    async def wait(self):
-                        return 0
-                return FakeProc()
-            with tempfile.TemporaryDirectory() as root, patch.object(
-                bb_acp, "ROOT", Path(root)
-            ), patch.object(
-                bb_acp.asyncio, "create_subprocess_exec", side_effect=fake_exec
-            ):
-                await server.do_prompt(20, sid, [
-                    {"type": "text", "text": "Only a fake test prompt"}
-                ])
-            self.assertEqual(emitted[-1]["result"]["stopReason"], "end_turn")
-            argv = list(commands[0])
-            self.assertEqual(argv[argv.index("--model")+1], model)
-            if expected_effort is None:
-                self.assertNotIn("--thinking-effort", argv)
-            else:
-                self.assertEqual(
-                    argv[argv.index("--thinking-effort")+1], expected_effort)
-        await run_case("gpt-6-thinking", "high", "extended")
-        await run_case("gpt-6-thinking", "medium", "standard")
-        await run_case("gpt-6-instant", "none", None)
+    async def test_every_mode_routes_to_verified_native_slug_and_effort(self):
+        for family,mode,slug,effort in (
+            ("gpt-6","auto","gpt-6",None),
+            ("gpt-6","instant","gpt-6-instant",None),
+            ("gpt-6","thinking","gpt-6-thinking","standard"),
+            ("gpt-6","extended","gpt-6-thinking","extended"),
+            ("gpt-6-mini","thinking","gpt-6-t-mini",None),
+            ("gpt-6-mini","instant","gpt-6-mini",None),
+            ("gpt-5-6","extended","gpt-5-6-thinking","extended"),
+            ("gpt-5-6-mini","thinking","gpt-5-6-t-mini",None),
+        ):
+            with self.subTest(family=family,mode=mode):
+                sid="b"*32
+                self.server.sessions[sid]={"sessionId":sid,"model":family,
+                    "mode":mode,"conversation_id":None}
+                calls=[]
+                async def fake_exec(*argv,**kwargs):
+                    calls.append(list(argv))
+                    class FakeProcess:
+                        def __init__(self):
+                            self.stdout=asyncio.StreamReader()
+                            self.stdout.feed_data(b'{"type":"result","conversation_id":"fake-chat"}\n')
+                            self.stdout.feed_eof()
+                            self.stderr=asyncio.StreamReader()
+                            self.stderr.feed_eof()
+                            self.returncode=0
+                        async def wait(self):return 0
+                    return FakeProcess()
+                with patch.object(bb_acp.asyncio,"create_subprocess_exec",side_effect=fake_exec):
+                    await self.server.do_prompt(30,sid,[{"type":"text","text":"test"}])
+                args=calls[-1]
+                self.assertEqual(args[args.index("--model")+1],slug)
+                if effort:
+                    self.assertEqual(args[args.index("--thinking-effort")+1],effort)
+                else:
+                    self.assertNotIn("--thinking-effort",args)
+                self.assertEqual(self.records[-1]["result"]["stopReason"],"end_turn")
