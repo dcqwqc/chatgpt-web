@@ -312,3 +312,116 @@ class ImageFallbackTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(calls[0][1]["prompt"],"Generate an image of a tree.")
             self.assertEqual(records[-1]["result"]["stopReason"],"end_turn")
             self.assertEqual(json.loads((root / "sessions" / (sid+".json")).read_text())["image_version_id"],"c"*32)
+
+
+class RateLimitRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.server = bb_acp.Server()
+        self.records = []
+        async def emit(record):
+            self.records.append(record)
+        self.server.emit = emit
+        self.catalog_patch = patch.object(
+            bb_acp, "model_capabilities", return_value=source_catalog())
+        self.catalog_patch.start()
+        self.server.catalog()
+        self.temp = tempfile.TemporaryDirectory()
+        self.root_patch = patch.object(bb_acp, "ROOT", Path(self.temp.name))
+        self.root_patch.start()
+        self.sid = "d" * 32
+        self.server.sessions[self.sid] = {
+            "sessionId": self.sid, "model": "gpt-6",
+            "mode": "instant", "conversation_id": None,
+        }
+
+    async def asyncTearDown(self):
+        self.root_patch.stop()
+        self.catalog_patch.stop()
+        self.temp.cleanup()
+
+    @staticmethod
+    def process(*, failed=False, submitted=False, delay=58):
+        class FakeProcess:
+            def __init__(self):
+                self.stdout = asyncio.StreamReader()
+                if submitted:
+                    self.stdout.feed_data(
+                        b'{"type":"phase","status":"Verifying saved conversation","submitted":true}\n')
+                if not failed:
+                    self.stdout.feed_data(
+                        b'{"type":"result","conversation_id":"verified"}\n')
+                self.stdout.feed_eof()
+                self.stderr = asyncio.StreamReader()
+                if failed:
+                    self.stderr.feed_data(
+                        f"chatgpt-web: ChatGPT web rate limit reached; "
+                        f"retry after {delay} seconds".encode())
+                self.stderr.feed_eof()
+                self.returncode = 1 if failed else 0
+
+            async def wait(self):
+                return self.returncode
+
+        return FakeProcess()
+
+    async def test_unsubmitted_429_retries_and_preserves_original_request(self):
+        calls = []
+        async def fake_exec(*args, **kwargs):
+            calls.append(args)
+            return self.process(failed=len(calls) == 1)
+        async def instant_sleep(seconds):
+            self.assertEqual(seconds, 59)
+        with patch.object(bb_acp.asyncio, "create_subprocess_exec",
+                          side_effect=fake_exec), patch.object(
+                              bb_acp.asyncio, "sleep",
+                              side_effect=instant_sleep):
+            await self.server.do_prompt(
+                9, self.sid, [{"type": "text", "text": "recommend plugins for BB"}])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+        self.assertEqual(self.server.sessions[self.sid]["conversation_id"],
+                         "verified")
+        self.assertEqual(self.records[-1]["result"]["stopReason"], "end_turn")
+        self.assertEqual(len([r for r in self.records if "result" in r]), 1)
+
+    async def test_post_submit_429_does_not_resend(self):
+        calls = []
+        async def fake_exec(*args, **kwargs):
+            calls.append(args)
+            return self.process(failed=True, submitted=True)
+        with patch.object(bb_acp.asyncio, "create_subprocess_exec",
+                          side_effect=fake_exec):
+            with self.assertRaisesRegex(RuntimeError, "rate limit reached"):
+                await self.server.do_prompt(
+                    10, self.sid, [{"type":"text","text":"do not duplicate me"}])
+        self.assertEqual(len(calls), 1)
+
+    async def test_stops_after_two_retry_attempts(self):
+        calls = []
+        sleeps = []
+        async def fake_exec(*args, **kwargs):
+            calls.append(args)
+            return self.process(failed=True)
+        async def fake_sleep(seconds):
+            sleeps.append(seconds)
+        with patch.object(bb_acp.asyncio, "create_subprocess_exec",
+                          side_effect=fake_exec), patch.object(
+                              bb_acp.asyncio, "sleep",
+                              side_effect=fake_sleep):
+            with self.assertRaisesRegex(RuntimeError, "retry after 58 seconds"):
+                await self.server.do_prompt(
+                    11, self.sid, [{"type":"text","text":"retry with bounds"}])
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleeps, [59, 59])
+
+    async def test_unreasonable_retry_after_is_not_retried(self):
+        calls = []
+        async def fake_exec(*args, **kwargs):
+            calls.append(args)
+            return self.process(failed=True, delay=3600)
+        with patch.object(bb_acp.asyncio, "create_subprocess_exec",
+                          side_effect=fake_exec):
+            with self.assertRaisesRegex(RuntimeError, "retry after 3600 seconds"):
+                await self.server.do_prompt(
+                    12, self.sid, [{"type":"text","text":"bounded wait"}])
+        self.assertEqual(len(calls), 1)

@@ -18,6 +18,8 @@ import tempfile
 import uuid
 from typing import Any
 
+from cooldown import retry_after_seconds
+
 ROOT = Path.home() / ".local/state/chatgpt-web/bb-acp"
 SOCKET = Path(os.environ.get("CHATGPT_WEB_ACP_SOCKET",
     str(Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/chatgpt-web-{os.getuid()}")) /
@@ -426,7 +428,7 @@ class Server:
         await self.update(sid, f"Image generation did not complete ({state}). {detail}. "
                           f"Job: {job['job_id']}. No image has been generated for this request.")
 
-    async def do_prompt(self, request_id: Any, sid: str, blocks: list):
+    async def do_prompt(self, request_id: Any, sid: str, blocks: list, rate_retries: int = 0):
         session = self.sessions[sid]
         pieces = []
         for block in blocks:
@@ -490,6 +492,7 @@ class Server:
         final = ""
         new_conversation_id = None
         errors = []
+        submitted = False
         try:
             assert process.stdout is not None
             while True:
@@ -501,6 +504,11 @@ class Server:
                 except (json.JSONDecodeError, UnicodeError):
                     continue
                 typ = event.get("type")
+                # The CLI marks a 2xx accepted send explicitly. A later 429
+                # can be a read/verification throttle; resending it would
+                # duplicate a user message, so only retry pre-acceptance 429s.
+                if event.get("submitted") is True:
+                    submitted = True
                 if typ == "delta" and isinstance(event.get("text"), str):
                     delta = event["text"]
                     rendered += delta
@@ -534,7 +542,19 @@ class Server:
                     await self.emit({"jsonrpc":"2.0","id":request_id,
                                      "result":{"stopReason":"end_turn"}})
                     return
-                raise RuntimeError("; ".join(errors))
+                detail = "; ".join(errors)
+                delay = retry_after_seconds(detail)
+                # Honor Retry-After, but do not hold a BB run indefinitely.
+                # Retry only a documented 429 refusal with zero output and no
+                # accepted submission; all ambiguous outcomes fail closed.
+                if (delay is not None and delay <= 180 and rate_retries < 2
+                        and not submitted and not rendered and not final
+                        and new_conversation_id is None):
+                    await asyncio.sleep(delay + 1)
+                    await self.do_prompt(request_id, sid, blocks,
+                                         rate_retries=rate_retries + 1)
+                    return
+                raise RuntimeError(detail)
             if not new_conversation_id and not session.get("conversation_id"):
                 raise RuntimeError("ChatGPT Web replied without a conversation ID")
             if new_conversation_id:
