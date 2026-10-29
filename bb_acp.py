@@ -21,7 +21,7 @@ from typing import Any
 ROOT = Path.home() / ".local/state/chatgpt-web/bb-acp"
 SOCKET = Path(os.environ.get("CHATGPT_WEB_ACP_SOCKET",
     str(Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/chatgpt-web-{os.getuid()}")) /
-        "chatgpt-web/daemon-v3.sock")))
+        "chatgpt-web/daemon-v4.sock")))
 CLI = os.environ.get("CHATGPT_WEB_ACP_CLI", str(Path.home() / ".local/bin/chatgpt-web"))
 SESSION_RE = re.compile(r"^[a-f0-9]{32}$")
 MODEL_RE = re.compile(r"^[a-zA-Z0-9._/-]+$")

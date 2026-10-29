@@ -32,7 +32,7 @@ class FakeClient:
         return self
     def __exit__(self, *args):
         pass
-    def send_prompt(self, cid, prompt, attachments, on_event=None):
+    def send_prompt(self, cid, prompt, attachments, on_event=None, **kwargs):
         self.control["entered"].append((cid,prompt,threading.get_ident()))
         self.control["started"].set()
         if cid == "long-one":

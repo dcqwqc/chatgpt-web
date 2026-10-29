@@ -523,10 +523,31 @@ conversations proceed in parallel. This protects against losing a branch
 or overwriting messages in shared conversation history. ChatGPT account
 quota and rate limits remain shared and cannot be bypassed by parallel clients.
 
-The upgraded backend uses daemon-v3.sock so an older busy daemon and its
+The upgraded backend uses daemon-v4.sock so an older busy daemon and its
 existing CLI session can finish safely without being killed. Restart both
 CLI windows to use the concurrent server. Per-thread temporary files prevent
 auth/session and conversation cache corruption during parallel writes.
+
+### Interactive chat continuity and structured responses
+
+The interactive terminal can resume recent ChatGPT conversations, including
+conversations created outside the dedicated CLI Project. It retrieves and
+checks the selected server conversation before sending a reply, preserves
+the conversation's original Project (or no Project), and stops if the server
+returns a different conversation. New chats still start in the CLI Project.
+Noninteractive daemon calls and scripts continue to enforce CLI Project
+isolation unless a caller explicitly uses the interactive-only opt-in flag.
+
+The response viewer renders basic structured ChatGPT text elements such as
+badges, links and headings as Markdown. Images, rich charts, widgets and
+interactive controls show honest text fallbacks, not raw angle-bracket tags
+or fake working controls. For full ChatGPT interactions, type `/web` to
+open the active conversation in the browser. Use `/copy` to copy the latest
+assistant response and `/copy code 1` to copy its first fenced code block.
+Image previews still work as before.
+
+The upgraded backend uses its own versioned daemon-v4 socket and does not
+stop older daemon instances or active requests.
 
 ### BB / ACP provider (Philipedia)
 

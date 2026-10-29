@@ -67,7 +67,7 @@ def default_socket_path() -> Path:
     base = Path(runtime) if runtime else Path("/tmp") / f"chatgpt-web-{os.getuid()}"
     # Versioned socket lets upgraded clients start a new backend safely
     # without killing an older daemon that may still be serving a live turn.
-    return base / "chatgpt-web" / "daemon-v3.sock" if runtime else base / "daemon-v3.sock"
+    return base / "chatgpt-web" / "daemon-v4.sock" if runtime else base / "daemon-v4.sock"
 
 
 def auth_store_path() -> Path:
@@ -138,7 +138,7 @@ def cache_conversation(conversation: dict[str, Any], make_active: bool = True) -
     return normalized
 
 
-def load_cached_conversation(conversation_id: str | None = None) -> dict[str, Any] | None:
+def load_cached_conversation(conversation_id: str | None = None, *, allow_external: bool = False) -> dict[str, Any] | None:
     if conversation_id is None:
         try:
             active = json.loads(active_conversation_path().read_text(encoding="utf-8"))
@@ -155,7 +155,7 @@ def load_cached_conversation(conversation_id: str | None = None) -> dict[str, An
     if not isinstance(value, dict):
         return None
     selected_project = load_preferences().get("project_id")
-    if (not PROJECT_ID_RE.fullmatch(str(selected_project)) or
+    if not allow_external and (not PROJECT_ID_RE.fullmatch(str(selected_project)) or
             value.get("gizmo_id") != selected_project):
         return None
     return value
@@ -547,6 +547,8 @@ class ChatGPTWebClient:
         prompt: str,
         attachments: list[dict[str, Any]] | None = None,
         on_event: Any = None,
+        *,
+        allow_existing_outside_project: bool = False,
     ) -> tuple[str, dict[str, Any], set[str]]:
         if attachments and os.environ.get("CHATGPT_WEB_SEND_MODE", "node") != "node":
             raise ChatGPTWebError("image attachments require the direct node send mode")
@@ -559,8 +561,11 @@ class ChatGPTWebClient:
         previous: dict[str, Any] | None = None
         if conversation_id:
             previous = self.get_conversation(conversation_id)
-            if previous.get("gizmo_id") != project_id:
-                raise ChatGPTWebError("This conversation is outside the CLI Project; /new starts a Project chat")
+            if previous.get("gizmo_id") != project_id and not allow_existing_outside_project:
+                raise ChatGPTWebError(
+                    "This conversation is outside the CLI Project. "
+                    "Continue it in the interactive TUI, or /new to start a CLI Project chat."
+                )
             previous_messages = previous.get("messages", [])
             if isinstance(previous_messages, list):
                 previous_ids = {
@@ -575,7 +580,11 @@ class ChatGPTWebClient:
             if on_event:
                 on_event({"type":"phase", "status":"Verifying saved conversation…"})
             conversation = self.get_conversation(resolved_id)
-            if conversation.get("gizmo_id") != project_id:
+            # Project-only scripted requests stay isolated; interactive continuations
+            # must remain in their original chat and original Project (if any).
+            expected_project = previous.get("gizmo_id") if previous is not None else project_id
+            if (conversation.get("gizmo_id") != expected_project
+                    or (conversation_id is not None and resolved_id != conversation_id)):
                 if conversation_id is None:
                     # Only delete the new, incorrectly routed chat created by this request.
                     try:
@@ -586,8 +595,9 @@ class ChatGPTWebClient:
                     except (ChatGPTWebError, httpx.HTTPError):
                         pass
                 raise ChatGPTWebError(
-                    "ChatGPT did not confirm CLI Project ownership; response blocked. "
-                    "Any misrouted new conversation was queued for cleanup."
+                    "ChatGPT did not preserve the requested conversation/Project; "
+                    "response blocked. A misrouted new conversation was cleaned up "
+                    "when possible; existing chats were not deleted."
                 )
             messages = conversation.get("messages", [])
             attached = isinstance(messages, list) and any(
@@ -703,10 +713,18 @@ class ChatGPTWebClient:
                     conversation, prompt, attachments
                 )
 
-        project_id = self.target_project_id()
-        body["conversation_mode"] = {"kind": "gizmo_interaction", "gizmo_id": project_id}
-        body["gizmo_id"] = project_id
-        body["conversation_template_id"] = project_id
+        # Preserve the server-verified owner and never let a browser recipe
+        # silently move a conversation into a different Project.
+        owner = conversation.get("gizmo_id") if conversation is not None else self.target_project_id()
+        for key in ("gizmo_id", "conversation_template_id"):
+            body.pop(key, None)
+        if isinstance(owner, str) and owner:
+            body["conversation_mode"] = {"kind": "gizmo_interaction", "gizmo_id": owner}
+            body["gizmo_id"] = owner
+            body["conversation_template_id"] = owner
+        else:
+            body["conversation_mode"] = {"kind": "primary_assistant"}
+        # ACP model selection is per request, not the shared CLI preference.
         if getattr(self, "_request_model", None):
             body["model"] = self._request_model
         headers.pop("x-openai-web-sse-compression", None)
@@ -927,7 +945,6 @@ class ChatGPTWebClient:
             "client_prepare_state": "sent",
             "timezone_offset_min": offset_minutes,
             "timezone": os.environ.get("TZ", "Europe/Lisbon"),
-            "conversation_mode": {"kind": "gizmo_interaction", "gizmo_id": self.target_project_id()},
             "enable_message_followups": True,
             "system_hints": [],
             "supports_buffering": False,
@@ -937,8 +954,15 @@ class ChatGPTWebClient:
             "thinking_effort": "extended",
             "local_function_names": ["local.continue_in_work"],
         }
-        body["gizmo_id"] = self.target_project_id()
-        body["conversation_template_id"] = body["gizmo_id"]
+        # Continuing a normal chat must not smuggle in the CLI Project ID.
+        # New chats default to the CLI Project; existing chats preserve their own.
+        owner = conversation.get("gizmo_id") if conversation is not None else self.target_project_id()
+        if isinstance(owner, str) and owner:
+            body["conversation_mode"] = {"kind": "gizmo_interaction", "gizmo_id": owner}
+            body["gizmo_id"] = owner
+            body["conversation_template_id"] = owner
+        else:
+            body["conversation_mode"] = {"kind": "primary_assistant"}
         if conversation:
             conversation_id = conversation.get("conversation_id") or conversation.get("id")
             if isinstance(conversation_id, str) and conversation_id:
@@ -1358,7 +1382,7 @@ def run_fullscreen(
         ensure_daemon(socket_path, cdp_url)
 
     def local_legacy_items() -> list[dict[str, Any]]:
-        """Old non-Project local caches are readable, never writable."""
+        """Older non-Project caches can be recovered for verified continuation."""
         result = []
         configured = load_preferences().get("project_id")
         for path in conversation_cache_dir().glob("*.json"):
@@ -1416,7 +1440,7 @@ def run_fullscreen(
             if ready.get("ready") is not True:
                 raise ChatGPTWebError("Chat daemon is busy; showing cached chats")
         result = daemon_request(socket_path, {
-            "command": "list", "maximum": 35, "quick": True,
+            "command": "list", "maximum": 35, "quick": True, "interactive_include_other": True,
         }, timeout_seconds=9)
         online = result.get("items", [])
         if not isinstance(online, list):
@@ -1453,8 +1477,9 @@ def run_fullscreen(
             if not isinstance(old, dict) or old.get("gizmo_id") == load_preferences().get("project_id"):
                 raise ChatGPTWebError("Invalid older cached chat")
             return {
-                "id": None, "server_id": None, "legacy": True,
-                "title": (old.get("title") or "Older chat") + " (read-only source)",
+                "id": legacy_id, "server_id": legacy_id, "offline": True,
+                "title": old.get("title") or "Older chat",
+                "gizmo_id": old.get("gizmo_id"),
                 "messages": old.get("messages", []),
             }
         snapshot = local_history.by_server(selected_id)
@@ -1466,21 +1491,22 @@ def run_fullscreen(
                 "messages": snapshot.get("messages", []),
                 "last_image": snapshot.get("last_image"),
             }
-        cached = load_cached_conversation(selected_id)
+        cached = load_cached_conversation(selected_id, allow_external=True)
         if cached is not None:
-            # Only records already verified as CLI Project chats are eligible.
+            # Interactive picker may display older caches; sending verifies the live chat.
             cached["offline"] = True
             return cached
         try:
             ensure_service()
             raw = daemon_request(socket_path, {
                 "command": "show_normalized", "conversation_id": selected_id,
+                "interactive_allow_external": True,
             }).get("conversation", {})
             if isinstance(raw, dict):
                 cache_conversation(raw)
                 return raw
         except (ChatGPTWebError, OSError):
-            cached = load_cached_conversation(selected_id)
+            cached = load_cached_conversation(selected_id, allow_external=True)
             if cached is not None:
                 cached["offline"] = True
                 return cached
@@ -1500,6 +1526,7 @@ def run_fullscreen(
             "conversation_id": selected_id,
             "prompt": prompt,
             "attachments": attachments,
+            "interactive_allow_external": True,
         }, on_event, on_connection)
         conversation = result.get("conversation")
         if isinstance(conversation, dict):
@@ -1529,6 +1556,7 @@ def run_fullscreen(
             "command": "rename",
             "conversation_id": selected_id,
             "title": new_title,
+            "interactive_allow_external": True,
         })
         rename_cached_conversation(selected_id, new_title)
 
@@ -1865,6 +1893,8 @@ def handle_daemon_command(
         if maximum is not None and (not isinstance(maximum, int) or maximum < 1):
             raise ChatGPTWebError("invalid conversation limit")
         quick = request.get("quick") is True
+        if request.get("interactive_include_other") is True:
+            return {"items": client.list_conversations(maximum)}, False
         return {
             "items": client.list_project_conversations(
                 maximum, max_pages=1 if quick else None,
@@ -1876,7 +1906,8 @@ def handle_daemon_command(
         if not isinstance(conversation_id, str) or not conversation_id:
             raise ChatGPTWebError("conversation ID is required")
         conversation = client.get_conversation(conversation_id)
-        if conversation.get("gizmo_id") != client.target_project_id():
+        if (conversation.get("gizmo_id") != client.target_project_id()
+                and request.get("interactive_allow_external") is not True):
             raise ChatGPTWebError("This conversation is outside the CLI Project")
         return {"conversation": conversation}, False
     if command == "show_normalized":
@@ -1884,7 +1915,8 @@ def handle_daemon_command(
         if not isinstance(conversation_id, str) or not conversation_id:
             raise ChatGPTWebError("conversation ID is required")
         conversation = client.get_conversation(conversation_id)
-        if conversation.get("gizmo_id") != client.target_project_id():
+        if (conversation.get("gizmo_id") != client.target_project_id()
+                and request.get("interactive_allow_external") is not True):
             raise ChatGPTWebError("This conversation is outside the CLI Project")
         normalized = cache_conversation(conversation)
         try:
@@ -1905,7 +1937,8 @@ def handle_daemon_command(
         title = title.strip()
         if len(title) > 256:
             raise ChatGPTWebError("conversation title must be 256 characters or fewer")
-        if client.get_conversation(conversation_id).get("gizmo_id") != client.target_project_id():
+        if (client.get_conversation(conversation_id).get("gizmo_id") != client.target_project_id()
+                and request.get("interactive_allow_external") is not True):
             raise ChatGPTWebError("This conversation is outside the CLI Project")
         client.rename_conversation(conversation_id, title)
         return {"conversation_id": conversation_id, "title": title}, False
@@ -1920,7 +1953,8 @@ def handle_daemon_command(
         if not isinstance(attachments, list):
             raise ChatGPTWebError("invalid attachment list")
         resolved_id, conversation, previous_ids = client.send_prompt(
-            conversation_id, prompt, attachments
+            conversation_id, prompt, attachments,
+            allow_existing_outside_project=request.get("interactive_allow_external") is True,
         )
         cache_conversation(conversation)
         return {
@@ -2019,6 +2053,7 @@ def process_daemon_connection(
             resolved_id, conversation, previous_ids = client.send_prompt(
                 conversation_id, prompt, attachments,
                 lambda event: send_json_line(connection, {"ok": True, "event": event}),
+                allow_existing_outside_project=request.get("interactive_allow_external") is True,
             )
             normalized = cache_conversation(conversation)
             media_paths: list[str] = []

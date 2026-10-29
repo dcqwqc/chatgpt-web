@@ -225,7 +225,7 @@ def merge_recent(remote: list[dict], *, legacy: list[dict] | None = None) -> lis
         if isinstance(sid, str) and sid not in seen:
             rows.append({
                 "id": "legacy:" + sid,
-                "title": str(item.get("title") or "Older chat")[:100] + "  [legacy · read-only]",
+                "title": str(item.get("title") or "Older chat")[:100] + "  [older cached chat]",
                 "update_time": item.get("update_time") or 0,
             })
             seen.add(sid)
