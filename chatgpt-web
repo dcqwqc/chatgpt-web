@@ -427,6 +427,46 @@ class ChatGPTWebClient:
             raise ChatGPTWebError("No selectable ChatGPT models were reported")
         return models
 
+    def model_capabilities(self) -> list[dict[str, Any]]:
+        """Account-reported per-model thinking capabilities for BB.
+
+        The website's standard/extended vocabulary is represented as
+        Medium/High in BB; do not offer unsupported Extra High levels.
+        """
+        payload = self.request(
+            "GET", urljoin(CHATGPT_ORIGIN, "/backend-api/models"),
+        ).json()
+        allowed = {model["slug"] for model in parse_models(payload)}
+        result = []
+        for raw in payload.get("models", []):
+            if not isinstance(raw, dict):
+                continue
+            slug = raw.get("slug")
+            if slug not in allowed:
+                continue
+            reasoning_type = raw.get("reasoning_type")
+            if reasoning_type not in ("none", "auto", "reasoning"):
+                reasoning_type = "auto"
+            efforts = []
+            if raw.get("configurable_thinking_effort") is True:
+                for effort in raw.get("thinking_efforts", []):
+                    if not isinstance(effort, dict):
+                        continue
+                    name = effort.get("thinking_effort")
+                    if name in ("standard", "extended"):
+                        value = "medium" if name == "standard" else "high"
+                        if value not in [e["value"] for e in efforts]:
+                            efforts.append({
+                                "value": value, "name": value.title(),
+                                "thinking_effort": name,
+                            })
+            result.append({
+                "slug": slug, "title": str(raw.get("title") or slug)[:80],
+                "reasoning_type": reasoning_type,
+                "efforts": efforts,
+            })
+        return result
+
     def model_status(self) -> dict[str, Any]:
         models = self.available_models()
         selected = load_preferences().get("model")
@@ -727,6 +767,8 @@ class ChatGPTWebClient:
         # ACP model selection is per request, not the shared CLI preference.
         if getattr(self, "_request_model", None):
             body["model"] = self._request_model
+        if getattr(self, "_request_thinking_effort", None):
+            body["thinking_effort"] = self._request_thinking_effort
         headers.pop("x-openai-web-sse-compression", None)
         headers["x-openai-target-path"] = "/backend-api/f/conversation"
         headers["x-openai-target-route"] = "/backend-api/f/conversation"
@@ -951,7 +993,7 @@ class ChatGPTWebClient:
             "supported_encodings": [],
             "paragen_cot_summary_display_override": "allow",
             "force_parallel_switch": "auto",
-            "thinking_effort": "extended",
+            "thinking_effort": getattr(self, "_request_thinking_effort", None) or "extended",
             "local_function_names": ["local.continue_in_work"],
         }
         # Continuing a normal chat must not smuggle in the CLI Project ID.
@@ -1195,6 +1237,7 @@ def stream_prompt(
     prompt: str,
     output: str,
     model: str | None = None,
+    thinking_effort: str | None = None,
 ) -> dict[str, Any]:
     rendered = ""
 
@@ -1222,6 +1265,7 @@ def stream_prompt(
         "conversation_id": conversation_id,
         "prompt": prompt,
         "model": model,
+        "thinking_effort": thinking_effort,
     }, on_event)
 
     if output == "text":
@@ -1881,6 +1925,8 @@ def handle_daemon_command(
         return client.model_status(), False
     if command == "models_catalog":
         return {"models": client.available_models()}, False
+    if command == "model_capabilities":
+        return {"models": client.model_capabilities()}, False
     if command == "set_model":
         slug = request.get("model")
         if not isinstance(slug, str):
@@ -2049,7 +2095,23 @@ def process_daemon_connection(
                     raise ChatGPTWebError("Invalid model identifier")
                 if requested_model not in {item["slug"] for item in client.available_models()}:
                     raise ChatGPTWebError("Requested model is not selectable for this account")
+            requested_effort = request.get("thinking_effort")
+            if requested_effort is not None:
+                if requested_effort not in ("standard", "extended"):
+                    raise ChatGPTWebError("Unsupported thinking effort")
+                selected = requested_model or load_preferences().get("model")
+                capabilities = next(
+                    (m for m in client.model_capabilities() if m["slug"] == selected),
+                    None,
+                )
+                if capabilities is None or requested_effort not in {
+                    item["thinking_effort"] for item in capabilities["efforts"]
+                }:
+                    raise ChatGPTWebError(
+                        "Selected model does not support that thinking effort"
+                    )
             client._request_model = requested_model
+            client._request_thinking_effort = requested_effort
             resolved_id, conversation, previous_ids = client.send_prompt(
                 conversation_id, prompt, attachments,
                 lambda event: send_json_line(connection, {"ok": True, "event": event}),
@@ -2264,12 +2326,16 @@ def build_parser() -> argparse.ArgumentParser:
     send_parser.add_argument("conversation_id")
     send_parser.add_argument("prompt", nargs="*")
     send_parser.add_argument("--model", help="per-request model override, safe for parallel sessions")
+    send_parser.add_argument("--thinking-effort", choices=("standard", "extended"),
+                           help="per-request reasoning level if supported by the model")
     send_parser.add_argument(
         "--output", choices=("text", "json", "jsonl"), default="text"
     )
     new_parser = commands.add_parser("new", help="start a new conversation")
     new_parser.add_argument("prompt", nargs="*")
     new_parser.add_argument("--model", help="per-request model override, safe for parallel sessions")
+    new_parser.add_argument("--thinking-effort", choices=("standard", "extended"),
+                           help="per-request reasoning level if supported by the model")
     new_parser.add_argument(
         "--output", choices=("text", "json", "jsonl"), default="text"
     )
@@ -2388,6 +2454,7 @@ def main() -> int:
                 prompt,
                 args.output,
                 args.model,
+                args.thinking_effort,
             )
             if args.command == "new" and args.output == "text":
                 print(f"\n[conversation {result.get('conversation_id')}]", file=sys.stderr)

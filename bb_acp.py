@@ -52,15 +52,21 @@ def daemon_request(command: str) -> dict[str, Any]:
     return result
 
 
-def models() -> list[dict[str, str]]:
+def model_capabilities() -> list[dict[str, Any]]:
     try:
-        raw = daemon_request("models_catalog").get("models", [])
+        raw = daemon_request("model_capabilities").get("models", [])
     except (FileNotFoundError, ConnectionRefusedError):
         # The CLI normally starts its own daemon; BB can recover from a reboot.
         import subprocess
         subprocess.run([CLI, "status"], check=True, timeout=30,
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        raw = daemon_request("models_catalog").get("models", [])
+        raw = daemon_request("model_capabilities").get("models", [])
+    if not isinstance(raw, list):
+        raise RuntimeError("ChatGPT Web model capabilities not available")
+    return [row for row in raw if isinstance(row, dict)]
+
+
+def model_rows(raw: list[dict[str, Any]]) -> list[dict[str, str]]:
     if not isinstance(raw, list):
         raise RuntimeError("ChatGPT Web model catalog not available")
     parsed = []
@@ -80,6 +86,10 @@ def models() -> list[dict[str, str]]:
     if not parsed:
         raise RuntimeError("No models available in the connected ChatGPT account")
     return parsed
+
+
+def models() -> list[dict[str, str]]:
+    return model_rows(model_capabilities())
 
 
 def session_path(sid: str) -> Path:
@@ -120,6 +130,7 @@ class Server:
         self.processes: dict[str, asyncio.subprocess.Process] = {}
         self.running: dict[str, asyncio.Task] = {}
         self.model_cache: list[dict[str, str]] | None = None
+        self.model_capabilities_cache: dict[str, dict[str, Any]] = {}
         self.write_lock = asyncio.Lock()
 
     async def emit(self, obj: dict[str, Any]):
@@ -135,8 +146,53 @@ class Server:
                                                    "content": {"type": "text", "text": text}}}})
 
     def catalog(self):
-        self.model_cache = models()
+        details = model_capabilities()
+        self.model_capabilities_cache = {
+            item["slug"]: item for item in details
+            if isinstance(item.get("slug"), str)
+        }
+        # Keep the model names/slugs from the same single catalog snapshot.
+        self.model_cache = model_rows(details)
         return self.model_cache
+
+    def reasoning_options(self, model: str) -> list[dict[str, str]]:
+        details = self.model_capabilities_cache.get(model, {})
+        raw = details.get("efforts", [])
+        efforts = [
+            {"value": item["value"], "name": item.get("name") or item["value"]}
+            for item in raw if isinstance(item, dict)
+            and item.get("value") in ("medium", "high")
+        ]
+        if efforts:
+            return efforts
+        reasoning_type = details.get("reasoning_type")
+        if reasoning_type == "none":
+            return [{"value": "none", "name": "None"}]
+        if reasoning_type == "reasoning":
+            return [{"value": "fixed", "name": "Model-controlled"}]
+        return [{"value": "auto", "name": "Automatic"}]
+
+    def default_reasoning(self, model: str) -> str:
+        return self.reasoning_options(model)[0]["value"]
+
+    def setup_session_reasoning(self, session: dict[str, Any]):
+        choices = {x["value"] for x in self.reasoning_options(session["model"])}
+        if session.get("reasoning") not in choices:
+            session["reasoning"] = self.default_reasoning(session["model"])
+
+    def config_options(self, session: dict[str, Any]) -> list[dict[str, Any]]:
+        self.setup_session_reasoning(session)
+        return [{
+            "id": "model", "name": "Model", "category": "model",
+            "type": "select", "currentValue": session["model"],
+            "options": [{"value": r["modelId"], "name": r["name"]}
+                        for r in self.model_cache or self.catalog()],
+        }, {
+            "id": "thinking_effort", "name": "Reasoning",
+            "category": "thought_level", "type": "select",
+            "currentValue": session["reasoning"],
+            "options": self.reasoning_options(session["model"]),
+        }]
 
     def model_state(self, current: str):
         items = self.model_cache or self.catalog()
@@ -190,7 +246,14 @@ class Server:
                       "to have changed files, run tests, or deployed anything. "
                       "Offer guidance or code as text only.]\n\n" + prompt)
         args = [CLI, "send", session["conversation_id"]] if session.get("conversation_id") else [CLI, "new"]
-        args += ["--model", session["model"], "--output", "jsonl", prompt]
+        args += ["--model", session["model"]]
+        self.setup_session_reasoning(session)
+        details = self.model_capabilities_cache.get(session["model"], {})
+        effort = next((row["thinking_effort"] for row in details.get("efforts", [])
+                       if row.get("value") == session["reasoning"]), None)
+        if effort is not None:
+            args += ["--thinking-effort", effort]
+        args += ["--output", "jsonl", prompt]
         process = await asyncio.create_subprocess_exec(
             *args, stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -289,22 +352,40 @@ class Server:
                     session = load_session(sid)
                     self.sessions[sid] = session
                     self.catalog()
+                self.setup_session_reasoning(session)
                 if method == "session/load":
                     await self.replay(sid, session)
-                result = {"sessionId": sid, "models": self.model_state(session["model"])}
-            elif method == "session/set_model":
+                result = {"sessionId": sid, "models": self.model_state(session["model"]),
+                          "configOptions": self.config_options(session)}
+            elif method in ("session/set_model", "session/set_config_option"):
                 sid = params["sessionId"]
-                requested = params["modelId"]
                 if sid not in self.sessions:
                     self.sessions[sid] = load_session(sid)
+                session = self.sessions[sid]
                 self.catalog()
-                if requested not in [r["modelId"] for r in self.model_cache]:
-                    raise ValueError(f"Model {requested!r} is not available")
                 if sid in self.running:
-                    raise ValueError("Cannot change models while a prompt is in progress")
-                self.sessions[sid]["model"] = requested
-                save_session(self.sessions[sid])
-                result = {"models": self.model_state(requested)}
+                    raise ValueError("Cannot change model or reasoning while prompting")
+                config_id = ("model" if method == "session/set_model"
+                             else params.get("configId"))
+                value = (params.get("modelId") if method == "session/set_model"
+                         else params.get("value"))
+                if config_id == "model":
+                    if value not in [r["modelId"] for r in self.model_cache]:
+                        raise ValueError(f"Model {value!r} is not available")
+                    session["model"] = value
+                    self.setup_session_reasoning(session)
+                elif config_id == "thinking_effort":
+                    allowed = {item["value"] for item in self.reasoning_options(session["model"])}
+                    if value not in allowed:
+                        raise ValueError(
+                            f"Reasoning {value!r} is not supported by {session['model']}"
+                        )
+                    session["reasoning"] = value
+                else:
+                    raise ValueError(f"Unsupported config option: {config_id}")
+                save_session(session)
+                result = {"models": self.model_state(session["model"]),
+                          "configOptions": self.config_options(session)}
             elif method == "session/prompt":
                 sid = params["sessionId"]
                 if sid not in self.sessions:

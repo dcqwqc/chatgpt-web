@@ -553,6 +553,17 @@ stop older daemon instances or active requests.
 
 The BB integration lives in `bb_acp.py`. It exposes this authenticated ChatGPT Web CLI as the custom `acp-chatgpt-web` provider via Agent Client Protocol v1. The provider advertises the live account model catalog, excluding internal/reserved entries, and selects the model **per request** instead of mutating the user's global CLI model. It supports persistent ACP session IDs mapped to CLI Project conversations, model switching, JSONL streaming, cancellation, and history replay on session load. Existing BB custom provider definitions are preserved when registering this provider.
 
+BB reads the model config option and its **per-model** `thought_level`
+config option over ACP. Thinking models expose only the levels actually
+advertised by the account: `standard` → BB **Medium** and `extended` →
+BB **High**. These choices are persisted independently per BB thread and
+passed as `--thinking-effort` on each CLI send. Auto, Instant, Mini, and
+fixed-effort models do not falsely advertise Medium/High. BB's
+`session/set_config_option` changes model and reasoning, restoring the
+previous selection when a thread resumes. Extra High is not shown unless
+ChatGPT Web's model metadata actually reports support for an equivalent
+level. New models appear automatically when the account reports them.
+
 The agent is **text-only advisory**: it does not implement coding tool calls, filesystem access, shell execution, or BB workspace mutation. Never interpret its prose as evidence that repository changes were made. It uses the browser-authenticated ChatGPT Web service, not the OpenAI API or Codex quota; account/rate limits and account model access apply.
 
 The CLI requires an existing authenticated Chrome profile and its existing ChatGPT Project named `CLI`. The project lookup follows all sidebar pagination cursors and verifies the saved Project ID. If ChatGPT's signer changes or the Chrome session presents a human verification challenge, sending **fails closed**; the user must resolve interactive verification or use a supported alternative provider. This adapter does not bypass website verification.

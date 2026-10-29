@@ -63,6 +63,29 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(body["conversation_mode"], {"kind": "gizmo_interaction", "gizmo_id": PROJECT_ID})
         self.assertEqual(body["model"], "gpt-6-thinking")
 
+    def test_per_request_thinking_effort_is_not_global(self):
+        self.client._request_model = "gpt-6-thinking"
+        self.client._request_thinking_effort = "standard"
+        with patch.object(self.client, "target_project_id", return_value=PROJECT_ID):
+            body = self.client.create_conversation_body(None, "hello")
+        self.assertEqual(body["model"], "gpt-6-thinking")
+        self.assertEqual(body["thinking_effort"], "standard")
+
+    def test_model_capabilities_are_derived_from_account_catalog(self):
+        response = {"models": [
+            {"slug": "gpt-6", "title": "GPT-6", "reasoning_type": "auto",
+             "configurable_thinking_effort": False, "thinking_efforts": []},
+            {"slug": "gpt-6-thinking", "title": "GPT-6",
+             "reasoning_type": "reasoning", "configurable_thinking_effort": True,
+             "thinking_efforts": [
+                 {"thinking_effort": "standard"}, {"thinking_effort": "extended"}]},
+        ]}
+        self.client.request = Mock(return_value=Mock(json=lambda: response))
+        models = self.client.model_capabilities()
+        self.assertEqual(models[0]["efforts"], [])
+        self.assertEqual([x["value"] for x in models[1]["efforts"]],
+                         ["medium", "high"])
+
     def test_per_request_model_does_not_touch_global_preference(self):
         with patch.object(self.client, "target_project_id", return_value=PROJECT_ID), patch.object(
             self.app, "load_preferences", return_value={"model": "gpt-6-thinking"}
