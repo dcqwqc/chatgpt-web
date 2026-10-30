@@ -8,6 +8,8 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { composerExpression, inspectComposer:inspectEditor,
+  prepareComposer:prepareEditor } = require("./composer.js");
 
 const cdpBase = process.env.CHATGPT_WEB_CDP_URL || "http://127.0.0.1:9222";
 const timeoutMs = Number(process.env.CHATGPT_WEB_RECIPE_TIMEOUT_MS || "90000");
@@ -190,7 +192,7 @@ async function browserCDP() {
     close() { socket.close(); },
   };
 }
-async function createIsolatedPage() {
+async function createIsolatedPage(target) {
   // Never fall back silently to the user's persistent browser context.
   // A failed isolated setup should fail safely without editing any draft.
   browserConnection = await browserCDP();
@@ -205,7 +207,7 @@ async function createIsolatedPage() {
   await browserConnection.call("Storage.setCookies",
     {cookies, browserContextId:isolatedContextId});
   const created = await browserConnection.call("Target.createTarget", {
-    url:"https://chatgpt.com/", browserContextId:isolatedContextId,
+    url:target, browserContextId:isolatedContextId,
   });
   ownedTabId = created.targetId;
   if (!ownedTabId) throw new Error("Isolated ChatGPT target missing");
@@ -227,9 +229,12 @@ async function main() {
   // Ephemeral browser contexts remain experimental: cookies alone do not
   // consistently reproduce session storage and a real send can silently stall.
   const privateContext = process.env.CHATGPT_WEB_RECIPE_ISOLATED_CONTEXT === "1";
+  const target = input.conversation_id
+    ? `https://chatgpt.com/c/${encodeURIComponent(input.conversation_id)}`
+    : "https://chatgpt.com/";
   const page = privateContext
-    ? await createIsolatedPage()
-    : await getJson(`${cdpBase}/json/new?https://chatgpt.com/`, "PUT");
+    ? await createIsolatedPage(target)
+    : await getJson(`${cdpBase}/json/new?${encodeURI(target)}`, "PUT");
   if (!page.id && !page.webSocketDebuggerUrl) {
     throw new Error("Chrome could not allocate a ChatGPT page");
   }
@@ -296,14 +301,18 @@ async function main() {
 
   clearInjectedDraft = async () => {
     if (!promptInjected || socket.readyState !== WebSocket.OPEN) return;
-    const expected = JSON.stringify(input.prompt.trim());
-    const cleared = await call("Runtime.evaluate", {
-      expression: `(()=>{const e=document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea');if(!e||(e.innerText||e.textContent||'').trim()!==${expected})return false;e.focus();const s=window.getSelection();s.selectAllChildren(e);document.execCommand('delete');e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward'}));return !(e.innerText||e.textContent||'').trim()})()`,
-      returnByValue: true,
-    });
+    const cleared = await prepareComposer(input.prompt.trim());
     promptInjected = false;
-    if (cleared.result?.value) await delay(200);
+    if (cleared.ok) await delay(200);
   };
+
+  async function inspectComposer(expected, select = false) {
+    return inspectEditor(call, expected, select);
+  }
+
+  async function prepareComposer(expected) {
+    return prepareEditor(call, expected);
+  }
 
   const timer = watchdogTimer = setTimeout(() => {
     if (!closing) {
@@ -368,6 +377,13 @@ async function main() {
       requestId: message.params.requestId,
       errorReason: "Aborted",
     });
+    const body = JSON.parse(request.postData || "{}");
+    const parts = body.messages?.[0]?.content?.parts;
+    if (!Array.isArray(parts) || parts.length !== 1 || typeof parts[0] !== "string"
+        || parts[0].trim() !== input.prompt.trim()) {
+      submissionStarted = false; // The intercepted request was aborted above.
+      return fail("captured prompt did not match the intended message; request aborted");
+    }
     const headers = { ...request.headers };
     headers.cookie = cookies.cookies
       .map((cookie) => `${cookie.name}=${cookie.value}`)
@@ -399,39 +415,34 @@ async function main() {
           requestStage: "Request",
         }],
       });
-      const target = input.conversation_id
-        ? `https://chatgpt.com/c/${encodeURIComponent(input.conversation_id)}`
-        : "https://chatgpt.com/";
-      // Reuse the already-ready home composer instead of navigating the
-      // same document. A redundant reload can race Runtime.evaluate and
-      // strand the readiness probe in a destroyed execution context.
-      // Navigation still happens when the target conversation differs.
-      const current = await call("Runtime.evaluate", {
-        expression: "location.href",
-        returnByValue: true,
-      });
-      if (current.result.value !== target) {
-        await call("Page.navigate", { url: target });
-        await delay(700);
-      }
+      // Load the requested conversation once. Loading home first and then
+      // navigating raced both editor hydration and restored conversation drafts.
       const ready = await waitForValue(
-        `!!(document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea'))`,
+        composerExpression(),
         30000,
       );
       if (!ready) return fail("ChatGPT composer did not become ready");
       await delay(1800);
+      if (input.check === true) {
+        const snapshot = await inspectComposer();
+        if (!snapshot?.present) return fail("ChatGPT composer did not stay ready");
+        clearTimeout(timer);
+        watchdogTimer = null;
+        process.stdout.write(JSON.stringify({ok:true, composer_ready:true,
+          draft_present:!!snapshot.text}));
+        closing = true;
+        socket.close();
+        await closeOwnedTab();
+        return;
+      }
       // Chrome can restore a draft from an earlier helper even after that
       // helper cleared its owned DOM. A private hash ledger recognizes only
       // prompts this helper injected; unknown user drafts remain untouched.
       let focused;
       for (let attempt = 0; attempt < 5; attempt++) {
-        const inspected = await call("Runtime.evaluate", {
-          expression: `(()=>{const e=document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea');return e?{present:true,text:(e.innerText||e.textContent||'').trim()}:{present:false,text:''}})()`,
-          returnByValue: true,
-        });
-        const snapshot = inspected.result?.value;
+        const snapshot = await inspectComposer();
         if (!snapshot?.present) {
-          focused = {result:{value:{ok:false,reason:"editor missing"}}};
+          focused = {ok:false,reason:"editor missing"};
           if (attempt < 4) await delay(500);
           continue;
         }
@@ -440,23 +451,21 @@ async function main() {
           "[BB Agent Control — published Core Instructions]"
         );
         if (staleText && !bbDraft && !isOwnedDraft(staleText)) {
-          focused = {result:{value:{ok:false,reason:"unknown draft preserved"}}};
+          focused = {ok:false,reason:"unknown draft preserved"};
           break;
         }
-        const expected = JSON.stringify(staleText);
-        focused = await call("Runtime.evaluate", {
-          expression: `(()=>{const e=document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea');if(!e)return {ok:false,reason:'editor missing'};const text=(e.innerText||e.textContent||'').trim();if(text!==${expected})return {ok:false,reason:'editor changed'};e.focus();if(text){const selection=window.getSelection();selection.selectAllChildren(e);document.execCommand('delete');e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward'}))}return {ok:document.activeElement===e&&e.isContentEditable&&!(e.innerText||e.textContent||'').trim(),reason:'editor was not cleared'}})()`,
-          returnByValue: true,
-        });
-        if (focused.result?.value?.ok) break;
+        focused = await prepareComposer(staleText);
+        if (focused.ok) break;
         if (attempt < 4) await delay(500);
       }
-      if (!focused.result?.value?.ok) {
-        return fail(`ChatGPT editor preflight failed: ${focused.result?.value?.reason || "unknown"}`);
+      if (!focused?.ok) {
+        return fail(`ChatGPT editor preflight failed: ${focused?.reason || "unknown"}`);
       }
       await call("Input.insertText", { text: input.prompt });
       promptInjected = true;
       rememberOwnedDraft(input.prompt.trim());
+      const inserted = await inspectComposer(input.prompt.trim());
+      if (!inserted.ok) return fail(`ChatGPT editor input failed: ${inserted.reason}`);
       // The submit button may be outside [data-chatgpt-composer] and the old
       // data-testid no longer exists on newer ChatGPT frontends.
       for (let clickAttempt = 0; clickAttempt < 3; clickAttempt++) {
@@ -478,7 +487,7 @@ async function main() {
         }
         if (await waitForCapture(8000)) return;
         const state = await call("Runtime.evaluate", {
-          expression: `(()=>{const e=document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea');const stop=document.querySelector('button[data-testid="stop-button"]')||[...document.querySelectorAll('button')].find(b=>/stop generating/i.test(b.getAttribute('aria-label')||''));return {text:e?(e.innerText||e.textContent||'').trim():null,stop:!!stop}})()`,
+          expression: `(()=>{const editor=${composerExpression()};const stop=document.querySelector('button[data-testid="stop-button"]')||[...document.querySelectorAll('button')].find(b=>/stop generating/i.test(b.getAttribute('aria-label')||''));return {text:editor?.text??null,stop:!!stop}})()`,
           returnByValue: true,
         });
         if (finished) return;

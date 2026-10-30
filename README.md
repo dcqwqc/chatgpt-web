@@ -575,6 +575,41 @@ extension in `bb-plugin-provider-icons/` overrides native Codex and Codex
 Lina with the Codex mark, and ChatGPT Web CLI with the ChatGPT knot, using
 BB's supported providerIcon slot and local validated SVG assets.
 
+#### Repeated sends and editor health (2026-10-30)
+
+Recipe tabs open the requested conversation directly. Editor preparation skips
+hidden or detached nodes, clears recognized adapter drafts using native Chrome
+editing events, then queries and focuses the current editor again after rendering.
+ProseMirror paragraphs are read as input lines: `innerText` adds extra newlines
+between paragraphs and cannot reliably recognize a multiline prompt. Real empty
+lines and Unicode are preserved. The inserted draft and intercepted request are
+checked against the intended prompt before an HTTP submission is allowed.
+
+Transient editor failures retry in a fresh owned tab up to three times, only
+before submission. Unknown drafts are preserved. Existing conservative handling
+of ambiguous sends and duplicate prevention still applies.
+
+The watchdog additionally checks the authenticated website/composer, at most
+once every ten minutes while BB is idle. This probe opens and closes its own
+tab, inserts no text and sends no message. `composer_healthy`,
+`composer_checked_at` and `composer_error` in its private status file distinguish
+website readiness from a working browser debugging port. Website failures are
+reported without restarting authenticated Chrome or resetting account state.
+The transport watchdog retains its existing repeated-failure/cooldown checks.
+
+To run the editor tests, including actual native Chrome editing in a disposable
+blank tab on an already running debugger:
+
+```sh
+node --test tests/test_chrome_recipe.js
+CHATGPT_WEB_TEST_CDP_URL=http://127.0.0.1:9334 node --test tests/test_composer_cdp.js
+python3 -m unittest discover -s tests
+```
+
+The browser test replaces the editor during deletion, performs five additional
+multiline/Unicode turns, and checks that hidden editor content remains untouched.
+It does not require an account or submit messages.
+
 #### Login and send compatibility (2026-10-29)
 
 Philipedia's owner-controlled Chrome profile is displayed in Xpra :140.

@@ -1153,6 +1153,12 @@ class ChatGPTWebClient:
             "No frame for given id",
             "lost the Chrome debugger connection",
             "send click did not start a request",
+            "ChatGPT editor preflight failed: editor missing",
+            "ChatGPT editor preflight failed: editor changed",
+            "ChatGPT editor preflight failed: editor was not cleared",
+            "ChatGPT editor preflight failed: editor focus unavailable",
+            "ChatGPT editor input failed:",
+            "Chrome debugger Page.navigate timed out",
         )
         known_conversation_ids: set[str] | None = None
         if conversation_id is None:

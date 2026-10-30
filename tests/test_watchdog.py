@@ -26,6 +26,7 @@ class WatchdogPolicyTests(unittest.TestCase):
             patch.object(watchdog, "busy_image_jobs", return_value=False),
             patch.object(watchdog, "cmd"),
             patch.object(watchdog.time, "time", return_value=10000),
+            patch.object(watchdog, "composer_ready", return_value=(True, "")),
         ]
         self.mocks = [p.start() for p in self.patches]
         for p in self.patches:
@@ -96,6 +97,23 @@ class WatchdogPolicyTests(unittest.TestCase):
         self.state(browser_failures=1, daemon_failures=2)
         watchdog.run_once()
         self.mocks[6].assert_not_called()
+
+    def test_website_failure_is_visible_but_does_not_restart_services(self):
+        self.mocks[8].return_value = (False, "composer did not become ready")
+        result = watchdog.run_once()
+        self.assertTrue(result["browser_healthy"])
+        self.assertFalse(result["composer_healthy"])
+        self.assertIn("composer", result["composer_error"])
+        self.mocks[6].assert_not_called()
+
+    def test_website_probe_is_throttled_and_deferred_during_active_work(self):
+        self.state(composer_checked_at=9900)
+        watchdog.run_once()
+        self.mocks[8].assert_not_called()
+        self.state(composer_checked_at=0)
+        self.mocks[4].return_value = True
+        watchdog.run_once()
+        self.mocks[8].assert_not_called()
 
 
 if __name__ == "__main__":

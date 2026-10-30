@@ -196,6 +196,33 @@ class BackendTests(unittest.TestCase):
         run.assert_called_once()
         sleep.assert_not_called()
 
+    def test_recipe_editor_recovery_is_bounded_and_only_before_submission(self):
+        self.client.cdp_url = "http://127.0.0.1:9334"
+        reasons = ("editor missing", "editor changed", "editor was not cleared",
+                   "editor focus unavailable")
+        for reason in reasons:
+            with self.subTest(reason=reason):
+                detail = f"ChatGPT editor preflight failed: {reason}"
+                failed = Mock(returncode=1, stdout="", stderr="chatgpt-web recipe pre-submit: " + detail)
+                with patch.object(self.app.subprocess, "run", return_value=failed) as run, patch.object(self.app.time, "sleep"):
+                    with self.assertRaisesRegex(self.app.ChatGPTWebError, reason):
+                        self.client.capture_send_recipe("conversation", "hello")
+                self.assertEqual(run.call_count, 3)
+                failed.stderr = "chatgpt-web recipe: " + detail
+                with patch.object(self.app.subprocess, "run", return_value=failed) as run:
+                    with self.assertRaises(self.app.ChatGPTWebError):
+                        self.client.capture_send_recipe("conversation", "hello")
+                run.assert_called_once()
+
+    def test_recipe_preserves_unknown_drafts_without_repeating(self):
+        self.client.cdp_url = "http://127.0.0.1:9334"
+        failed = Mock(returncode=1, stdout="", stderr=(
+            "chatgpt-web recipe pre-submit: ChatGPT editor preflight failed: unknown draft preserved"))
+        with patch.object(self.app.subprocess, "run", return_value=failed) as run:
+            with self.assertRaisesRegex(self.app.ChatGPTWebError, "unknown draft preserved"):
+                self.client.capture_send_recipe("conversation", "hello")
+        run.assert_called_once()
+
     def test_recipe_does_not_retry_ambiguous_post_click_lifecycle_failure(self):
         self.client.cdp_url = "http://127.0.0.1:9334"
         failed = Mock(returncode=1, stdout="",

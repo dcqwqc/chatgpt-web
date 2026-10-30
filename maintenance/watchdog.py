@@ -26,6 +26,7 @@ BROWSER = "qwqc-image-browser-session.service"
 DAEMON = "chatgpt-web.service"
 COOLDOWN = 900
 FAILURE_THRESHOLD = 3
+COMPOSER_CHECK_INTERVAL = 600
 
 
 def cmd(*argv: str, timeout: int = 12) -> subprocess.CompletedProcess | None:
@@ -62,6 +63,34 @@ def daemon_ready() -> bool:
         return bool(json.loads(data.decode().splitlines()[0]).get("ok"))
     except (OSError, ValueError, IndexError, TimeoutError):
         return False
+
+
+def composer_ready() -> tuple[bool, str]:
+    """Check the authenticated website, without inserting or sending a prompt.
+
+    A working debugger port is not proof that the account/composer is usable.
+    A failed website check is diagnostic only; restarting cannot fix login or
+    a verification challenge and must never become a restart loop.
+    """
+    recipe = Path(__file__).resolve().parents[1] / "chrome-recipe.js"
+    environment = dict(os.environ)
+    environment["CHATGPT_WEB_CDP_URL"] = "http://127.0.0.1:9334"
+    environment["CHATGPT_WEB_RECIPE_TIMEOUT_MS"] = "30000"
+    try:
+        result = subprocess.run(
+            [environment.get("CHATGPT_WEB_NODE_BINARY", "/usr/bin/node"), str(recipe)],
+            input=json.dumps({"prompt":"health check", "check":True}),
+            text=True, capture_output=True, timeout=40, check=False, env=environment,
+        )
+        if result.returncode:
+            # The helper's error contains reasons only, never a draft or cookies.
+            return False, result.stderr.strip()[:400] or "composer check failed"
+        state = json.loads(result.stdout)
+        if not isinstance(state, dict) or state.get("composer_ready") is not True:
+            return False, "composer check returned no readiness confirmation"
+        return True, ""
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False, "composer check unavailable or timed out"
 
 
 def busy_threads() -> bool | None:
@@ -147,6 +176,15 @@ def run_once() -> dict:
     state["checked_at"] = now
     state["browser_healthy"] = browser
     state["daemon_healthy"] = daemon
+    if (browser and daemon
+            and now - state.get("composer_checked_at", 0) >= COMPOSER_CHECK_INTERVAL
+            and busy_threads() is False):
+        ready, detail = composer_ready()
+        state["composer_checked_at"] = now
+        state["composer_healthy"] = ready
+        state["composer_error"] = detail
+        if not ready:
+            print(f"BB ChatGPT Web: website/composer check failed: {detail}", flush=True)
     temporary = STATE.with_suffix(".tmp")
     temporary.write_text(json.dumps(state, indent=2) + "\n")
     os.chmod(temporary, 0o600)
