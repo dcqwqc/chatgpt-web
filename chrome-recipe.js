@@ -207,14 +207,23 @@ async function main() {
         returnByValue: true,
       });
       if (!ready.result.value) return fail("ChatGPT composer did not become ready");
+      await new Promise((resolve) => setTimeout(resolve, 1800));
       // A crashed prior BB attempt can leave its injected instruction envelope
       // in the new-chat draft, and Chrome restores that draft in fresh tabs.
       // Clear ONLY this owned tab, ONLY for an identifiable BB envelope.
       // Never erase an unrelated draft or the owner's existing browser tab.
-      const focused = await call("Runtime.evaluate", {
-        expression: `(()=>{const e=document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea');if(!e)return {ok:false,reason:'editor missing'};const text=e.innerText.trim();if(text&&!text.startsWith('[BB Agent Control — published Core Instructions]'))return {ok:false,reason:'non-BB draft preserved'};e.focus();if(text){const selection=window.getSelection();selection.selectAllChildren(e);document.execCommand('delete')}return {ok:document.activeElement===e&&e.isContentEditable&&!e.innerText.trim(),reason:'editor was not cleared'}})()`,
-        returnByValue: true,
-      });
+      let focused;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        focused = await call("Runtime.evaluate", {
+          expression: `(()=>{const e=document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea');if(!e)return {ok:false,reason:'editor missing'};const text=e.innerText.trim();if(text&&!text.startsWith('[BB Agent Control — published Core Instructions]'))return {ok:false,reason:'non-BB draft preserved'};e.focus();if(text){const selection=window.getSelection();selection.selectAllChildren(e);document.execCommand('delete')}return {ok:document.activeElement===e&&e.isContentEditable&&!e.innerText.trim(),reason:'editor was not cleared'}})()`,
+          returnByValue: true,
+        });
+        if (focused.result?.value?.ok ||
+            focused.result?.value?.reason !== "non-BB draft preserved") break;
+        if (attempt < 2) {
+          await new Promise((resolve) => setTimeout(resolve, 1100));
+        }
+      }
       if (!focused.result?.value?.ok) {
         return fail(`ChatGPT editor preflight failed: ${focused.result?.value?.reason || "unknown"}`);
       }

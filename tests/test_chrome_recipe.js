@@ -8,7 +8,7 @@ const path = require("node:path");
 
 const code = readFileSync(path.join(__dirname, "..", "chrome-recipe.js"), "utf8");
 function expression(variable) {
-  const start = code.indexOf(`const ${variable} = await call("Runtime.evaluate", {`);
+  const start = code.indexOf(`${variable} = await call("Runtime.evaluate", {`);
   assert.notEqual(start, -1, `missing CDP expression: ${variable}`);
   const match = /expression: `([^`]+)`/.exec(code.slice(start));
   assert.ok(match, `missing JS expression: ${variable}`);
