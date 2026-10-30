@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """BB ACP v1 adapter for the authenticated, user-local ChatGPT Web CLI.
 
-The web CLI is a conversational model, not a coding agent: do not claim
-filesystem, tool, or shell access. Each ACP session maps to one CLI Project
-conversation and has its own model selection.
+Each ACP session maps to one CLI Project conversation and has its own model
+selection. Execution uses the ChatGPT account's connected tools; this adapter
+does not implement a separate ACP shell or translate prose into tool calls.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ import uuid
 from typing import Any
 
 from cooldown import retry_after_seconds
+from web_content import render_web_elements
 
 ROOT = Path.home() / ".local/state/chatgpt-web/bb-acp"
 SOCKET = Path(os.environ.get("CHATGPT_WEB_ACP_SOCKET",
@@ -233,7 +235,7 @@ def load_session(sid: str) -> dict[str, Any]:
 def remove_bb_system_envelope(text: str) -> str:
     """BB passes host/plugin tool instructions inside a tagged text envelope.
 
-    The Web CLI is text-only and has no BB tool runtime. Forwarding this
+    The Web CLI has no native BB ACP tool runtime. Forwarding this
     enormous agent-only envelope as the user's message is misleading, can
     exceed browser composer limits, and can cause send failures. Preserve
     every byte after a properly delimited envelope (the actual user input).
@@ -271,6 +273,52 @@ def load_bb_core_policy() -> str:
         raise RuntimeError("Unable to load BB Core Instructions") from exc
 
 
+def adapter_policy(session: dict[str, Any]) -> tuple[str, str]:
+    """Describe the actual execution boundary, including on legacy chats.
+
+    Native ChatGPT connectors and BB ACP tools are different capabilities.
+    Do not disable the former just because this adapter lacks the latter.
+    Fingerprint the published policy and workspace so a successful next turn
+    corrects old advice without creating a replacement conversation.
+    """
+    context = json.dumps({"host": socket.gethostname(), "cwd": session.get("cwd")},
+                         ensure_ascii=False)
+    notice = """[BB ChatGPT Web adapter — capability and execution contract v2]
+This contract replaces any earlier adapter notice saying this connection is
+text-only advisory or has no filesystem, shell or tool access.
+You are the user's ChatGPT conversation in BB. Use the tools actually available
+in this ChatGPT session, including connected MCP apps and web search. This
+adapter does not provide native BB ACP tools; that does not remove the account's
+connected tools. Discover their real schemas and try the supported route before
+claiming a capability is absent. A listed tool is not proof its service is healthy.
+For QWQC MCP, when available, use search_tools/find_mcp_tools with short keywords,
+then describe_tool/get_mcp_tool_schema and execute_tool. Discover the Philipedia
+terminal bridge for filesystem, Git and shell work on the BB host. Prefer
+structured file/Git tools. Inspect the host and applicable AGENTS.md before edits.
+An offline Mirai connector does not establish that Philipedia is unavailable.
+An error in one connector blocks only that route: try another already authorized
+connected route, and continue independent work. Never bypass access restrictions,
+invent a tool, or claim an action happened without its result.
+When the user asks for an action, carry out the authorized work and verify it.
+Do not replace execution with a proposed configuration or stop at the first
+recoverable error. For a real blocker, state the exact failed route, completed
+work, remaining work and smallest required next action. Do not infer missing
+credentials from a single process environment; use the credential catalog when
+available, keeping secret values out of chat, logs and source files.
+BB runtime context (not proof of remote connector reachability):
+""" + context + """
+Write clear, concise Markdown for the BB transcript. Do not emit ChatGPT-only
+XML/JSX UI tags such as <box>, <row>, <Cite>, or internal citation reference IDs.
+Use ordinary Markdown links to sources you actually consulted. Keep code samples
+as code. Distinguish implemented, tested and deployed outcomes.
+[End BB ChatGPT Web adapter contract]
+"""
+    policy = ("[BB Agent Control — published Core Instructions]\n"
+              + load_bb_core_policy().rstrip() + "\n"
+              + "[End published Core Instructions]\n\n" + notice)
+    return policy, hashlib.sha256(policy.encode("utf-8")).hexdigest()
+
+
 class Server:
     def __init__(self):
         self.sessions: dict[str, dict[str, Any]] = {}
@@ -287,6 +335,7 @@ class Server:
 
     async def update(self, sid: str, text: str):
         if text:
+            text = render_web_elements(text)
             await self.emit({"jsonrpc": "2.0", "method": "session/update",
                              "params": {"sessionId": sid,
                                         "update": {"sessionUpdate": "agent_message_chunk",
@@ -461,15 +510,10 @@ class Server:
             await self.emit({"jsonrpc": "2.0", "id": request_id,
                              "result": {"stopReason": "end_turn"}})
             return
-        if not session.get("conversation_id"):
-            core_policy = load_bb_core_policy()
-            prompt = ("[BB Agent Control — published Core Instructions]\n"
-                      + core_policy.rstrip() + "\n"
-                      + "[End published Core Instructions]\n\n"
-                      + "[Adapter capability notice: this ChatGPT Web connection has no "
-                      "filesystem, shell, code-execution or BB tool access. Never claim "
-                      "to have changed files, run tests, or deployed anything. "
-                      "Offer guidance or code as text only.]\n\n" + prompt)
+        policy, policy_hash = adapter_policy(session)
+        if (not session.get("conversation_id")
+                or session.get("adapter_policy_hash") != policy_hash):
+            prompt = policy + "\n\n" + prompt
         args = [CLI, "send", session["conversation_id"]] if session.get("conversation_id") else [CLI, "new"]
         self.normalize_session(session)
         slug = self.variants[session["model"]][session["mode"]]
@@ -559,7 +603,8 @@ class Server:
                 raise RuntimeError("ChatGPT Web replied without a conversation ID")
             if new_conversation_id:
                 session["conversation_id"] = new_conversation_id
-                save_session(session)
+            session["adapter_policy_hash"] = policy_hash
+            save_session(session)
             if final and final.startswith(rendered):
                 await self.update(sid, final[len(rendered):])
             elif final and final != rendered and not rendered:
@@ -606,6 +651,7 @@ class Server:
                     ids = [m["modelId"] for m in catalog]
                     default = "gpt-6" if "gpt-6" in ids else ids[0]
                     session = {"sessionId": sid, "conversation_id": None,
+                               "cwd": params.get("cwd"),
                                "model": default, "mode": "thinking"}
                     self.sessions[sid] = session
                     save_session(session)
@@ -614,6 +660,8 @@ class Server:
                     session = load_session(sid)
                     self.sessions[sid] = session
                     self.catalog()
+                if isinstance(params.get("cwd"), str):
+                    session["cwd"] = params["cwd"]
                 self.normalize_session(session)
                 save_session(session)
                 if method == "session/load":

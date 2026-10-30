@@ -628,8 +628,8 @@ sentinel signature can change; the CLI then uses the authenticated
 browser's own send recipe and verifies the saved conversation.
 BB supplies its plugin tools as a large `<system_instructions>...`
 envelope inside ACP prompt text. The adapter deliberately removes that
-BB-only wrapper; the text-only ChatGPT Web account has no BB tools,
-so forwarding those instructions caused long composer input and errors.
+BB-only wrapper; this adapter does not execute native BB ACP tools,
+so forwarding those tool definitions caused long composer input and errors.
 All actual user text after the closing tag is preserved.
 
 Verified by a real CLI conversation (QW8-OK), a BB round-trip (BB9-OK),
@@ -638,7 +638,23 @@ If a failed BB turn cannot be recovered by `bb thread retry`, send the
 user's prompt again through the **same** thread: BB's retry may submit
 "Please continue" rather than the original text.
 
-The agent is **text-only advisory**: it does not implement coding tool calls, filesystem access, shell execution, or BB workspace mutation. Never interpret its prose as evidence that repository changes were made. It uses the browser-authenticated ChatGPT Web service, not the OpenAI API or Codex quota; account/rate limits and account model access apply.
+Execution uses the **ChatGPT account's connected tools**. The adapter does not
+implement native BB ACP tool calls, but ChatGPT can discover and use its actual
+MCP connectors for filesystem, shell, Git and other authorized work. Connector
+availability and permissions must be verified at runtime; prose alone is never
+evidence that a change happened. It uses the browser-authenticated ChatGPT Web
+service, not the OpenAI API or Codex quota; account/rate limits and account
+model access apply.
+
+The published BB Core Instructions and an accurate capability contract are
+sent on the first turn and refreshed after policy or workspace changes. Existing
+conversations receive the correction on their next successful turn without
+losing history or model settings. Failed sends do not mark the policy delivered.
+The runtime host and ACP working directory are included so an offline laptop
+connector is not mistaken for loss of the execution host. ChatGPT-only rich
+markup is converted to a readable Markdown fallback in BB; literal code is
+preserved. This does not add new tool permissions or make native BB plugins
+automatically available to the ChatGPT account.
 
 The CLI requires an existing authenticated Chrome profile and its existing ChatGPT Project named `CLI`. The project lookup follows all sidebar pagination cursors and verifies the saved Project ID. If ChatGPT's signer changes or the Chrome session presents a human verification challenge, sending **fails closed**; the user must resolve interactive verification or use a supported alternative provider. This adapter does not bypass website verification.
 
