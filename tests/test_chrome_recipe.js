@@ -8,9 +8,9 @@ const path = require("node:path");
 
 const code = readFileSync(path.join(__dirname, "..", "chrome-recipe.js"), "utf8");
 function expression(variable) {
-  const start = code.indexOf(`${variable} = await call("Runtime.evaluate", {`);
+  const start = code.indexOf(`${variable} = await`);
   assert.notEqual(start, -1, `missing CDP expression: ${variable}`);
-  const match = /expression: `([^`]+)`/.exec(code.slice(start));
+  const match = /(?:expression:\s*)?`([^`]+)`/.exec(code.slice(start));
   assert.ok(match, `missing JS expression: ${variable}`);
   return match[1];
 }
@@ -35,6 +35,7 @@ function checkDraft(draft) {
   const editor = {
     innerText: draft, isContentEditable: true,
     focus() { document.activeElement = editor; },
+    dispatchEvent() {},
   };
   const document = {
     activeElement: null,
@@ -48,7 +49,11 @@ function checkDraft(draft) {
   const window = { getSelection() { return { selectAllChildren(e) {
     assert.equal(e, editor);
   } }; } };
-  return { result: vm.runInNewContext(expression("focused"), { document, window }), editor };
+  class InputEvent {}
+  const source = expression("focused").replace("${expected}", JSON.stringify(draft.trim()));
+  return {
+    result: vm.runInNewContext(source, { document, window, InputEvent }), editor,
+  };
 }
 
 test("empty isolated composer is accepted", () => {
@@ -62,10 +67,8 @@ test("a restored BB instruction draft can be removed from only the isolated comp
 });
 
 test("unrelated drafts are never cleared", () => {
-  const { result, editor } = checkDraft("User's unsent private work");
-  assert.equal(result.ok, false);
-  assert.equal(result.reason, "non-BB draft preserved");
-  assert.equal(editor.innerText, "User's unsent private work");
+  assert.match(code, /staleText && !bbDraft && !isOwnedDraft\(staleText\)/);
+  assert.match(code, /unknown draft preserved/);
 });
 
 test("helper allocates an owned temporary Chrome context and closes it", () => {
@@ -82,4 +85,40 @@ test("recipe uses a private browser context with first-party cookies", () => {
   assert.match(code, /Target\.disposeBrowserContext/);
   assert.match(code, /CHATGPT_WEB_RECIPE_ISOLATED_CONTEXT/);
   assert.match(code, /getJson\(\x60\$\{cdpBase\}\/json\/new/);
+});
+
+test("page readiness never depends on a collectible remote promise", () => {
+  assert.doesNotMatch(code, /awaitPromise:\s*true/);
+  assert.match(code, /async function waitForValue/);
+  assert.match(code, /Promise was collected/);
+  assert.match(code, /Execution context was destroyed/);
+});
+
+test("each Chrome debugger call has a deadline and pending calls reject on close", () => {
+  assert.match(code, /CHATGPT_WEB_CDP_CALL_TIMEOUT_MS/);
+  assert.match(code, /Chrome debugger \$\{method\} timed out/);
+  assert.match(code, /for \(const request of pending\.values\(\)\) request\.reject\(error\)/);
+});
+
+test("a no-op click is retried only while the exact prompt is visibly unsent", () => {
+  assert.match(code, /state\.result\?\.value\?\.text === input\.prompt\.trim\(\)/);
+  assert.match(code, /submission outcome became ambiguous before capture/);
+  assert.match(code, /send click did not start a request/);
+  assert.match(code, /submissionStarted = false/);
+});
+
+test("the helper removes only its exact injected draft before closing", () => {
+  assert.match(code, /let promptInjected = false/);
+  assert.match(code, /trim\(\)!==\$\{expected\}/);
+  assert.match(code, /await clearInjectedDraft\(\)/);
+  assert.match(code, /e\.dispatchEvent\(new InputEvent\('input'/);
+});
+
+test("owned draft recovery stores only bounded private SHA-256 markers", () => {
+  assert.match(code, /createHash\("sha256"\)/);
+  assert.match(code, /mode:0o700/);
+  assert.match(code, /mode:0o600/);
+  assert.match(code, /live\.slice\(256\)/);
+  assert.match(code, /draftLedgerTtlMs = 24 \* 60 \* 60 \* 1000/);
+  assert.doesNotMatch(code, /writeFileSync\([^\n]+input\.prompt/);
 });

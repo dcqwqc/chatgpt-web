@@ -4,9 +4,74 @@
 // transmission, and pass the request recipe to a local caller over stdout.
 
 const http = require("http");
+const crypto = require("crypto");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 
 const cdpBase = process.env.CHATGPT_WEB_CDP_URL || "http://127.0.0.1:9222";
 const timeoutMs = Number(process.env.CHATGPT_WEB_RECIPE_TIMEOUT_MS || "90000");
+const callTimeoutMs = Number(process.env.CHATGPT_WEB_CDP_CALL_TIMEOUT_MS || "10000");
+
+const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const stateRoot = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state");
+const draftLedgerDir = path.join(stateRoot, "chatgpt-web", "recipe-drafts");
+const draftLedgerTtlMs = 24 * 60 * 60 * 1000;
+
+function draftHash(text) {
+  return crypto.createHash("sha256").update(text, "utf8").digest("hex");
+}
+function pruneDraftLedger() {
+  let entries;
+  try { entries = fs.readdirSync(draftLedgerDir); }
+  catch (_error) { return; }
+  const live = [];
+  const now = Date.now();
+  for (const name of entries) {
+    if (!/^[a-f0-9]{64}$/.test(name)) continue;
+    const file = path.join(draftLedgerDir, name);
+    try {
+      const modified = fs.statSync(file).mtimeMs;
+      if (now - modified > draftLedgerTtlMs) fs.unlinkSync(file);
+      else live.push({file, modified});
+    } catch (_error) { /* A concurrent helper may have pruned it. */ }
+  }
+  live.sort((left, right) => right.modified - left.modified);
+  for (const entry of live.slice(256)) {
+    try { fs.unlinkSync(entry.file); }
+    catch (_error) { /* A concurrent helper may have pruned it. */ }
+  }
+}
+function rememberOwnedDraft(text) {
+  fs.mkdirSync(draftLedgerDir, {recursive:true, mode:0o700});
+  fs.chmodSync(draftLedgerDir, 0o700);
+  const file = path.join(draftLedgerDir, draftHash(text));
+  fs.writeFileSync(file, `${Date.now()}\n`, {encoding:"utf8", mode:0o600});
+  fs.chmodSync(file, 0o600);
+  pruneDraftLedger();
+}
+function isOwnedDraft(text) {
+  const file = path.join(draftLedgerDir, draftHash(text));
+  try {
+    const fresh = Date.now() - fs.statSync(file).mtimeMs <= draftLedgerTtlMs;
+    if (!fresh) fs.unlinkSync(file);
+    return fresh;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function isTransientLifecycleError(error) {
+  const message = String(error?.message || error);
+  return [
+    "Promise was collected",
+    "Execution context was destroyed",
+    "Cannot find context with specified id",
+    "Cannot find default execution context",
+    "Inspected target navigated or closed",
+    "No frame for given id",
+  ].some((fragment) => message.includes(fragment));
+}
 
 // Every recipe owns an isolated tab. Never type into the owner's existing
 // ChatGPT window (also shared with the image workflow), or strand a draft
@@ -17,6 +82,9 @@ let browserConnection = null;
 let activeSocket = null;
 let watchdogTimer = null;
 let closing = false;
+let submissionStarted = false;
+let promptInjected = false;
+let clearInjectedDraft = null;
 async function closeOwnedTab() {
   if (isolatedContextId && browserConnection) {
     const id = isolatedContextId;
@@ -38,8 +106,13 @@ async function fail(message) {
   if (closing) return;
   closing = true;
   if (watchdogTimer) clearTimeout(watchdogTimer);
+  if (promptInjected && clearInjectedDraft) {
+    try { await clearInjectedDraft(); }
+    catch (_error) { /* The owned page may already be gone. */ }
+  }
   if (activeSocket) activeSocket.close();
-  process.stderr.write(`chatgpt-web recipe: ${message}\n`);
+  const phase = submissionStarted ? "" : " pre-submit";
+  process.stderr.write(`chatgpt-web recipe${phase}: ${message}\n`);
   await closeOwnedTab();
   process.exitCode = 1;
 }
@@ -103,7 +176,14 @@ async function browserCDP() {
     call(method, params = {}) {
       return new Promise((resolve, reject) => {
         const id = ++sequence;
-        pending.set(id, {resolve, reject});
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error(`Chrome debugger ${method} timed out`));
+        }, callTimeoutMs);
+        pending.set(id, {
+          resolve(value) { clearTimeout(timer); resolve(value); },
+          reject(error) { clearTimeout(timer); reject(error); },
+        });
         socket.send(JSON.stringify({id, method, params}));
       });
     },
@@ -168,10 +248,62 @@ async function main() {
   function call(method, params = {}) {
     return new Promise((resolve, reject) => {
       const id = ++sequence;
-      pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`Chrome debugger ${method} timed out`));
+      }, callTimeoutMs);
+      pending.set(id, {
+        resolve(value) { clearTimeout(timer); resolve(value); },
+        reject(error) { clearTimeout(timer); reject(error); },
+      });
       socket.send(JSON.stringify({ id, method, params }));
     });
   }
+
+  // Never ask Chrome to retain a long-lived remote Promise. ChatGPT replaces
+  // execution contexts while hydrating and navigating, and V8 may collect a
+  // pending Runtime.evaluate promise. Short host-side polls survive that page
+  // lifecycle churn and make "Promise was collected" a recoverable event.
+  async function waitForValue(expression, budgetMs) {
+    const deadline = Date.now() + budgetMs;
+    let lastLifecycleError = null;
+    while (Date.now() < deadline && !closing && !finished) {
+      try {
+        const evaluated = await call("Runtime.evaluate", {
+          expression,
+          returnByValue: true,
+        });
+        if (evaluated.exceptionDetails) {
+          throw new Error(evaluated.exceptionDetails.text || "page evaluation failed");
+        }
+        lastLifecycleError = null;
+        if (evaluated.result?.value) return evaluated.result.value;
+      } catch (error) {
+        if (!isTransientLifecycleError(error)) throw error;
+        lastLifecycleError = error;
+      }
+      await delay(100);
+    }
+    if (lastLifecycleError) throw lastLifecycleError;
+    return null;
+  }
+
+  async function waitForCapture(budgetMs) {
+    const deadline = Date.now() + budgetMs;
+    while (Date.now() < deadline && !closing && !finished) await delay(100);
+    return finished;
+  }
+
+  clearInjectedDraft = async () => {
+    if (!promptInjected || socket.readyState !== WebSocket.OPEN) return;
+    const expected = JSON.stringify(input.prompt.trim());
+    const cleared = await call("Runtime.evaluate", {
+      expression: `(()=>{const e=document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea');if(!e||(e.innerText||e.textContent||'').trim()!==${expected})return false;e.focus();const s=window.getSelection();s.selectAllChildren(e);document.execCommand('delete');e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward'}));return !(e.innerText||e.textContent||'').trim()})()`,
+      returnByValue: true,
+    });
+    promptInjected = false;
+    if (cleared.result?.value) await delay(200);
+  };
 
   const timer = watchdogTimer = setTimeout(() => {
     if (!closing) {
@@ -240,9 +372,10 @@ async function main() {
     headers.cookie = cookies.cookies
       .map((cookie) => `${cookie.name}=${cookie.value}`)
       .join("; ");
+    await clearInjectedDraft();
     // Network.loadingFinished and Fetch.requestPaused can arrive in adjacent
     // tasks. Give the response-body callback a brief chance to complete.
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await delay(300);
     clearTimeout(timer);
     watchdogTimer = null;
     process.stdout.write(JSON.stringify({
@@ -252,6 +385,7 @@ async function main() {
       postData: request.postData || "",
       sentinel: sentinelResponses,
     }));
+    closing = true;
     socket.close();
     await closeOwnedTab();
   }
@@ -278,46 +412,96 @@ async function main() {
       });
       if (current.result.value !== target) {
         await call("Page.navigate", { url: target });
-        await new Promise((resolve) => setTimeout(resolve, 700));
+        await delay(700);
       }
-      const ready = await call("Runtime.evaluate", {
-        expression: `(async()=>{for(let i=0;i<300;i++){const e=document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea');if(e)return true;await new Promise(r=>setTimeout(r,100));}return false})()`,
-        awaitPromise: true,
-        returnByValue: true,
-      });
-      if (!ready.result.value) return fail("ChatGPT composer did not become ready");
-      await new Promise((resolve) => setTimeout(resolve, 1800));
-      // A crashed prior BB attempt can leave its injected instruction envelope
-      // in the new-chat draft, and Chrome restores that draft in fresh tabs.
-      // Clear ONLY this owned tab, ONLY for an identifiable BB envelope.
-      // Never erase an unrelated draft or the owner's existing browser tab.
+      const ready = await waitForValue(
+        `!!(document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea'))`,
+        30000,
+      );
+      if (!ready) return fail("ChatGPT composer did not become ready");
+      await delay(1800);
+      // Chrome can restore a draft from an earlier helper even after that
+      // helper cleared its owned DOM. A private hash ledger recognizes only
+      // prompts this helper injected; unknown user drafts remain untouched.
       let focused;
-      for (let attempt = 0; attempt < 3; attempt++) {
-        focused = await call("Runtime.evaluate", {
-          expression: `(()=>{const e=document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea');if(!e)return {ok:false,reason:'editor missing'};const text=e.innerText.trim();if(text&&!text.startsWith('[BB Agent Control — published Core Instructions]'))return {ok:false,reason:'non-BB draft preserved'};e.focus();if(text){const selection=window.getSelection();selection.selectAllChildren(e);document.execCommand('delete')}return {ok:document.activeElement===e&&e.isContentEditable&&!e.innerText.trim(),reason:'editor was not cleared'}})()`,
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const inspected = await call("Runtime.evaluate", {
+          expression: `(()=>{const e=document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea');return e?{present:true,text:(e.innerText||e.textContent||'').trim()}:{present:false,text:''}})()`,
           returnByValue: true,
         });
-        if (focused.result?.value?.ok ||
-            focused.result?.value?.reason !== "non-BB draft preserved") break;
-        if (attempt < 2) {
-          await new Promise((resolve) => setTimeout(resolve, 1100));
+        const snapshot = inspected.result?.value;
+        if (!snapshot?.present) {
+          focused = {result:{value:{ok:false,reason:"editor missing"}}};
+          if (attempt < 4) await delay(500);
+          continue;
         }
+        const staleText = snapshot.text || "";
+        const bbDraft = staleText.startsWith(
+          "[BB Agent Control — published Core Instructions]"
+        );
+        if (staleText && !bbDraft && !isOwnedDraft(staleText)) {
+          focused = {result:{value:{ok:false,reason:"unknown draft preserved"}}};
+          break;
+        }
+        const expected = JSON.stringify(staleText);
+        focused = await call("Runtime.evaluate", {
+          expression: `(()=>{const e=document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea');if(!e)return {ok:false,reason:'editor missing'};const text=(e.innerText||e.textContent||'').trim();if(text!==${expected})return {ok:false,reason:'editor changed'};e.focus();if(text){const selection=window.getSelection();selection.selectAllChildren(e);document.execCommand('delete');e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward'}))}return {ok:document.activeElement===e&&e.isContentEditable&&!(e.innerText||e.textContent||'').trim(),reason:'editor was not cleared'}})()`,
+          returnByValue: true,
+        });
+        if (focused.result?.value?.ok) break;
+        if (attempt < 4) await delay(500);
       }
       if (!focused.result?.value?.ok) {
         return fail(`ChatGPT editor preflight failed: ${focused.result?.value?.reason || "unknown"}`);
       }
       await call("Input.insertText", { text: input.prompt });
-      const submitted = await call("Runtime.evaluate", {
-        // The submit button may be outside [data-chatgpt-composer] and the
-        // old data-testid no longer exists on newer ChatGPT frontends.
-        expression: `(async()=>{for(let i=0;i<100;i++){const b=document.querySelector('button[type="submit"][aria-label="Send"]')||document.querySelector('button[data-testid="send-button"]')||[...document.querySelectorAll('button[type="submit"]')].find(b=>/^send( message)?$/i.test(b.getAttribute('aria-label')||''));if(b&&!b.disabled){b.click();return true;}await new Promise(r=>setTimeout(r,100));}return false})()`,
-        awaitPromise: true,
-        returnByValue: true,
-      });
-      if (!submitted.result.value) return fail("ChatGPT send button was unavailable");
+      promptInjected = true;
+      rememberOwnedDraft(input.prompt.trim());
+      // The submit button may be outside [data-chatgpt-composer] and the old
+      // data-testid no longer exists on newer ChatGPT frontends.
+      for (let clickAttempt = 0; clickAttempt < 3; clickAttempt++) {
+        const sendReady = await waitForValue(
+          `(()=>{const b=document.querySelector('button[type="submit"][aria-label="Send"]')||document.querySelector('button[data-testid="send-button"]')||[...document.querySelectorAll('button[type="submit"]')].find(b=>/^send( message)?$/i.test(b.getAttribute('aria-label')||''));return !!b&&!b.disabled})()`,
+          10000,
+        );
+        if (!sendReady) return fail("ChatGPT send button was unavailable");
+        // From this point, errors are ambiguous until the DOM proves that the
+        // exact unsent prompt is still in the composer and no response started.
+        submissionStarted = true;
+        const submitted = await call("Runtime.evaluate", {
+          expression: `(()=>{const b=document.querySelector('button[type="submit"][aria-label="Send"]')||document.querySelector('button[data-testid="send-button"]')||[...document.querySelectorAll('button[type="submit"]')].find(b=>/^send( message)?$/i.test(b.getAttribute('aria-label')||''));if(!b||b.disabled)return false;b.click();return true})()`,
+          returnByValue: true,
+        });
+        if (!submitted.result?.value) {
+          submissionStarted = false;
+          continue;
+        }
+        if (await waitForCapture(8000)) return;
+        const state = await call("Runtime.evaluate", {
+          expression: `(()=>{const e=document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea');const stop=document.querySelector('button[data-testid="stop-button"]')||[...document.querySelectorAll('button')].find(b=>/stop generating/i.test(b.getAttribute('aria-label')||''));return {text:e?(e.innerText||e.textContent||'').trim():null,stop:!!stop}})()`,
+          returnByValue: true,
+        });
+        if (finished) return;
+        const unchanged = state.result?.value?.text === input.prompt.trim();
+        if (!unchanged || state.result?.value?.stop) {
+          return fail("submission outcome became ambiguous before capture");
+        }
+        // The click was a frontend no-op: the exact draft remains and no
+        // request or response exists. This is the only safe click retry case.
+        submissionStarted = false;
+        if (clickAttempt === 2) {
+          return fail("send click did not start a request");
+        }
+      }
     } catch (error) {
       fail(error.message);
     }
+  });
+  socket.addEventListener("close", () => {
+    const error = new Error("lost the Chrome debugger connection");
+    for (const request of pending.values()) request.reject(error);
+    pending.clear();
+    if (!finished && !closing) fail(error.message);
   });
   socket.addEventListener("error", () => { if (!finished) fail("lost the Chrome debugger connection"); });
 }

@@ -15,6 +15,7 @@ PROJECT_ID = "g-p-" + "a" * 32
 def load_application():
     m = types.ModuleType("app_under_test")
     source = Path(__file__).resolve().parents[1] / "chatgpt-web"
+    m.__file__ = str(source)
     SourceFileLoader("app_under_test", str(source)).exec_module(m)
     return m
 
@@ -52,6 +53,7 @@ class BackendTests(unittest.TestCase):
     def setUp(self):
         self.app = load_application()
         self.client = object.__new__(self.app.ChatGPTWebClient)
+        self.client.list_conversations = Mock(return_value=[])
 
     def test_send_body_has_project_and_selected_model(self):
         with patch.object(self.client, "target_project_id", return_value=PROJECT_ID), patch.object(
@@ -158,6 +160,105 @@ class BackendTests(unittest.TestCase):
         with patch.dict(os.environ, {"CHATGPT_WEB_SEND_MODE": "chrome"}):
             with self.assertRaisesRegex(self.app.ChatGPTWebError, "cannot guarantee"):
                 self.client.send_prompt(None, "hello")
+
+    def test_recipe_retries_page_lifecycle_failure_in_a_fresh_owned_tab(self):
+        self.client.cdp_url = "http://127.0.0.1:9334"
+        failed = Mock(returncode=1, stdout="",
+                      stderr="chatgpt-web recipe pre-submit: Promise was collected")
+        recipe = {
+            "url": "https://chatgpt.com/backend-api/f/conversation",
+            "method": "POST",
+            "headers": {"cookie": "private", "content-type": "application/json"},
+            "postData": json.dumps({"messages": [{"id": "user-message"}]}),
+        }
+        succeeded = Mock(returncode=0, stdout=json.dumps(recipe), stderr="")
+        with patch.object(self.app.subprocess, "run",
+                          side_effect=[failed, succeeded]) as run, patch.object(
+            self.app.time, "sleep"
+        ) as sleep:
+            method, url, headers, body = self.client.capture_send_recipe(None, "hello")
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(0.25)
+        self.assertEqual(method, "POST")
+        self.assertEqual(url, recipe["url"])
+        self.assertEqual(headers["cookie"], "private")
+        self.assertEqual(body["messages"][0]["id"], "user-message")
+
+    def test_recipe_does_not_retry_non_lifecycle_failure(self):
+        self.client.cdp_url = "http://127.0.0.1:9334"
+        failed = Mock(returncode=1, stdout="",
+                      stderr="chatgpt-web recipe: authenticated cookies missing")
+        with patch.object(self.app.subprocess, "run", return_value=failed) as run, patch.object(
+            self.app.time, "sleep"
+        ) as sleep:
+            with self.assertRaisesRegex(self.app.ChatGPTWebError, "cookies missing"):
+                self.client.capture_send_recipe(None, "hello")
+        run.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_recipe_does_not_retry_ambiguous_post_click_lifecycle_failure(self):
+        self.client.cdp_url = "http://127.0.0.1:9334"
+        failed = Mock(returncode=1, stdout="",
+                      stderr="chatgpt-web recipe: Promise was collected")
+        with patch.object(self.app.subprocess, "run", return_value=failed) as run, patch.object(
+            self.app.time, "sleep"
+        ) as sleep:
+            with self.assertRaisesRegex(self.app.ChatGPTWebError, "Promise was collected"):
+                self.client.capture_send_recipe(None, "hello")
+        run.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_recipe_retries_ambiguous_click_only_after_server_proves_no_delivery(self):
+        self.client.cdp_url = "http://127.0.0.1:9334"
+        failed = Mock(
+            returncode=1, stdout="",
+            stderr="chatgpt-web recipe: submission outcome became ambiguous before capture",
+        )
+        recipe = {
+            "url": "https://chatgpt.com/backend-api/f/conversation",
+            "method": "POST", "headers": {"cookie": "private"},
+            "postData": json.dumps({"messages": [{"id": "user-message"}]}),
+        }
+        succeeded = Mock(returncode=0, stdout=json.dumps(recipe), stderr="")
+        with patch.object(self.app.subprocess, "run",
+                          side_effect=[failed, succeeded]) as run, patch.object(
+            self.client, "_recipe_retry_is_safe", return_value=True
+        ) as verified, patch.object(self.app.time, "sleep"):
+            self.client.capture_send_recipe(None, "hello")
+        self.assertEqual(run.call_count, 2)
+        verified.assert_called_once()
+
+    def test_recipe_never_retries_ambiguous_click_when_delivery_cannot_be_disproved(self):
+        self.client.cdp_url = "http://127.0.0.1:9334"
+        failed = Mock(
+            returncode=1, stdout="",
+            stderr="chatgpt-web recipe: submission outcome became ambiguous before capture",
+        )
+        with patch.object(self.app.subprocess, "run", return_value=failed) as run, patch.object(
+            self.client, "_recipe_retry_is_safe", return_value=False
+        ) as verified:
+            with self.assertRaisesRegex(self.app.ChatGPTWebError, "ambiguous"):
+                self.client.capture_send_recipe(None, "hello")
+        run.assert_called_once()
+        verified.assert_called_once()
+
+    def test_server_verification_detects_a_saved_user_message(self):
+        self.client.get_conversation = Mock(return_value={"messages": [
+            {"id": "old", "author": {"role": "user"},
+             "content": {"parts": ["earlier"]}},
+            {"id": "new", "author": {"role": "user"},
+             "content": {"parts": ["hello"]}},
+        ]})
+        with patch.object(self.app.time, "sleep"):
+            safe = self.client._recipe_retry_is_safe(
+                "conversation", "hello", {"old"}, None
+            )
+        self.assertFalse(safe)
+
+    def test_server_verification_requires_a_baseline(self):
+        self.assertFalse(self.client._recipe_retry_is_safe(
+            None, "hello", None, None
+        ))
 
 
 if __name__ == "__main__":

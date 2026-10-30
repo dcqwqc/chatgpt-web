@@ -737,10 +737,17 @@ class ChatGPTWebClient:
             candidate = conversation.get("conversation_id") or conversation.get("id")
             if isinstance(candidate, str):
                 conversation_id = candidate
+        existing_messages = (conversation or {}).get("messages", [])
+        if not isinstance(existing_messages, list):
+            existing_messages = []
+        known_message_ids = {
+            message["id"] for message in existing_messages
+            if isinstance(message, dict) and isinstance(message.get("id"), str)
+        }
         mode = os.environ.get("CHATGPT_WEB_SEND_MODE", "node")
         if mode == "recipe":
             method, url, headers, body = self.capture_send_recipe(
-                conversation_id, prompt
+                conversation_id, prompt, known_message_ids
             )
         else:
             try:
@@ -761,7 +768,7 @@ class ChatGPTWebClient:
                         "to complete verification; no prompt was submitted."
                     ) from error
                 method, url, headers, body = self.capture_send_recipe(
-                    conversation_id, prompt
+                    conversation_id, prompt, known_message_ids
                 )
             else:
                 method = "POST"
@@ -1078,32 +1085,127 @@ class ChatGPTWebClient:
             "height": height,
         }
 
+    def _recipe_retry_is_safe(
+        self,
+        conversation_id: str | None,
+        prompt: str,
+        known_message_ids: set[str] | None,
+        known_conversation_ids: set[str] | None,
+    ) -> bool:
+        """Prove an ambiguous browser click did not save before retrying."""
+        if conversation_id is not None and known_message_ids is None:
+            return False
+        if conversation_id is None and known_conversation_ids is None:
+            return False
+        try:
+            for verification_attempt in range(3):
+                candidates: list[dict[str, Any]] = []
+                if conversation_id is not None:
+                    candidates = [self.get_conversation(conversation_id)]
+                else:
+                    rows = self.list_conversations(50)
+                    new_ids = {
+                        row.get("id") for row in rows
+                        if isinstance(row, dict) and isinstance(row.get("id"), str)
+                    } - (known_conversation_ids or set())
+                    candidates = [
+                        self.get_conversation(row_id) for row_id in new_ids
+                    ]
+                for conversation in candidates:
+                    for message in conversation.get("messages", []):
+                        if not isinstance(message, dict):
+                            continue
+                        message_id = message.get("id")
+                        if (conversation_id is not None
+                                and isinstance(message_id, str)
+                                and message_id in (known_message_ids or set())):
+                            continue
+                        author = message.get("author", {})
+                        role = author.get("role") if isinstance(author, dict) else None
+                        if role != "user":
+                            continue
+                        rendered = text_from_parts(message_parts(message.get("content")))
+                        if rendered.strip() == prompt.strip():
+                            return False
+                if verification_attempt < 2:
+                    time.sleep(0.75)
+            return True
+        except (ChatGPTWebError, httpx.HTTPError, OSError, ValueError, TypeError):
+            # If account state cannot prove non-delivery, never risk a duplicate.
+            return False
+
     def capture_send_recipe(
-        self, conversation_id: str | None, prompt: str
+        self,
+        conversation_id: str | None,
+        prompt: str,
+        known_message_ids: set[str] | None = None,
     ) -> tuple[str, str, dict[str, str], dict[str, Any]]:
         helper = Path(__file__).with_name("chrome-recipe.js")
         environment = os.environ.copy()
         environment["CHATGPT_WEB_CDP_URL"] = self.cdp_url.rstrip("/")
-        try:
-            captured = subprocess.run(
-                [NODE_BINARY, str(helper)],
-                input=json.dumps({"conversation_id": conversation_id, "prompt": prompt}),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=110,
-                check=False,
-                env=environment,
+        request = json.dumps({"conversation_id": conversation_id, "prompt": prompt})
+        transient_markers = (
+            "Promise was collected",
+            "Execution context was destroyed",
+            "Cannot find context with specified id",
+            "Cannot find default execution context",
+            "Inspected target navigated or closed",
+            "No frame for given id",
+            "lost the Chrome debugger connection",
+            "send click did not start a request",
+        )
+        known_conversation_ids: set[str] | None = None
+        if conversation_id is None:
+            try:
+                known_conversation_ids = {
+                    row["id"] for row in self.list_conversations(50)
+                    if isinstance(row, dict) and isinstance(row.get("id"), str)
+                }
+            except (ChatGPTWebError, httpx.HTTPError, OSError, ValueError, TypeError):
+                # Capture can still succeed. Only an ambiguous retry is disabled.
+                known_conversation_ids = None
+        captured = None
+        for attempt in range(3):
+            try:
+                captured = subprocess.run(
+                    [NODE_BINARY, str(helper)],
+                    input=request,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=110,
+                    check=False,
+                    env=environment,
+                )
+            except FileNotFoundError as error:
+                raise ChatGPTWebError(
+                    "Chrome request preparation failed: Node.js helper not found"
+                ) from error
+            except subprocess.TimeoutExpired as error:
+                raise ChatGPTWebError(
+                    "Chrome request preparation failed: timed out after 110 seconds; "
+                    "the isolated request tab may need inspection"
+                ) from error
+            if captured.returncode == 0:
+                break
+            detail = captured.stderr.strip() or "request preparation failed"
+            retryable = (
+                "chatgpt-web recipe pre-submit:" in detail
+                and any(marker in detail for marker in transient_markers)
             )
-        except FileNotFoundError as error:
-            raise ChatGPTWebError("Chrome request preparation failed: Node.js helper not found") from error
-        except subprocess.TimeoutExpired as error:
-            raise ChatGPTWebError(
-                "Chrome request preparation failed: timed out after 110 seconds; "
-                "the isolated request tab may need inspection"
-            ) from error
-        if captured.returncode != 0:
-            raise ChatGPTWebError(captured.stderr.strip() or "request preparation failed")
+            ambiguous = "submission outcome became ambiguous before capture" in detail
+            if (ambiguous and attempt < 2 and self._recipe_retry_is_safe(
+                    conversation_id, prompt, known_message_ids,
+                    known_conversation_ids)):
+                time.sleep(0.25 * (attempt + 1))
+                continue
+            if not retryable or attempt == 2:
+                raise ChatGPTWebError(detail)
+            # Recipe capture aborts the intercepted request before it reaches
+            # ChatGPT, so a fresh owned tab is safe. Never retry the later HTTP
+            # submission, which may already have been accepted.
+            time.sleep(0.25 * (attempt + 1))
+        assert captured is not None
         try:
             recipe = json.loads(captured.stdout)
             url = recipe["url"]
