@@ -345,7 +345,24 @@ class ChatGPTWebClient:
             target_path = urlsplit(url).path
             request_headers["x-openai-target-path"] = target_path
             request_headers["x-openai-target-route"] = target_path
-            response = self.http.request(method, url, headers=request_headers, **kwargs)
+            # Retrying reads is safe; retrying a submission is not. A timed-out
+            # POST may have been accepted and must never be sent twice blindly.
+            read_attempts = 3 if method.upper() == "GET" else 1
+            for read_attempt in range(read_attempts):
+                try:
+                    response = self.http.request(
+                        method, url, headers=request_headers, **kwargs
+                    )
+                    break
+                except (httpx.ReadTimeout, httpx.ConnectTimeout) as error:
+                    if read_attempt + 1 >= read_attempts:
+                        if method.upper() == "GET":
+                            raise ChatGPTWebError(
+                                f"ChatGPT GET {target_path} timed out after "
+                                f"{read_attempts} read attempts"
+                            ) from error
+                        raise
+                    time.sleep(0.5 * (2 ** read_attempt))
             if response.status_code not in (401, 403) or attempt == 1:
                 break
             try:
