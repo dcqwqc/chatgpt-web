@@ -1,0 +1,12 @@
+[Unit]
+Description=BB ChatGPT Web health watchdog every 2 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=10s
+Persistent=true
+Unit=chatgpt-web-watchdog.service
+
+[Install]
+WantedBy=timers.target

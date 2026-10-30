@@ -6,16 +6,28 @@
 const http = require("http");
 
 const cdpBase = process.env.CHATGPT_WEB_CDP_URL || "http://127.0.0.1:9222";
-const timeoutMs = Number(process.env.CHATGPT_WEB_RECIPE_TIMEOUT_MS || "45000");
+const timeoutMs = Number(process.env.CHATGPT_WEB_RECIPE_TIMEOUT_MS || "90000");
 
 // Every recipe owns an isolated tab. Never type into the owner's existing
 // ChatGPT window (also shared with the image workflow), or strand a draft
 // there after a timeout or frontend change.
 let ownedTabId = null;
+let isolatedContextId = null;
+let browserConnection = null;
 let activeSocket = null;
 let watchdogTimer = null;
 let closing = false;
 async function closeOwnedTab() {
+  if (isolatedContextId && browserConnection) {
+    const id = isolatedContextId;
+    isolatedContextId = null;
+    try { await browserConnection.call("Target.disposeBrowserContext", {browserContextId:id}); }
+    catch (_error) { /* Browser may have already destroyed the context. */ }
+    browserConnection.close();
+    browserConnection = null;
+    ownedTabId = null;
+    return;
+  }
   if (!ownedTabId) return;
   const id = ownedTabId;
   ownedTabId = null;
@@ -66,18 +78,75 @@ async function getJson(url, method = "GET") {
   catch (error) { throw new Error(`Chrome debugger request failed: ${error.message}`); }
 }
 
+// A dedicated ephemeral Chrome browser context prevents ChatGPT's shared
+// localStorage/sessionStorage drafts from leaking into recipe preparation. Copy
+// only first-party login cookies at invocation time; do not persist them here.
+async function browserCDP() {
+  const version = await getJson(`${cdpBase}/json/version`);
+  if (!version.webSocketDebuggerUrl) throw new Error("Chrome browser CDP unavailable");
+  const socket = new WebSocket(version.webSocketDebuggerUrl);
+  await new Promise((resolve, reject) => {
+    socket.addEventListener("open", resolve, {once:true});
+    socket.addEventListener("error", reject, {once:true});
+  });
+  let sequence = 0;
+  const pending = new Map();
+  socket.addEventListener("message", (event) => {
+    const msg = JSON.parse(event.data);
+    const item = pending.get(msg.id);
+    if (!item) return;
+    pending.delete(msg.id);
+    if (msg.error) item.reject(new Error(msg.error.message));
+    else item.resolve(msg.result);
+  });
+  return {
+    call(method, params = {}) {
+      return new Promise((resolve, reject) => {
+        const id = ++sequence;
+        pending.set(id, {resolve, reject});
+        socket.send(JSON.stringify({id, method, params}));
+      });
+    },
+    close() { socket.close(); },
+  };
+}
+async function createIsolatedPage() {
+  // Never fall back silently to the user's persistent browser context.
+  // A failed isolated setup should fail safely without editing any draft.
+  browserConnection = await browserCDP();
+  const context = await browserConnection.call("Target.createBrowserContext",
+    {disposeOnDetach:true});
+  isolatedContextId = context.browserContextId;
+  if (!isolatedContextId) throw new Error("Chrome did not allocate isolated context");
+  const stored = await browserConnection.call("Storage.getCookies");
+  const cookies = (stored.cookies || []).filter((cookie) =>
+    /(^|\.)chatgpt\.com$|(^|\.)openai\.com$/.test(cookie.domain));
+  if (!cookies.length) throw new Error("Authenticated ChatGPT cookies missing");
+  await browserConnection.call("Storage.setCookies",
+    {cookies, browserContextId:isolatedContextId});
+  const created = await browserConnection.call("Target.createTarget", {
+    url:"https://chatgpt.com/", browserContextId:isolatedContextId,
+  });
+  ownedTabId = created.targetId;
+  if (!ownedTabId) throw new Error("Isolated ChatGPT target missing");
+  for (let retry = 0; retry < 80; retry++) {
+    const pages = await getJson(`${cdpBase}/json/list`);
+    const page = pages.filter((item) => item.id === ownedTabId)[0];
+    if (page?.webSocketDebuggerUrl) return page;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("Isolated Chrome target did not attach");
+}
+
 async function main() {
   const input = await readInput();
   if (typeof input.prompt !== "string" || !input.prompt.trim()) {
     return fail("prompt must not be empty");
   }
-  // Chrome's /json/new endpoint uses PUT. It inherits the authenticated
-  // profile but is independent of other active conversations and workers.
-  const page = await getJson(`${cdpBase}/json/new?https://chatgpt.com/`, "PUT");
-  if (!page.id || !page.webSocketDebuggerUrl) {
-    throw new Error("Chrome could not create an isolated ChatGPT tab");
+  const page = await createIsolatedPage();
+  if (!page.webSocketDebuggerUrl) {
+    throw new Error("Chrome could not open the isolated ChatGPT page");
   }
-  ownedTabId = page.id;
   const socket = new WebSocket(page.webSocketDebuggerUrl);
   activeSocket = socket;
   const pending = new Map();

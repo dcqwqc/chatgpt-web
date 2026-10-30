@@ -1091,7 +1091,7 @@ class ChatGPTWebClient:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=45,
+                timeout=110,
                 check=False,
                 env=environment,
             )
@@ -1099,7 +1099,7 @@ class ChatGPTWebClient:
             raise ChatGPTWebError("Chrome request preparation failed: Node.js helper not found") from error
         except subprocess.TimeoutExpired as error:
             raise ChatGPTWebError(
-                "Chrome request preparation failed: timed out after 45 seconds; "
+                "Chrome request preparation failed: timed out after 110 seconds; "
                 "the isolated request tab may need inspection"
             ) from error
         if captured.returncode != 0:

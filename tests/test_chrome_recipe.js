@@ -68,8 +68,17 @@ test("unrelated drafts are never cleared", () => {
   assert.equal(editor.innerText, "User's unsent private work");
 });
 
-test("helper allocates an owned temporary Chrome tab and closes it", () => {
-  assert.match(code, /\/json\/new\?https:\/\/chatgpt\.com\//);
+test("helper allocates an owned temporary Chrome context and closes it", () => {
+  assert.match(code, /Target\.createTarget/);
   assert.match(code, /closeOwnedTab\(\)/);
   assert.doesNotMatch(code, /pages\.find\(/);
+});
+
+
+test("recipe uses a private browser context with first-party cookies", () => {
+  assert.match(code, /Target\.createBrowserContext/);
+  assert.match(code, /Storage\.setCookies/);
+  assert.match(code, /chatgpt\\\.com/);
+  assert.match(code, /Target\.disposeBrowserContext/);
+  assert.doesNotMatch(code, /getJson\(\x60\$\{cdpBase\}\/json\/new/);
 });

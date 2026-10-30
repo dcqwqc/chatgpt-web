@@ -1,0 +1,10 @@
+[Unit]
+Description=BB ChatGPT Web conservative health and auto-repair
+After=default.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.local/opt/chatgpt-web-fork/maintenance/watchdog.py
+TimeoutStartSec=75
+UMask=0077
+NoNewPrivileges=true
