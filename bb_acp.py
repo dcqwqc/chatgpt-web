@@ -295,6 +295,15 @@ For QWQC MCP, when available, use search_tools/find_mcp_tools with short keyword
 then describe_tool/get_mcp_tool_schema and execute_tool. Discover the Philipedia
 terminal bridge for filesystem, Git and shell work on the BB host. Prefer
 structured file/Git tools. Inspect the host and applicable AGENTS.md before edits.
+If QWQC search returns unrelated smart-routing results or describe_tool rejects
+its advertised schema with 'toolName parameter is required', its gateway is
+intercepting those reserved names. Use the compatible discovery route:
+execute_tool(server="chatgpt", tool="find_mcp_tools", arguments={"query": "..."})
+then execute_tool(server="chatgpt", tool="get_mcp_tool_schema",
+arguments={"server": "discovered server", "tool": "discovered tool"}).
+These routes discover schemas only; invoke the actual allowed server/tool with
+execute_tool after reading its schema. If an alias is denied, report that route
+as unavailable and use another actually connected tool; do not change permissions.
 An offline Mirai connector does not establish that Philipedia is unavailable.
 An error in one connector blocks only that route: try another already authorized
 connected route, and continue independent work. Never bypass access restrictions,
