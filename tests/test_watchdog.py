@@ -23,6 +23,7 @@ class WatchdogPolicyTests(unittest.TestCase):
             patch.object(watchdog, "browser_ready", return_value=True),
             patch.object(watchdog, "daemon_ready", return_value=True),
             patch.object(watchdog, "busy_threads", return_value=False),
+            patch.object(watchdog, "busy_image_jobs", return_value=False),
             patch.object(watchdog, "cmd"),
             patch.object(watchdog.time, "time", return_value=10000),
         ]
@@ -37,50 +38,64 @@ class WatchdogPolicyTests(unittest.TestCase):
         result = watchdog.run_once()
         self.assertTrue(result["daemon_healthy"])
         self.assertTrue(result["browser_healthy"])
-        self.mocks[5].assert_not_called()
+        self.mocks[6].assert_not_called()
 
     def test_single_failure_never_restarts(self):
         self.mocks[2].return_value = False
         watchdog.run_once()
-        self.mocks[5].assert_not_called()
+        self.mocks[6].assert_not_called()
 
     def test_active_conversation_defers_browser_restart(self):
         self.mocks[2].return_value = False
         self.mocks[4].return_value = True
         self.state(browser_failures=2)
         watchdog.run_once()
-        self.mocks[5].assert_not_called()
+        self.mocks[6].assert_not_called()
 
     def test_unknown_thread_state_defers_restart(self):
         self.mocks[2].return_value = False
         self.mocks[4].return_value = None
         self.state(browser_failures=2)
         watchdog.run_once()
-        self.mocks[5].assert_not_called()
+        self.mocks[6].assert_not_called()
 
     def test_bounded_recovery_after_three_failures(self):
         self.mocks[2].return_value = False
         self.state(browser_failures=2)
-        self.mocks[5].return_value.returncode = 0
+        self.mocks[6].return_value.returncode = 0
         watchdog.run_once()
-        self.mocks[5].assert_called_once_with(
+        self.mocks[6].assert_called_once_with(
             "systemctl", "--user", "restart",
             watchdog.BROWSER, timeout=45)
         self.assertEqual(json.loads(self.status.read_text())[
             "browser_last_restart"], 10000)
 
+    def test_active_image_job_defers_browser_restart(self):
+        self.mocks[2].return_value = False
+        self.mocks[5].return_value = True
+        self.state(browser_failures=2)
+        watchdog.run_once()
+        self.mocks[6].assert_not_called()
+
+    def test_unknown_image_job_state_defers_browser_restart(self):
+        self.mocks[2].return_value = False
+        self.mocks[5].return_value = None
+        self.state(browser_failures=2)
+        watchdog.run_once()
+        self.mocks[6].assert_not_called()
+
     def test_cooldown_prevents_restart_loop(self):
         self.mocks[2].return_value = False
         self.state(browser_failures=8, browser_last_restart=9900)
         watchdog.run_once()
-        self.mocks[5].assert_not_called()
+        self.mocks[6].assert_not_called()
 
     def test_browser_failure_blocks_daemon_restart(self):
         self.mocks[2].return_value = False
         self.mocks[3].return_value = False
         self.state(browser_failures=1, daemon_failures=2)
         watchdog.run_once()
-        self.mocks[5].assert_not_called()
+        self.mocks[6].assert_not_called()
 
 
 if __name__ == "__main__":

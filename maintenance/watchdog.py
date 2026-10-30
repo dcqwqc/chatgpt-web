@@ -10,6 +10,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import sqlite3
 from pathlib import Path
 import socket
 import subprocess
@@ -79,6 +80,23 @@ def busy_threads() -> bool | None:
         return None
 
 
+def busy_image_jobs() -> bool | None:
+    """Avoid restarting the shared Chrome service during an image render.
+
+    The image workflow worker stays active even while idle, so service state
+    alone is not evidence of an active render. Check its durable job ledger.
+    """
+    db = Path.home() / "services/image-workflow/data/image-workflow.sqlite3"
+    try:
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM browser_jobs WHERE state='running'"
+            ).fetchone()
+        return bool(row and row[0])
+    except (OSError, sqlite3.Error):
+        return None
+
+
 def allowed_repair(state: dict, service: str, now: float) -> bool:
     return (state.get(f"{service}_failures", 0) >= FAILURE_THRESHOLD
             and now - state.get(f"{service}_last_restart", 0) >= COOLDOWN)
@@ -113,7 +131,11 @@ def run_once() -> dict:
             continue
         busy = busy_threads()
         if busy is not False:
-            print(f"BB ChatGPT Web: deferred {name} restart; work is active or unknown",
+            print(f"BB ChatGPT Web: deferred {name} restart; BB work is active or unknown",
+                  flush=True)
+            continue
+        if name == "browser" and busy_image_jobs() is not False:
+            print("BB ChatGPT Web: deferred browser restart; image job active or unknown",
                   flush=True)
             continue
         state[f"{name}_last_restart"] = now
