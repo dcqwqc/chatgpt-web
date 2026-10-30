@@ -80,5 +80,6 @@ test("recipe uses a private browser context with first-party cookies", () => {
   assert.match(code, /Storage\.setCookies/);
   assert.match(code, /chatgpt\\\.com/);
   assert.match(code, /Target\.disposeBrowserContext/);
-  assert.doesNotMatch(code, /getJson\(\x60\$\{cdpBase\}\/json\/new/);
+  assert.match(code, /CHATGPT_WEB_RECIPE_ISOLATED_CONTEXT/);
+  assert.match(code, /getJson\(\x60\$\{cdpBase\}\/json\/new/);
 });

@@ -143,9 +143,19 @@ async function main() {
   if (typeof input.prompt !== "string" || !input.prompt.trim()) {
     return fail("prompt must not be empty");
   }
-  const page = await createIsolatedPage();
+  // The authenticated persistent profile is the verified production path.
+  // Ephemeral browser contexts remain experimental: cookies alone do not
+  // consistently reproduce session storage and a real send can silently stall.
+  const privateContext = process.env.CHATGPT_WEB_RECIPE_ISOLATED_CONTEXT === "1";
+  const page = privateContext
+    ? await createIsolatedPage()
+    : await getJson(`${cdpBase}/json/new?https://chatgpt.com/`, "PUT");
+  if (!page.id && !page.webSocketDebuggerUrl) {
+    throw new Error("Chrome could not allocate a ChatGPT page");
+  }
+  if (!privateContext) ownedTabId = page.id;
   if (!page.webSocketDebuggerUrl) {
-    throw new Error("Chrome could not open the isolated ChatGPT page");
+    throw new Error("Chrome could not open the authenticated ChatGPT page");
   }
   const socket = new WebSocket(page.webSocketDebuggerUrl);
   activeSocket = socket;
