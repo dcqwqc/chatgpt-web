@@ -8,9 +8,28 @@ const http = require("http");
 const cdpBase = process.env.CHATGPT_WEB_CDP_URL || "http://127.0.0.1:9222";
 const timeoutMs = Number(process.env.CHATGPT_WEB_RECIPE_TIMEOUT_MS || "45000");
 
-function fail(message) {
+// Every recipe owns an isolated tab. Never type into the owner's existing
+// ChatGPT window (also shared with the image workflow), or strand a draft
+// there after a timeout or frontend change.
+let ownedTabId = null;
+let activeSocket = null;
+let watchdogTimer = null;
+let closing = false;
+async function closeOwnedTab() {
+  if (!ownedTabId) return;
+  const id = ownedTabId;
+  ownedTabId = null;
+  try { await httpRequest(`${cdpBase}/json/close/${encodeURIComponent(id)}`); }
+  catch (_error) { /* Chrome may already have closed the target. */ }
+}
+async function fail(message) {
+  if (closing) return;
+  closing = true;
+  if (watchdogTimer) clearTimeout(watchdogTimer);
+  if (activeSocket) activeSocket.close();
   process.stderr.write(`chatgpt-web recipe: ${message}\n`);
-  process.exit(1);
+  await closeOwnedTab();
+  process.exitCode = 1;
 }
 
 function readInput() {
@@ -25,31 +44,42 @@ function readInput() {
   });
 }
 
-function getJson(url) {
+function httpRequest(url, method = "GET") {
   return new Promise((resolve, reject) => {
-    http.get(url, (response) => {
+    const request = http.request(url, { method }, (response) => {
       let body = "";
       response.setEncoding("utf8");
       response.on("data", (chunk) => { body += chunk; });
       response.on("end", () => {
-        try { resolve(JSON.parse(body)); }
-        catch (_error) { reject(new Error("invalid Chrome debugger response")); }
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          reject(new Error(`Chrome debugger HTTP ${response.statusCode}`));
+        } else resolve(body);
       });
-    }).on("error", reject);
+    });
+    request.setTimeout(5000, () => request.destroy(new Error("Chrome debugger timed out")));
+    request.on("error", reject);
+    request.end();
   });
+}
+async function getJson(url, method = "GET") {
+  try { return JSON.parse(await httpRequest(url, method)); }
+  catch (error) { throw new Error(`Chrome debugger request failed: ${error.message}`); }
 }
 
 async function main() {
   const input = await readInput();
   if (typeof input.prompt !== "string" || !input.prompt.trim()) {
-    fail("prompt must not be empty");
+    return fail("prompt must not be empty");
   }
-  const pages = await getJson(`${cdpBase}/json/list`);
-  const page = pages.find((item) =>
-    item.type === "page" && item.url.startsWith("https://chatgpt.com"));
-  if (!page) fail("no ChatGPT tab found in the debugging browser");
-
+  // Chrome's /json/new endpoint uses PUT. It inherits the authenticated
+  // profile but is independent of other active conversations and workers.
+  const page = await getJson(`${cdpBase}/json/new?https://chatgpt.com/`, "PUT");
+  if (!page.id || !page.webSocketDebuggerUrl) {
+    throw new Error("Chrome could not create an isolated ChatGPT tab");
+  }
+  ownedTabId = page.id;
   const socket = new WebSocket(page.webSocketDebuggerUrl);
+  activeSocket = socket;
   const pending = new Map();
   const sentinelRequests = new Map();
   const sentinelResponses = [];
@@ -64,14 +94,17 @@ async function main() {
     });
   }
 
-  const timer = setTimeout(() => {
-    if (!finished) {
+  const timer = watchdogTimer = setTimeout(() => {
+    if (!closing) {
       socket.close();
       fail("timed out waiting for the send request");
     }
   }, timeoutMs);
 
-  socket.addEventListener("message", async (event) => {
+  socket.addEventListener("message", (event) => {
+    handleMessage(event).catch((error) => fail(error.message));
+  });
+  async function handleMessage(event) {
     const message = JSON.parse(event.data);
     if (message.id && pending.has(message.id)) {
       const request = pending.get(message.id);
@@ -119,7 +152,6 @@ async function main() {
       return;
     }
     finished = true;
-    clearTimeout(timer);
     const cookies = await call("Network.getCookies", { urls: [request.url] });
     await call("Fetch.failRequest", {
       requestId: message.params.requestId,
@@ -132,6 +164,8 @@ async function main() {
     // Network.loadingFinished and Fetch.requestPaused can arrive in adjacent
     // tasks. Give the response-body callback a brief chance to complete.
     await new Promise((resolve) => setTimeout(resolve, 300));
+    clearTimeout(timer);
+    watchdogTimer = null;
     process.stdout.write(JSON.stringify({
       url: request.url,
       method: request.method,
@@ -140,7 +174,8 @@ async function main() {
       sentinel: sentinelResponses,
     }));
     socket.close();
-  });
+    await closeOwnedTab();
+  }
 
   socket.addEventListener("open", async () => {
     try {
@@ -171,28 +206,32 @@ async function main() {
         awaitPromise: true,
         returnByValue: true,
       });
-      if (!ready.result.value) fail("ChatGPT composer did not become ready");
-      await call("Runtime.evaluate", {
-        expression: `(()=>{const e=document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea');if(!e)return false;e.focus();return !e.innerText.trim()})()`,
-        returnByValue: true,
-      });
+      if (!ready.result.value) return fail("ChatGPT composer did not become ready");
+      // A crashed prior BB attempt can leave its injected instruction envelope
+      // in the new-chat draft, and Chrome restores that draft in fresh tabs.
+      // Clear ONLY this owned tab, ONLY for an identifiable BB envelope.
+      // Never erase an unrelated draft or the owner's existing browser tab.
       const focused = await call("Runtime.evaluate", {
-        expression: `document.activeElement?.isContentEditable===true && !document.activeElement.innerText.trim()`,
+        expression: `(()=>{const e=document.querySelector('[data-composer-markdown][contenteditable="true"]')||document.querySelector('[data-chatgpt-composer] [contenteditable="true"]')||document.querySelector('#prompt-textarea');if(!e)return {ok:false,reason:'editor missing'};const text=e.innerText.trim();if(text&&!text.startsWith('[BB Agent Control — published Core Instructions]'))return {ok:false,reason:'non-BB draft preserved'};e.focus();if(text){const selection=window.getSelection();selection.selectAllChildren(e);document.execCommand('delete')}return {ok:document.activeElement===e&&e.isContentEditable&&!e.innerText.trim(),reason:'editor was not cleared'}})()`,
         returnByValue: true,
       });
-      if (!focused.result.value) fail("ChatGPT editor is not empty or did not receive focus");
+      if (!focused.result?.value?.ok) {
+        return fail(`ChatGPT editor preflight failed: ${focused.result?.value?.reason || "unknown"}`);
+      }
       await call("Input.insertText", { text: input.prompt });
       const submitted = await call("Runtime.evaluate", {
-        expression: `(async()=>{for(let i=0;i<100;i++){const b=document.querySelector('[data-chatgpt-composer] button[type="submit"][aria-label="Send"]')||document.querySelector('button[data-testid=send-button]');if(b&&!b.disabled){b.click();return true;}await new Promise(r=>setTimeout(r,100));}return false})()`,
+        // The submit button may be outside [data-chatgpt-composer] and the
+        // old data-testid no longer exists on newer ChatGPT frontends.
+        expression: `(async()=>{for(let i=0;i<100;i++){const b=document.querySelector('button[type="submit"][aria-label="Send"]')||document.querySelector('button[data-testid="send-button"]')||[...document.querySelectorAll('button[type="submit"]')].find(b=>/^send( message)?$/i.test(b.getAttribute('aria-label')||''));if(b&&!b.disabled){b.click();return true;}await new Promise(r=>setTimeout(r,100));}return false})()`,
         awaitPromise: true,
         returnByValue: true,
       });
-      if (!submitted.result.value) fail("ChatGPT send button was unavailable");
+      if (!submitted.result.value) return fail("ChatGPT send button was unavailable");
     } catch (error) {
       fail(error.message);
     }
   });
-  socket.addEventListener("error", () => fail("lost the Chrome debugger connection"));
+  socket.addEventListener("error", () => { if (!finished) fail("lost the Chrome debugger connection"); });
 }
 
 main().catch((error) => fail(error.message));

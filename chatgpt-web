@@ -1078,8 +1078,13 @@ class ChatGPTWebClient:
                 check=False,
                 env=environment,
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as error:
-            raise ChatGPTWebError("Chrome request preparation failed") from error
+        except FileNotFoundError as error:
+            raise ChatGPTWebError("Chrome request preparation failed: Node.js helper not found") from error
+        except subprocess.TimeoutExpired as error:
+            raise ChatGPTWebError(
+                "Chrome request preparation failed: timed out after 45 seconds; "
+                "the isolated request tab may need inspection"
+            ) from error
         if captured.returncode != 0:
             raise ChatGPTWebError(captured.stderr.strip() or "request preparation failed")
         try:

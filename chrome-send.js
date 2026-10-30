@@ -193,7 +193,7 @@ async function main() {
       if (!focused.result.value) fail("could not focus the ChatGPT composer");
       await call("Input.insertText", { text: input.prompt });
       const submitted = await call("Runtime.evaluate", {
-        expression: `(async()=>{for(let i=0;i<100;i++){const b=document.querySelector('[data-chatgpt-composer] button[type="submit"][aria-label="Send"]')||document.querySelector("button[data-testid=send-button]");if(b&&!b.disabled){b.click();return true;}await new Promise(r=>setTimeout(r,100));}return false})()`,
+        expression: `(async()=>{for(let i=0;i<100;i++){const b=document.querySelector('button[type="submit"][aria-label="Send"]')||document.querySelector("button[data-testid=send-button]");if(b&&!b.disabled){b.click();return true;}await new Promise(r=>setTimeout(r,100));}return false})()`,
         awaitPromise: true,
         returnByValue: true,
       });
