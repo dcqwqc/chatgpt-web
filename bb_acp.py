@@ -444,6 +444,8 @@ class Server:
             content = msg.get("text")
             if not isinstance(content, str) or not content:
                 continue
+            if role == "assistant":
+                content = render_web_elements(content)
             await self.emit({"jsonrpc": "2.0", "method": "session/update",
                              "params": {"sessionId": sid, "update": {
                                  "sessionUpdate": ("user_message_chunk"
@@ -576,7 +578,7 @@ class Server:
                         await self.update(sid, value)
                     rendered = value
                 elif typ == "message" and event.get("role") == "assistant":
-                    if isinstance(event.get("text"), str):
+                    if isinstance(event.get("text"), str) and event["text"].strip():
                         final += ("\n" if final else "") + event["text"]
                 elif "conversation_id" in event and isinstance(event["conversation_id"], str):
                     new_conversation_id = event["conversation_id"]

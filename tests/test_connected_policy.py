@@ -34,7 +34,7 @@ class ConnectedPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.root.stop()
         self.temp.cleanup()
 
-    async def send(self, fail=False):
+    async def send(self, fail=False, messages=()):
         async def fake_exec(*argv, **kwargs):
             self.prompts.append(argv[-1])
             class Process:
@@ -42,6 +42,9 @@ class ConnectedPolicyTests(unittest.IsolatedAsyncioTestCase):
                     self.returncode = 1 if fail else 0
                     self.stdout = asyncio.StreamReader()
                     if not fail:
+                        for text in messages:
+                            self.stdout.feed_data((json.dumps({"type": "message",
+                                "role": "assistant", "text": text}) + "\n").encode())
                         self.stdout.feed_data((json.dumps({"type": "result",
                             "conversation_id": "existing-chat"}) + "\n").encode())
                     self.stdout.feed_eof()
@@ -96,3 +99,9 @@ class ConnectedPolicyTests(unittest.IsolatedAsyncioTestCase):
         code = "```html\n<row>literal sample</row>\n```"
         await self.server.update(self.sid, code)
         self.assertEqual(self.records[-1]["params"]["update"]["content"]["text"], code)
+
+    async def test_empty_tool_messages_do_not_become_blank_lines(self):
+        await self.send(messages=["Checked the host.", "", "", "  ", "Actual answer."])
+        answer = "".join(r["params"]["update"]["content"]["text"] for r in self.records
+            if r.get("params", {}).get("update", {}).get("sessionUpdate") == "agent_message_chunk")
+        self.assertEqual(answer, "Checked the host.\nActual answer.")
