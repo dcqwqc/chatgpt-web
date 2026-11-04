@@ -409,7 +409,9 @@ class ChatTui:
         self.resume_items: list[dict[str, Any]] = []
         self.resume_filtered: list[dict[str, Any]] = []
         self.resume_index = 0
-        self.resume_filter = Condition(lambda: self.resume_visible)
+        self.resume_filter = Condition(
+            lambda: self.resume_visible and self.viewport_height().preferred >= 3
+        )
         self.model_visible = False
         self.model_loading = False
         self.model_items: list[dict[str, str]] = []
@@ -417,10 +419,27 @@ class ChatTui:
         self.model_index = 0
         self.model_pending_steps = 0
         self.model_error: str | None = None
-        self.model_filter = Condition(lambda: self.model_visible)
+        self.model_filter = Condition(
+            lambda: self.model_visible and self.viewport_height().preferred >= 3
+        )
+        # Keep the footer in its full form when there is room. The native-image
+        # mode intentionally caps the interactive viewport, so use that actual
+        # viewport height rather than the physical terminal height here.
+        self.full_layout_filter = Condition(
+            lambda: self.viewport_height().preferred >= 16
+            or (
+                self.viewport_height().preferred >= 6
+                and not self.resume_visible and not self.model_visible
+                and not (self.input.text.startswith("/") and "\n" not in self.input.text)
+            )
+        )
+        self.picker_details_filter = Condition(
+            lambda: self.viewport_height().preferred >= 8
+        )
         self.commands_filter = Condition(
-            lambda: not self.resume_visible and not self.model_visible and self.input.text.startswith("/")
-            and '\n' not in self.input.text
+            lambda: not self.resume_visible and not self.model_visible
+            and self.input.text.startswith("/") and '\n' not in self.input.text
+            and self.viewport_height().preferred >= 3
         )
         self.follow_output = True
         self.transcript_line_count = 1
@@ -443,6 +462,7 @@ class ChatTui:
         )
         self.transcript_window = TranscriptWindow(
             content=self.transcript_control,
+            height=D(min=0, preferred=1),
             wrap_lines=True,
             right_margins=[],
             allow_scroll_beyond_bottom=False,
@@ -475,7 +495,8 @@ class ChatTui:
         self.model_search.buffer.on_text_changed += lambda _buffer: self.filter_models()
         self.model_list_window = Window(
             content=FormattedTextControl(self.render_model_list, focusable=True),
-            wrap_lines=False, always_hide_cursor=True, height=D.exact(7),
+            wrap_lines=False, always_hide_cursor=True,
+            height=D(min=1, preferred=7, max=7),
             style="class:picker.list",
         )
         self.resume_list_control = FormattedTextControl(
@@ -486,72 +507,98 @@ class ChatTui:
             content=self.resume_list_control,
             wrap_lines=False,
             always_hide_cursor=True,
-            height=D.exact(7),
+            height=D(min=1, preferred=7, max=7),
             style="class:picker.list",
         )
         self.bindings = self.make_bindings()
         # Command hints and conversation selection stay in normal document flow.
         # Unlike Float/Frame they never cover the transcript with a full-height modal.
+        self.command_hints_window = Window(
+            content=FormattedTextControl(self.render_command_hints),
+            height=D(min=1, preferred=5, max=5),
+            style="class:commands",
+        )
         command_hints = ConditionalContainer(
-            content=Window(
-                content=FormattedTextControl(self.render_command_hints),
-                height=D.exact(5),
-                style="class:commands",
-            ),
+            content=self.command_hints_window,
             filter=self.commands_filter,
         )
         resume_picker = ConditionalContainer(
             content=HSplit([
-                Window(
-                    content=FormattedTextControl(
-                        [("class:picker.title", "  RECENT CONVERSATIONS"),
-                         ("class:picker.hint", "     Cached first · ↑ ↓ · Enter · Esc")]),
-                    height=1,
-                    style="class:picker.header",
+                ConditionalContainer(
+                    content=Window(
+                        content=FormattedTextControl(
+                            [("class:picker.title", "  RECENT CONVERSATIONS"),
+                             ("class:picker.hint", "     Cached first · ↑ ↓ · Enter · Esc")]),
+                        height=1,
+                        style="class:picker.header",
+                    ),
+                    filter=self.picker_details_filter,
                 ),
                 self.resume_search,
                 self.resume_list_window,
-                Window(
-                    content=FormattedTextControl(
-                        "  Ctrl+R  conversations    Esc  close"
+                ConditionalContainer(
+                    content=Window(
+                        content=FormattedTextControl(
+                            "  Ctrl+R  conversations    Esc  close"
+                        ),
+                        height=1,
+                        style="class:picker.help",
                     ),
-                    height=1,
-                    style="class:picker.help",
+                    filter=self.picker_details_filter,
                 ),
             ]),
             filter=self.resume_filter,
         )
         model_picker = ConditionalContainer(
             content=HSplit([
-                Window(content=FormattedTextControl([
-                    ("class:picker.title", "  SELECT CHATGPT MODEL"),
-                    ("class:picker.hint", "    Filter · ↑ ↓ · Enter · Esc")]),
-                    height=1, style="class:picker.header"),
+                ConditionalContainer(
+                    content=Window(content=FormattedTextControl([
+                        ("class:picker.title", "  SELECT CHATGPT MODEL"),
+                        ("class:picker.hint", "    Filter · ↑ ↓ · Enter · Esc")]),
+                        height=1, style="class:picker.header"),
+                    filter=self.picker_details_filter,
+                ),
                 self.model_search,
                 self.model_list_window,
-                Window(content=FormattedTextControl("  Enter  select    Esc  close"),
-                       height=1, style="class:picker.help"),
+                ConditionalContainer(
+                    content=Window(
+                        content=FormattedTextControl("  Enter  select    Esc  close"),
+                        height=1, style="class:picker.help"),
+                    filter=self.picker_details_filter,
+                ),
             ]),
             filter=self.model_filter,
         )
         root = HSplit(
             [
                 self.transcript_window,
-                Window(
-                    height=1,
-                    content=FormattedTextControl(self.render_activity),
-                    style="class:activity",
+                ConditionalContainer(
+                    content=Window(
+                        height=1,
+                        content=FormattedTextControl(self.render_activity),
+                        style="class:activity",
+                    ),
+                    filter=self.full_layout_filter,
                 ),
-                Window(height=1, char=" ", style="class:composer"),
+                ConditionalContainer(
+                    content=Window(height=1, char=" ", style="class:composer"),
+                    filter=self.full_layout_filter,
+                ),
                 self.input,
                 command_hints,
                 resume_picker,
                 model_picker,
-                Window(height=1, char=" ", style="class:composer"),
-                Window(
-                    height=1,
-                    content=FormattedTextControl(self.render_metadata),
-                    style="class:metadata",
+                ConditionalContainer(
+                    content=Window(height=1, char=" ", style="class:composer"),
+                    filter=self.full_layout_filter,
+                ),
+                ConditionalContainer(
+                    content=Window(
+                        height=1,
+                        content=FormattedTextControl(self.render_metadata),
+                        style="class:metadata",
+                    ),
+                    filter=self.full_layout_filter,
                 ),
             ],
             height=self.viewport_height,
@@ -629,9 +676,13 @@ class ChatTui:
         # Leave completed Kitty images in terminal scrollback above the
         # interactive footer. A full-screen repaint destroys cursor-anchored
         # images even when the PNG transfer itself succeeds.
+        # Do not invent a six-row minimum. During a resize or in a compact
+        # floating terminal the actual output can be shorter, and forcing a
+        # larger root height makes prompt_toolkit replace the whole UI with its
+        # default "Window too small..." placeholder.
         if self.native_image_preview:
-            return D.exact(max(6, min(rows, 10)))
-        return D.exact(max(6, rows))
+            return D.exact(max(1, min(rows, 10)))
+        return D.exact(max(1, rows))
 
     @staticmethod
     def format_elapsed(seconds: float) -> str:
@@ -1133,6 +1184,9 @@ class ChatTui:
 
     def open_models(self) -> None:
         if self.busy or self.model_visible or self.resume_visible:
+            return
+        if self.viewport_height().preferred < 3:
+            self.app.layout.focus(self.input)
             return
         if self.list_models is None:
             self.status = "Model selection unavailable"
@@ -2020,6 +2074,9 @@ class ChatTui:
 
     def open_resume(self) -> None:
         if self.busy or self.loading_conversation or self.resume_visible:
+            return
+        if self.viewport_height().preferred < 3:
+            self.app.layout.focus(self.input)
             return
         self.resume_generation += 1
         generation = self.resume_generation
