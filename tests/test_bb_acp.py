@@ -203,6 +203,60 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn("--thinking-effort",args)
                 self.assertEqual(self.records[-1]["result"]["stopReason"],"end_turn")
 
+class MutableStreamTests(unittest.IsolatedAsyncioTestCase):
+    """A replacement stream must not become multiple appended BB messages."""
+
+    async def test_revisions_are_reconciled_before_one_acp_chunk(self):
+        import json
+        cases = [
+            ([
+                {"type": "delta", "text": "Yes, some"},
+                {"type": "replace", "text": "Yes, several good"},
+                {"type": "delta", "text": " plugins"},
+                {"type": "replace", "text": "Yes, plugins for BB"},
+                {"type": "message", "role": "assistant", "text": "Yes, plugins for BB."},
+                {"type": "result", "conversation_id": "existing"},
+            ], "Yes, plugins for BB."),
+            ([
+                {"type": "delta", "text": "Initial"},
+                {"type": "replace", "text": "Better"},
+                {"type": "delta", "text": " answer"},
+                {"type": "result", "conversation_id": "existing"},
+            ], "Better answer"),
+        ]
+        for events, expected in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as d:
+                server = bb_acp.Server()
+                records = []
+                async def emit(obj): records.append(obj)
+                server.emit = emit
+                with patch.object(bb_acp, "model_capabilities", return_value=source_catalog()), patch.object(
+                    bb_acp, "ROOT", Path(d)
+                ):
+                    server.catalog()
+                    sid = "f" * 32
+                    server.sessions[sid] = {"sessionId": sid, "conversation_id": "existing",
+                                            "model": "gpt-6", "mode": "instant"}
+                    class FakeProcess:
+                        def __init__(self):
+                            self.stdout = asyncio.StreamReader()
+                            self.stdout.feed_data(("\n".join(json.dumps(e) for e in events) + "\n").encode())
+                            self.stdout.feed_eof()
+                            self.stderr = asyncio.StreamReader()
+                            self.stderr.feed_eof()
+                            self.returncode = 0
+                        async def wait(self): return 0
+                    async def fake_exec(*args, **kwargs): return FakeProcess()
+                    with patch.object(bb_acp.asyncio, "create_subprocess_exec", side_effect=fake_exec):
+                        await server.do_prompt(1, sid, [{"type": "text", "text": "plugins?"}])
+                chunks = [r["params"]["update"]["content"]["text"] for r in records
+                          if r.get("method") == "session/update" and
+                          r.get("params", {}).get("update", {}).get("sessionUpdate") == "agent_message_chunk"]
+                self.assertEqual(chunks, [expected])
+                self.assertEqual(records[-1]["result"]["stopReason"], "end_turn")
+                self.assertNotIn("[Updated response]", "".join(chunks))
+
+
 class GeneratedMediaTests(unittest.IsolatedAsyncioTestCase):
     def test_verified_cached_images_only(self):
         import json

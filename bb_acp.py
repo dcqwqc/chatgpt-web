@@ -350,6 +350,18 @@ class Server:
                                         "update": {"sessionUpdate": "agent_message_chunk",
                                                    "content": {"type": "text", "text": text}}}})
 
+    async def activity(self, sid: str, call_id: str, title: str,
+                       *, started: bool = False, status: str = "in_progress",
+                       kind: str = "other") -> None:
+        """Render a truthful, replaceable ACP activity row in BB."""
+        if not title.strip():
+            return
+        await self.emit({"jsonrpc": "2.0", "method": "session/update",
+                         "params": {"sessionId": sid, "update": {
+                             "sessionUpdate": "tool_call" if started else "tool_call_update",
+                             "toolCallId": call_id, "title": title[:240],
+                             "kind": kind, "status": status}}})
+
     def catalog(self):
         details = model_capabilities()
         self.model_capabilities_cache = {
@@ -548,6 +560,11 @@ class Server:
         new_conversation_id = None
         errors = []
         submitted = False
+        activity_prefix = "chatgpt-" + uuid.uuid4().hex[:12]
+        phase_title = None
+        activity_rows: set[str] = set()
+        activity_titles: dict[str, str] = {}
+        last_preview = ""
         try:
             assert process.stdout is not None
             while True:
@@ -564,20 +581,60 @@ class Server:
                 # duplicate a user message, so only retry pre-acceptance 429s.
                 if event.get("submitted") is True:
                     submitted = True
+                if typ == "phase" and isinstance(event.get("status"), str):
+                    title = event["status"].strip()
+                    if title and title != phase_title:
+                        phase_title = title
+                        await self.activity(sid, activity_prefix + "-request",
+                                            "ChatGPT Web · " + title,
+                                            started="request" not in activity_rows)
+                        activity_rows.add("request")
+                        activity_titles["request"] = "ChatGPT Web · " + title
+                elif typ == "tool_start" and isinstance(event.get("id"), str):
+                    raw_id = event["id"]
+                    if raw_id not in activity_rows and isinstance(event.get("name"), str):
+                        activity_rows.add(raw_id)
+                        activity_titles[raw_id] = "ChatGPT · " + event["name"]
+                        await self.activity(sid, activity_prefix + "-tool-" +
+                                            hashlib.sha256(raw_id.encode()).hexdigest()[:12],
+                                            activity_titles[raw_id],
+                                            started=True, kind="other")
+                elif typ == "commentary" and isinstance(event.get("id"), str):
+                    raw_id = "commentary-" + event["id"]
+                    body = event.get("text")
+                    if isinstance(body, str) and body.strip():
+                        await self.activity(sid, activity_prefix + "-" +
+                                            hashlib.sha256(raw_id.encode()).hexdigest()[:12],
+                                            body.strip(), started=raw_id not in activity_rows,
+                                            kind="other")
+                        activity_rows.add(raw_id)
+                        activity_titles[raw_id] = body.strip()
+                # Browser SSE supplies mutable assistant snapshots. ACP's
+                # agent_message_chunk is append-only: publishing a snapshot
+                # before the final answer makes any later "replace" event
+                # duplicate the response in BB. Reconcile locally, then emit
+                # just one canonical answer after the CLI finishes.
                 if typ == "delta" and isinstance(event.get("text"), str):
-                    delta = event["text"]
-                    rendered += delta
-                    await self.update(sid, delta)
+                    rendered += event["text"]
                 elif typ == "replace" and isinstance(event.get("text"), str):
-                    value = event["text"]
-                    if value.startswith(rendered):
-                        await self.update(sid, value[len(rendered):])
-                    elif rendered and value != rendered:
-                        await self.update(sid, "\n\n[Updated response]\n" + value)
-                    else:
-                        await self.update(sid, value)
-                    rendered = value
-                elif typ == "message" and event.get("role") == "assistant":
+                    rendered = event["text"]
+                # Show provisional text in a replaceable *activity* row. ACP
+                # answer chunks are append-only, so only verified final content
+                # is emitted as the actual answer. Throttle updates to avoid
+                # swamping BB's event log for each SSE token.
+                if typ in ("delta", "replace") and rendered.strip():
+                    preview = rendered.strip()[-175:].replace("\n", " ")
+                    if ("preview" not in activity_rows or
+                            typ == "replace" or len(rendered) - len(last_preview) >= 48):
+                        activity_titles["preview"] = "Live answer preview · " + preview
+                        await self.activity(sid, activity_prefix + "-preview",
+                                            activity_titles["preview"],
+                                            started="preview" not in activity_rows)
+                        activity_rows.add("preview")
+                        last_preview = rendered
+                if (typ == "message" and event.get("role") == "assistant"
+                      and event.get("channel") in (None, "final")
+                      and event.get("recipient") in (None, "all")):
                     if isinstance(event.get("text"), str) and event["text"].strip():
                         final += ("\n" if final else "") + event["text"]
                 elif "conversation_id" in event and isinstance(event["conversation_id"], str):
@@ -616,10 +673,26 @@ class Server:
                 session["conversation_id"] = new_conversation_id
             session["adapter_policy_hash"] = policy_hash
             save_session(session)
-            if final and final.startswith(rendered):
-                await self.update(sid, final[len(rendered):])
-            elif final and final != rendered and not rendered:
-                await self.update(sid, final)
+            # Prefer the provider's completed message, falling back to the
+            # most recent stream snapshot when no final message was included.
+            # Never concatenate both: replacements are not append-only deltas.
+            canonical = final if final else rendered
+            if canonical:
+                await self.update(sid, canonical)
+            for raw_id in activity_rows:
+                if raw_id == "request":
+                    call_id = activity_prefix + "-request"
+                    title = "ChatGPT Web · Response verified"
+                elif raw_id == "preview":
+                    call_id = activity_prefix + "-preview"
+                    title = "Live answer preview · Final answer delivered"
+                elif raw_id.startswith("commentary-"):
+                    call_id = activity_prefix + "-" + hashlib.sha256(raw_id.encode()).hexdigest()[:12]
+                    title = activity_titles[raw_id]
+                else:
+                    call_id = activity_prefix + "-tool-" + hashlib.sha256(raw_id.encode()).hexdigest()[:12]
+                    title = activity_titles[raw_id]
+                await self.activity(sid, call_id, title, status="completed")
             fresh_images = [image for image in generated_media(session.get("conversation_id"))
                             if image not in previous_images]
             if fresh_images:
@@ -629,6 +702,12 @@ class Server:
             await self.emit({"jsonrpc": "2.0", "id": request_id,
                              "result": {"stopReason": "end_turn"}})
         except asyncio.CancelledError:
+            for raw_id in activity_rows:
+                call_id = (activity_prefix + "-request" if raw_id == "request" else
+                           activity_prefix + "-preview" if raw_id == "preview" else
+                           activity_prefix + ("-" if raw_id.startswith("commentary-") else "-tool-") +
+                           hashlib.sha256(raw_id.encode()).hexdigest()[:12])
+                await self.activity(sid, call_id, activity_titles[raw_id], status="cancelled")
             if process.returncode is None:
                 process.terminate()
                 try:
@@ -638,6 +717,14 @@ class Server:
                     await process.wait()
             await self.emit({"jsonrpc": "2.0", "id": request_id,
                              "result": {"stopReason": "cancelled"}})
+        except Exception:
+            for raw_id in activity_rows:
+                call_id = (activity_prefix + "-request" if raw_id == "request" else
+                           activity_prefix + "-preview" if raw_id == "preview" else
+                           activity_prefix + ("-" if raw_id.startswith("commentary-") else "-tool-") +
+                           hashlib.sha256(raw_id.encode()).hexdigest()[:12])
+                await self.activity(sid, call_id, activity_titles[raw_id], status="failed")
+            raise
         finally:
             self.processes.pop(sid, None)
             self.running.pop(sid, None)

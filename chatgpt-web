@@ -805,6 +805,8 @@ class ChatGPTWebClient:
             raise ChatGPTWebError("conversation request has no user message ID")
         resolved_id: str | None = conversation_id
         rendered = ""
+        seen_tool_calls: set[str] = set()
+        commentary_snapshots: dict[str, str] = {}
         if on_event:
             on_event({"type":"phase","status":"Submitting request to ChatGPT…"})
         with self.http.stream(
@@ -851,8 +853,30 @@ class ChatGPTWebClient:
                 author = message.get("author")
                 if not isinstance(author, dict) or author.get("role") != "assistant":
                     continue
+                recipient = message.get("recipient")
+                channel = message.get("channel")
+                message_id = message.get("id")
+                # Tool-call messages are not answer text. Report actual observed
+                # invocations, never inferred or invented tool activity.
+                if isinstance(recipient, str) and recipient not in ("", "all"):
+                    if (on_event is not None and isinstance(message_id, str)
+                            and message_id not in seen_tool_calls):
+                        seen_tool_calls.add(message_id)
+                        on_event({"type": "tool_start", "id": message_id,
+                                  "name": recipient})
+                    continue
                 text = text_from_parts(message_parts(message.get("content")))
-                if not text or text == rendered:
+                # Public commentary can be revised in-place by SSE. Emit a
+                # replaceable snapshot to the ACP activity row, not an
+                # append-only answer or hidden-chain-of-thought channel.
+                if channel == "commentary":
+                    if (on_event is not None and isinstance(message_id, str)
+                            and text and commentary_snapshots.get(message_id) != text):
+                        commentary_snapshots[message_id] = text
+                        on_event({"type": "commentary", "id": message_id,
+                                  "text": text})
+                    continue
+                if channel not in (None, "final") or not text or text == rendered:
                     continue
                 if on_event is not None:
                     if text.startswith(rendered):
