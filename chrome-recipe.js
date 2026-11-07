@@ -422,7 +422,12 @@ async function main() {
         30000,
       );
       if (!ready) return fail("ChatGPT composer did not become ready");
-      await delay(1800);
+      // The composer readiness probe already waits for hydration. Keep a
+      // short configurable settling window; the subsequent exact editor and
+      // send-button checks reject stale or replaced editors safely.
+      const settleMs = Math.max(200, Math.min(1800,
+        Number(process.env.CHATGPT_WEB_COMPOSER_SETTLE_MS || "400") || 400));
+      await delay(settleMs);
       if (input.check === true) {
         const snapshot = await inspectComposer();
         if (!snapshot?.present) return fail("ChatGPT composer did not stay ready");
