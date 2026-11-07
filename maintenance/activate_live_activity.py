@@ -38,10 +38,16 @@ def log(stage, detail=''):
 def current_completed():
     try:
         with sqlite3.connect(f'file:{BB / "bb.db"}?mode=ro', uri=True, timeout=2) as db:
-            row = db.execute('''select turn_id, type from events
-                where thread_id = ? and turn_id is not null
+            row = db.execute('''select turn_id from events
+                where thread_id = ? and type = 'turn/started'
                 order by created_at desc, sequence desc limit 1''', (THREAD,)).fetchone()
-        return bool(row and row[1] in ('turn/completed', 'turn/failed', 'turn/cancelled'))
+            if row is None:
+                return False
+            completed = db.execute('''select 1 from events
+                where thread_id = ? and turn_id = ?
+                and type in ('turn/completed', 'turn/failed', 'turn/cancelled')
+                limit 1''', (THREAD, row[0])).fetchone()
+        return bool(completed)
     except sqlite3.Error:
         return False
 
@@ -72,6 +78,17 @@ def main():
     else:
         log('deferred', 'No verified idle window within 15 minutes; no restart made')
         return 2
+    # Release only this BB thread's loaded ACP runtime. Reloading provider-acp
+    # globally would also disturb unrelated ACP providers and active projects.
+    log('releasing-thread-runtime', 'Stopping the completed BB turn safely')
+    stop = call(str(Path.home() / '.local/bin/bb'), 'thread', 'stop', THREAD,
+                '--json', timeout=35)
+    if stop.returncode:
+        log('failed', 'Scoped BB thread stop failed: ' + (stop.stderr or stop.stdout).strip()[:240])
+        return 3
+    if active_sends():
+        log('deferred', 'New send began after release; daemon restart deferred')
+        return 5
     log('reloading-daemon', 'Restarting ChatGPT Web local service')
     restart = call('systemctl', '--user', 'restart', 'chatgpt-web.service', timeout=50)
     if restart.returncode:
@@ -81,19 +98,13 @@ def main():
     if status.returncode:
         log('failed', 'Daemon failed status check: ' + status.stderr.strip()[:240])
         return 4
-    if active_sends():
-        log('deferred', 'A new send began before provider reload; kept running provider')
-        return 5
-    log('reloading-provider', 'Reloading only the BB ACP provider bridge')
-    reload = call(str(Path.home() / '.local/bin/bb'), 'plugin', 'reload', 'provider-acp', '--json', timeout=70)
-    if reload.returncode:
-        log('failed', 'BB provider reload failed: ' + (reload.stderr or reload.stdout).strip()[:260])
-        return 6
+    # No global plugin reload: the next BB request creates a new ACP process
+    # from the updated source, preserving other providers and loaded sessions.
     models = call(str(Path.home() / '.local/bin/bb'), 'provider', 'models', 'acp-chatgpt-web', '--json', timeout=35)
     if models.returncode:
         log('failed', 'Provider models check failed: ' + (models.stderr or models.stdout).strip()[:240])
         return 7
-    log('activated', 'ChatGPT Web service and BB ACP provider reloaded; model catalog reachable')
+    log('activated', 'Daemon restarted; this thread ACP runtime released; provider catalog reachable')
     return 0
 
 
