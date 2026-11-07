@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import sqlite3
+import stat
 from pathlib import Path
 import socket
 import subprocess
@@ -54,6 +55,13 @@ def browser_ready() -> bool:
 
 def daemon_ready() -> bool:
     try:
+        # The daemon may be an already-running, owner-authenticated CLI
+        # process outside systemd's service cgroup. Systemd's duplicate
+        # invocation exits 0; that does NOT mean the daemon is down.
+        st = DAEMON_SOCKET.lstat()
+        if (not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid()
+                or st.st_mode & 0o777 != 0o600):
+            return False
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
             conn.settimeout(3)
             conn.connect(str(DAEMON_SOCKET))
@@ -95,7 +103,11 @@ def composer_ready() -> tuple[bool, str]:
 
 def busy_threads() -> bool | None:
     """Unknown is NOT permission to interrupt possible conversations."""
-    result = cmd(str(Path.home() / ".local/bin/bb"), "thread", "list", "--json")
+    # Hidden BB mission workers also use the same ChatGPT daemon. Include
+    # them, and only count THIS provider, not unrelated active Codex/Claude
+    # workers that would otherwise prevent legitimate daemon recovery.
+    result = cmd(str(Path.home() / ".local/bin/bb"),
+                 "thread", "list", "--json", "--include-hidden")
     if result is None or result.returncode != 0:
         return None
     try:
@@ -103,8 +115,13 @@ def busy_threads() -> bool | None:
         if not isinstance(rows, list):
             return None
         terminal = {"idle", "error", "done", "completed", "stopped", "failed"}
-        return any(isinstance(row, dict) and row.get("status") not in terminal
-                   for row in rows)
+        for row in rows:
+            if not isinstance(row, dict):
+                return None
+            if row.get("status") not in terminal and not row.get("providerId"):
+                return None  # An unidentified active thread may be ours.
+        return any(row.get("providerId") == "acp-chatgpt-web"
+                   and row.get("status") not in terminal for row in rows)
     except (ValueError, TypeError):
         return None
 
@@ -140,7 +157,10 @@ def run_once() -> dict:
         state = {}
     now = time.time()
     browser = active(BROWSER) and browser_ready()
-    daemon = active(DAEMON) and daemon_ready()
+    # Real socket challenge-response is the source of truth, not
+    # systemd.is-active: a duplicate CLI invocation exits cleanly while
+    # the existing owner daemon continues to serve ACP sessions.
+    daemon = daemon_ready()
     for name, good in (("browser", browser), ("daemon", daemon)):
         previous = state.get(f"{name}_failures", 0)
         state[f"{name}_failures"] = 0 if good else previous + 1

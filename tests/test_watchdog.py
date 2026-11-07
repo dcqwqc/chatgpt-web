@@ -10,6 +10,7 @@ SOURCE = Path(__file__).resolve().parent.parent / "maintenance/watchdog.py"
 spec = importlib.util.spec_from_file_location("chatgpt_web_watchdog", SOURCE)
 watchdog = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(watchdog)
+REAL_BUSY_THREADS = watchdog.busy_threads
 
 
 class WatchdogPolicyTests(unittest.TestCase):
@@ -40,6 +41,33 @@ class WatchdogPolicyTests(unittest.TestCase):
         self.assertTrue(result["daemon_healthy"])
         self.assertTrue(result["browser_healthy"])
         self.mocks[6].assert_not_called()
+
+    def test_existing_healthy_daemon_is_healthy_even_if_systemd_duplicate_exits(self):
+        self.mocks[1].side_effect = lambda unit: unit != watchdog.DAEMON
+        result=watchdog.run_once()
+        self.assertTrue(result["daemon_healthy"])
+        self.assertTrue(result["browser_healthy"])
+        self.assertEqual(result["daemon_failures"],0)
+        self.mocks[6].assert_not_called()
+
+    def test_only_chatgpt_web_active_threads_prevent_daemon_repair(self):
+        sample = [
+          {"id":"thr_other","providerId":"claude-code","status":"active"},
+          {"id":"thr_hidden","providerId":"acp-chatgpt-web","status":"active",
+           "visibility":"hidden"},
+        ]
+        # Exercise the real parser, rather than the patched busy_threads.
+        self.mocks[6].return_value.returncode=0
+        self.mocks[6].return_value.stdout=json.dumps(sample[:1])
+        self.assertFalse(REAL_BUSY_THREADS())
+        self.mocks[6].return_value.stdout=json.dumps(sample)
+        self.assertTrue(REAL_BUSY_THREADS())
+        self.mocks[6].assert_called_with(
+            str(Path.home()/".local/bin/bb"),"thread","list",
+            "--json","--include-hidden")
+        self.mocks[6].return_value.stdout=json.dumps(
+            [{"id":"thr_unknown","status":"active"}])
+        self.assertIsNone(REAL_BUSY_THREADS())
 
     def test_single_failure_never_restarts(self):
         self.mocks[2].return_value = False
@@ -90,6 +118,15 @@ class WatchdogPolicyTests(unittest.TestCase):
         self.state(browser_failures=8, browser_last_restart=9900)
         watchdog.run_once()
         self.mocks[6].assert_not_called()
+
+    def test_bounded_daemon_recovery_when_socket_actually_fails(self):
+        self.mocks[3].return_value=False  # Real owner socket has no reply.
+        self.state(daemon_failures=2)
+        self.mocks[6].return_value.returncode=0
+        result=watchdog.run_once()
+        self.assertFalse(result["daemon_healthy"])
+        self.mocks[6].assert_called_once_with(
+            "systemctl", "--user", "restart",watchdog.DAEMON,timeout=45)
 
     def test_browser_failure_blocks_daemon_restart(self):
         self.mocks[2].return_value = False
