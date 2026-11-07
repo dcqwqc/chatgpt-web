@@ -587,7 +587,8 @@ class Server:
                         phase_title = title
                         await self.activity(sid, activity_prefix + "-request",
                                             "ChatGPT Web · " + title,
-                                            started="request" not in activity_rows)
+                                            started="request" not in activity_rows,
+                                            kind="think")
                         activity_rows.add("request")
                         activity_titles["request"] = "ChatGPT Web · " + title
                 elif typ == "tool_start" and isinstance(event.get("id"), str):
@@ -606,7 +607,7 @@ class Server:
                         await self.activity(sid, activity_prefix + "-" +
                                             hashlib.sha256(raw_id.encode()).hexdigest()[:12],
                                             body.strip(), started=raw_id not in activity_rows,
-                                            kind="other")
+                                            kind="think")
                         activity_rows.add(raw_id)
                         activity_titles[raw_id] = body.strip()
                 # Browser SSE supplies mutable assistant snapshots. ACP's
@@ -629,7 +630,8 @@ class Server:
                         activity_titles["preview"] = "Live answer preview · " + preview
                         await self.activity(sid, activity_prefix + "-preview",
                                             activity_titles["preview"],
-                                            started="preview" not in activity_rows)
+                                            started="preview" not in activity_rows,
+                                            kind="think")
                         activity_rows.add("preview")
                         last_preview = rendered
                 if (typ == "message" and event.get("role") == "assistant"
