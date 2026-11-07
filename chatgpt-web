@@ -814,7 +814,12 @@ class ChatGPTWebClient:
             url,
             headers=headers,
             json=body,
-            timeout=httpx.Timeout(300.0),
+            # A tool-using ChatGPT turn may spend several minutes without SSE
+            # bytes while its tools run. 300s read-idle used to kill live BB
+            # turns. The local daemon socket already permits 1160s of idle;
+            # keep HTTP read below that bound and short connection/write timeouts.
+            timeout=httpx.Timeout(connect=20.0, read=1100.0,
+                                  write=30.0, pool=30.0),
         ) as response:
             if response.status_code == 429:
                 retry_after = response.headers.get("retry-after")

@@ -48,8 +48,11 @@ class SSEActivityTests(unittest.TestCase):
                 for row in sample:
                     yield "data: " + json.dumps(row)
                 yield "data: [DONE]"
-        client.http = SimpleNamespace(stream=lambda *args, **kwargs:
-                                      contextlib.nullcontext(FakeResponse()))
+        observed = []
+        def fake_stream(*args, **kwargs):
+            observed.append(kwargs['timeout'])
+            return contextlib.nullcontext(FakeResponse())
+        client.http = SimpleNamespace(stream=fake_stream)
         resolved, submitted = client.send_prompt_direct(None, "Test", [], events.append)
         self.assertEqual((resolved, submitted), ("verified-conversation", "submitted-user-message"))
         self.assertEqual([e["type"] for e in events if e.get("type") in
@@ -63,5 +66,7 @@ class SSEActivityTests(unittest.TestCase):
                          ["Final answer"])
         self.assertNotIn("private analysis", str(events))
         self.assertNotIn("Tool output", str(events))
+        self.assertEqual(observed[0].read, 1100.0)
+        self.assertEqual(observed[0].connect, 20.0)
 
 if __name__ == "__main__": unittest.main()
