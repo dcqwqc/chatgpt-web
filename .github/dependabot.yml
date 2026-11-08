@@ -8,3 +8,18 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+
+  - package-ecosystem: "npm"
+    directory: "/bb-plugin-provider-icons"
+    schedule:
+      interval: "weekly"
+    groups:
+      provider-icons-updates:
+        patterns: ["*"]
+  - package-ecosystem: "npm"
+    directory: "/bb-plugin-rich-ui"
+    schedule:
+      interval: "weekly"
+    groups:
+      rich-ui-updates:
+        patterns: ["*"]

@@ -47,6 +47,13 @@ class ImageBackendTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Output must"):
                 prepare_image_command("generate", "cat", output="/tmp/test.sh")
 
+    def test_configured_project_is_used_by_web_images(self):
+        with patch("image_backend.shutil.which", return_value="/usr/bin/image-use"), patch(
+            "image_backend.PROJECT_NAME", "Research"
+        ):
+            argv, _ = prepare_image_command("generate", "cat", backend="web")
+        self.assertEqual(argv[argv.index("--project") + 1], "Research")
+
     def test_success_requires_output(self):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "result.png"
