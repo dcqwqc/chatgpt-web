@@ -59,8 +59,9 @@ class LiveActivityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(tool_starts), 3)
         self.assertEqual(tool_starts[0]["sessionUpdate"], "tool_call")
         self.assertEqual(tool_starts[1]["title"], "Run connected tools")
-        self.assertIn("command=git status", tool_starts[1]["content"][0]["content"]["text"])
+        self.assertNotIn("content", tool_starts[1], "Tool input must not be mislabeled as output")
         self.assertEqual(tool_starts[1]["rawInput"], {"input": "command=git status"})
+        self.assertEqual(tool_starts[1]["name"], "Run connected tools")
         self.assertEqual(tool_starts[-1]["status"], "completed")
         previews = [x for x in updates if x.get("toolCallId", "").endswith("-preview")]
         self.assertEqual([x["sessionUpdate"] for x in previews],

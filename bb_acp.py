@@ -511,7 +511,8 @@ class Server:
 
     async def activity(self, sid: str, call_id: str, title: str,
                        *, started: bool = False, status: str = "in_progress",
-                       kind: str = "other", detail: str = "") -> None:
+                       kind: str = "other", detail: str = "",
+                       tool_name: str = "") -> None:
         """Render a truthful, replaceable ACP activity row in BB."""
         if not title.strip():
             return
@@ -520,9 +521,8 @@ class Server:
                              "sessionUpdate": "tool_call" if started else "tool_call_update",
                              "toolCallId": call_id, "title": title[:240],
                              "kind": kind, "status": status,
-                             **({"content": [{"type": "content", "content":
-                                  {"type": "text", "text": detail[:12000]}}],
-                                 "rawInput": safe_tool_input(detail)}
+                             **({"name": tool_name[:120]} if tool_name else {}),
+                             **({"rawInput": safe_tool_input(detail)}
                                 if detail else {})}}})
 
     def catalog(self):
@@ -932,6 +932,10 @@ class Server:
                             r'(?i)\bBearer\s+[A-Za-z0-9_./~+\-=]{8,}',
                             'Bearer [redacted]', sanitized)
                         activity_titles[raw_id], _ = readable_tool_activity(name, sanitized)
+                        # BB's generic item uses the ACP name, not the title,
+                        # as its expanded card heading. Prefer the observed
+                        # connected app rather than the meaningless "other".
+                        tool_name = activity_titles[raw_id].split(" · ", 1)[0]
                         native_title = event.get("native_title")
                         if isinstance(native_title, str) and native_title.strip():
                             native_title = native_title.strip()
@@ -946,7 +950,8 @@ class Server:
                         await self.activity(sid, activity_prefix + "-tool-" +
                                             hashlib.sha256(raw_id.encode()).hexdigest()[:12],
                                             activity_titles[raw_id], started=started,
-                                            kind="other", detail=sanitized[:4000])
+                                            kind="other", detail=sanitized[:4000],
+                                            tool_name=tool_name)
                 elif typ == "tool_end" and isinstance(event.get("id"), str):
                     raw_id = event["id"]
                     if raw_id in activity_rows:
