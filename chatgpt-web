@@ -405,7 +405,7 @@ class ChatGPTWebClient:
         return self.request("GET", self.list_url).json()
 
     def target_project_id(self) -> str:
-        """Resolve the exact CLI Project; refuse ambiguous or missing projects."""
+        """Resolve the exact configured Project; refuse ambiguous or missing projects."""
         pinned = load_preferences().get("project_id")
         saved = getattr(self, "_cli_project_cache", None)
         if saved is not None and saved[1] > time.monotonic() and (
@@ -443,7 +443,7 @@ class ChatGPTWebClient:
         project_id = projects[0]["id"]
         pinned = load_preferences().get("project_id")
         if pinned is not None and pinned != project_id:
-            raise ChatGPTWebError("Configured CLI Project differs from the account's Project; refusing to send")
+            raise ChatGPTWebError(f"Configured {PROJECT_NAME} Project differs from the account's Project; refusing to send")
         if pinned is None:
             save_preferences(project_id=project_id)
         self._cli_project_cache = (project_id, time.monotonic() + 300)
@@ -626,9 +626,9 @@ class ChatGPTWebClient:
         if attachments and os.environ.get("CHATGPT_WEB_SEND_MODE", "node") != "node":
             raise ChatGPTWebError("image attachments require the direct node send mode")
         if os.environ.get("CHATGPT_WEB_SEND_MODE", "node") == "chrome":
-            raise ChatGPTWebError("Browser send mode cannot guarantee CLI Project routing; use the default direct mode")
+            raise ChatGPTWebError(f"Browser send mode cannot guarantee {PROJECT_NAME} Project routing; use the default direct mode")
         if on_event:
-            on_event({"type":"phase", "status":"Checking CLI Project…"})
+            on_event({"type":"phase", "status": f"Checking {PROJECT_NAME} Project…"})
         project_id = self.target_project_id()
         previous_ids: set[str] = set()
         previous: dict[str, Any] | None = None
@@ -636,8 +636,8 @@ class ChatGPTWebClient:
             previous = self.get_conversation(conversation_id)
             if previous.get("gizmo_id") != project_id and not allow_existing_outside_project:
                 raise ChatGPTWebError(
-                    "This conversation is outside the CLI Project. "
-                    "Continue it in the interactive TUI, or /new to start a CLI Project chat."
+                    f"This conversation is outside the {PROJECT_NAME} Project. "
+                    f"Continue it in the interactive TUI, or /new to start a {PROJECT_NAME} Project chat."
                 )
             previous_messages = previous.get("messages", [])
             if isinstance(previous_messages, list):
@@ -872,7 +872,7 @@ class ChatGPTWebClient:
                     raise ChatGPTWebError(
                         "ChatGPT's verification requirements changed and the "
                         "authenticated Chrome tab is showing an interactive security "
-                        "challenge. Open the existing Philipedia Chrome login window "
+                        "challenge. Open the existing authenticated Chrome login window "
                         "to complete verification; no prompt was submitted."
                     ) from error
                 method, url, headers, body = self.capture_send_recipe(
@@ -1209,8 +1209,8 @@ class ChatGPTWebClient:
             "thinking_effort": getattr(self, "_request_thinking_effort", None) or "extended",
             "local_function_names": ["local.continue_in_work"],
         }
-        # Continuing a normal chat must not smuggle in the CLI Project ID.
-        # New chats default to the CLI Project; existing chats preserve their own.
+        # Continuing a normal chat must not smuggle in a configured Project ID.
+        # New chats use the configured Project; existing chats preserve their own.
         owner = conversation.get("gizmo_id") if conversation is not None else self.target_project_id()
         if isinstance(owner, str) and owner:
             body["conversation_mode"] = {"kind": "gizmo_interaction", "gizmo_id": owner}
@@ -2312,7 +2312,7 @@ def handle_daemon_command(
         conversation = client.get_conversation(conversation_id)
         if (conversation.get("gizmo_id") != client.target_project_id()
                 and request.get("interactive_allow_external") is not True):
-            raise ChatGPTWebError("This conversation is outside the CLI Project")
+            raise ChatGPTWebError(f"This conversation is outside the {PROJECT_NAME} Project")
         return {"conversation": conversation}, False
     if command == "show_normalized":
         conversation_id = request.get("conversation_id")
@@ -2321,7 +2321,7 @@ def handle_daemon_command(
         conversation = client.get_conversation(conversation_id)
         if (conversation.get("gizmo_id") != client.target_project_id()
                 and request.get("interactive_allow_external") is not True):
-            raise ChatGPTWebError("This conversation is outside the CLI Project")
+            raise ChatGPTWebError(f"This conversation is outside the {PROJECT_NAME} Project")
         normalized = cache_conversation(conversation)
         try:
             normalized["media_files"] = download_generated_images(
@@ -2343,7 +2343,7 @@ def handle_daemon_command(
             raise ChatGPTWebError("conversation title must be 256 characters or fewer")
         if (client.get_conversation(conversation_id).get("gizmo_id") != client.target_project_id()
                 and request.get("interactive_allow_external") is not True):
-            raise ChatGPTWebError("This conversation is outside the CLI Project")
+            raise ChatGPTWebError(f"This conversation is outside the {PROJECT_NAME} Project")
         client.rename_conversation(conversation_id, title)
         return {"conversation_id": conversation_id, "title": title}, False
     if command == "send":
@@ -2472,7 +2472,7 @@ def process_daemon_connection(
             if conversation_id in active_conversations:
                 raise ChatGPTWebError(
                     "Another terminal is already sending in this conversation. "
-                    "Different CLI Project chats can run concurrently."
+                    f"Different {PROJECT_NAME} Project chats can run concurrently."
                 )
             active_conversations.add(conversation_id)
             locked_id = conversation_id
@@ -2752,7 +2752,7 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("usage", help="show the honest ChatGPT Web quota status")
     model_parser = commands.add_parser("model", help="list models or select one")
     model_parser.add_argument("slug", nargs="?")
-    commands.add_parser("project", help="show the enforced CLI Project")
+    commands.add_parser("project", help="show the selected ChatGPT Project")
     commands.add_parser("stop", help="stop the background daemon")
     commands.add_parser("logout", help="stop the daemon and delete saved credentials")
     return parser

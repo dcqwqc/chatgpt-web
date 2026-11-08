@@ -31,6 +31,7 @@ class WatchdogPolicyTests(unittest.TestCase):
             patch.object(watchdog, "shared_daemon_busy", return_value=False),
             patch.object(watchdog, "daemon_build_current", return_value=True),
             patch.object(watchdog, "committed_daemon_source", return_value=True),
+            patch.object(watchdog, "BROWSER", "example-browser.service"),
         ]
         self.mocks = [p.start() for p in self.patches]
         for p in self.patches:
@@ -38,6 +39,13 @@ class WatchdogPolicyTests(unittest.TestCase):
 
     def state(self, **kwargs):
         self.status.write_text(json.dumps(kwargs))
+
+    def test_unconfigured_browser_unit_is_never_restarted(self):
+        with patch.object(watchdog, "BROWSER", ""):
+            self.mocks[2].return_value = False
+            self.state(browser_failures=5)
+            watchdog.run_once()
+            self.mocks[6].assert_not_called()
 
     def test_healthy_does_not_restart(self):
         result = watchdog.run_once()

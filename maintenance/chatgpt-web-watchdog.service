@@ -4,7 +4,7 @@ After=default.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 %h/.local/opt/chatgpt-web-fork/maintenance/watchdog.py
+ExecStart=%h/.local/bin/chatgpt-web-watchdog
 TimeoutStartSec=75
 UMask=0077
 NoNewPrivileges=true

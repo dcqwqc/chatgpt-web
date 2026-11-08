@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -24,29 +25,31 @@ from cooldown import retry_after_seconds
 from web_content import render_web_elements, embedded_image_assets
 from genui_image_resolution import apply_resolved_images, hydrate_from_cache
 # Enabled only after BB's native directive component was installed and checked.
-RICH_UI_READY = Path.home() / ".local/state/chatgpt-web/bb-native-rich-ui-ready"
+RICH_UI_READY = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "chatgpt-web/bb-native-rich-ui-ready"
 
 from maintenance.verified_recovery import verified_final
 from maintenance.source_activity import observe_source
 from maintenance.bb_retry_guard import original_prompt_for_retry
 
-ROOT = Path.home() / ".local/state/chatgpt-web/bb-acp"
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share")))
+ROOT = STATE_HOME / "chatgpt-web/bb-acp"
 SOCKET = Path(os.environ.get("CHATGPT_WEB_ACP_SOCKET",
     str(Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/chatgpt-web-{os.getuid()}")) /
         "chatgpt-web/daemon-v4.sock")))
-CLI = os.environ.get("CHATGPT_WEB_ACP_CLI", str(Path.home() / ".local/bin/chatgpt-web"))
+CLI = os.environ.get("CHATGPT_WEB_ACP_CLI", str(Path(__file__).resolve().parent / "run"))
 SESSION_RE = re.compile(r"^[a-f0-9]{32}$")
 MODEL_RE = re.compile(r"^[a-zA-Z0-9._/-]+$")
 
 # Generated media is already persisted by chatgpt-web's normal image workflow.
 # Only serve verified local images; never expose arbitrary paths or image tokens.
-MEDIA_ROOT = Path.home() / ".local/share/chatgpt-web/images/web-generated"
-CONVERSATION_ROOT = Path.home() / ".local/share/chatgpt-web/conversations"
+MEDIA_ROOT = DATA_HOME / "chatgpt-web/images/web-generated"
+CONVERSATION_ROOT = DATA_HOME / "chatgpt-web/conversations"
 MEDIA_RE = re.compile(r"^file_[A-Za-z0-9]{12,80}\.png$")
 CONVERSATION_RE = re.compile(r"^[a-f0-9-]{36}$")
-BB_IMAGE_ENDPOINT = "/api/v1/plugins/image-generation/http/cli-image"
-BB_WORKER_ENDPOINT = "/api/v1/plugins/image-generation/http/worker-image"
-IMAGE_BRIDGE = "/home/qwqc/Projects/bb-plugin-image-generation/bridge.py"
+BB_IMAGE_ENDPOINT = os.environ.get("CHATGPT_WEB_ACP_IMAGE_ENDPOINT", "")
+BB_WORKER_ENDPOINT = os.environ.get("CHATGPT_WEB_ACP_WORKER_IMAGE_ENDPOINT", "")
+IMAGE_BRIDGE = os.environ.get("CHATGPT_WEB_ACP_IMAGE_BRIDGE", "")
 
 def explicit_image_intent(prompt: str) -> bool:
     normalized = prompt.strip().lower()
@@ -58,6 +61,10 @@ def image_edit_intent(prompt: str) -> bool:
     return bool(re.match(r"^\s*(please\s+)?(edit|change|modify|refine|make it|make the image|turn it|remove|add|replace)\b",prompt,re.I))
 
 async def image_bridge_call(action: str, **data: Any) -> dict[str, Any]:
+    if not IMAGE_BRIDGE or not Path(IMAGE_BRIDGE).is_file():
+        raise RuntimeError(
+            "Optional image worker not configured; set CHATGPT_WEB_ACP_IMAGE_BRIDGE "
+            "to the trusted local worker script")
     process = await asyncio.create_subprocess_exec(
         sys.executable, IMAGE_BRIDGE,
         stdin=asyncio.subprocess.PIPE,
@@ -109,11 +116,14 @@ def generated_media(conversation_id: str | None) -> list[str]:
     return found
 
 
+def image_markdown(asset_id: str, endpoint: str) -> str:
+    if re.fullmatch(r"/[a-zA-Z0-9/_-]+", endpoint):
+        return f"\n\n![Generated image]({endpoint}?asset={asset_id})\n"
+    return f"\n\nGenerated image saved locally: {asset_id}. Open it in chatgpt-web.\n"
+
+
 def markdown_images(ids: list[str]) -> str:
-    return "".join(
-        f"\n\n![Generated image]({BB_IMAGE_ENDPOINT}?asset={image_id})\n"
-        for image_id in ids
-    )
+    return "".join(image_markdown(image_id, BB_IMAGE_ENDPOINT) for image_id in ids)
 
 
 def daemon_request(command: str) -> dict[str, Any]:
@@ -160,7 +170,7 @@ def model_capabilities() -> list[dict[str, Any]]:
 FAMILY_ORDER = ("gpt-6", "gpt-6-mini", "gpt-5-6", "gpt-5-6-mini")
 FAMILY_LABELS = {
     "gpt-6": "GPT-6", "gpt-6-mini": "GPT-6 Mini",
-    "gpt-5-6": "GPT-5.6 Sol", "gpt-5-6-mini": "GPT-5.6 Luna",
+    "gpt-5-6": "GPT-5.6", "gpt-5-6-mini": "GPT-5.6 Mini",
 }
 VARIANT_SUFFIXES = {
     "gpt-6": {"auto": "gpt-6", "instant": "gpt-6-instant",
@@ -171,7 +181,7 @@ VARIANT_SUFFIXES = {
     "gpt-5-6-mini": {"instant": "gpt-5-6-mini", "thinking": "gpt-5-6-t-mini"},
 }
 MODE_LABELS = {"auto": "Auto", "instant": "Instant",
-               "thinking": "Thinking", "extended": "Extended"}
+               "thinking": "Thinking", "extended": "Extended", "default": "Default"}
 
 
 def build_families(raw: list[dict[str, Any]]):
@@ -179,6 +189,7 @@ def build_families(raw: list[dict[str, Any]]):
                  if isinstance(item, dict) and isinstance(item.get("slug"), str)
                  and not item["slug"].startswith("chatgpt_alpha_")}
     families = {}
+    recognized_slugs = set()
     for family in FAMILY_ORDER:
         modes = {
             mode: slug for mode, slug in VARIANT_SUFFIXES[family].items()
@@ -193,6 +204,16 @@ def build_families(raw: list[dict[str, Any]]):
                 modes["extended"] = modes["thinking"]
         if modes:
             families[family] = modes
+            recognized_slugs.update(modes.values())
+    for slug, details in available.items():
+        if slug in recognized_slugs or slug in families:
+            continue
+        if (details.get("enable_infer") is False
+                or details.get("is_work_mode_model") is True
+                or details.get("reasoning_type") == "work"):
+            continue
+        if MODEL_RE.fullmatch(slug):
+            families[slug] = {"default": slug}
     return families
 
 
@@ -200,7 +221,10 @@ def model_rows(raw: list[dict[str, Any]]) -> list[dict[str, str]]:
     families = build_families(raw)
     if not families:
         raise RuntimeError("No supported ChatGPT Web models in this account")
-    return [{"modelId": family, "name": FAMILY_LABELS[family]}
+    titles = {row["slug"]: row.get("title") for row in raw
+              if isinstance(row.get("slug"), str)}
+    return [{"modelId": family,
+             "name": FAMILY_LABELS.get(family) or titles.get(family) or family}
             for family in families]
 
 
@@ -307,78 +331,50 @@ def remove_bb_system_envelope(text: str) -> str:
 
 
 def load_bb_core_policy() -> str:
-    """Read the explicitly published BB-wide contract, not the mutable draft.
+    """Load an optional operator-supplied policy, never a private default.
 
-    The Web CLI backend cannot consume native BB ACP tool/system envelopes,
-    so the published core policy is sent as text on the first turn of each
-    newly created Web conversation only.
+    Invalid explicit paths fail safely instead of silently dropping policy.
     """
-    path = Path.home() / ".bb" / "AGENTS.md"
+    filename = os.environ.get("CHATGPT_WEB_ACP_POLICY_FILE", "").strip()
+    if not filename:
+        return ""
+    path = Path(filename).expanduser()
     try:
-        if not path.is_file():
-            raise RuntimeError("BB universal Core Instructions are not published")
-        if path.stat().st_size > 256_000:
-            raise RuntimeError("BB Core Instructions exceed safe adapter limit")
+        if not path.is_file() or not 0 < path.stat().st_size <= 256_000:
+            raise RuntimeError("Configured ACP policy is missing, empty, or too large")
         content = path.read_text(encoding="utf-8")
-        if not content.strip():
-            raise RuntimeError("BB universal Core Instructions are empty")
-        return content
     except OSError as exc:
-        raise RuntimeError("Unable to load BB Core Instructions") from exc
+        raise RuntimeError("Cannot read configured ACP policy") from exc
+    if not content.strip():
+        raise RuntimeError("Configured ACP policy is empty")
+    return content
 
 
 def adapter_policy(session: dict[str, Any]) -> tuple[str, str]:
-    """Describe the actual execution boundary, including on legacy chats.
-
-    Native ChatGPT connectors and BB ACP tools are different capabilities.
-    Do not disable the former just because this adapter lacks the latter.
-    Fingerprint the published policy and workspace so a successful next turn
-    corrects old advice without creating a replacement conversation.
-    """
-    context = json.dumps({"host": socket.gethostname(), "cwd": session.get("cwd")},
-                         ensure_ascii=False)
-    notice = """[BB ChatGPT Web adapter — capability and execution contract v2]
-This contract replaces any earlier adapter notice saying this connection is
-text-only advisory or has no filesystem, shell or tool access.
-You are the user's ChatGPT conversation in BB. Use the tools actually available
-in this ChatGPT session, including connected MCP apps and web search. This
-adapter does not provide native BB ACP tools; that does not remove the account's
-connected tools. Discover their real schemas and try the supported route before
-claiming a capability is absent. A listed tool is not proof its service is healthy.
-For QWQC MCP, when available, use search_tools/find_mcp_tools with short keywords,
-then describe_tool/get_mcp_tool_schema and execute_tool. Discover the Philipedia
-terminal bridge for filesystem, Git and shell work on the BB host. Prefer
-structured file/Git tools. Inspect the host and applicable AGENTS.md before edits.
-If QWQC search returns unrelated smart-routing results or describe_tool rejects
-its advertised schema with 'toolName parameter is required', its gateway is
-intercepting those reserved names. Use the compatible discovery route:
-execute_tool(server="chatgpt", tool="find_mcp_tools", arguments={"query": "..."})
-then execute_tool(server="chatgpt", tool="get_mcp_tool_schema",
-arguments={"server": "discovered server", "tool": "discovered tool"}).
-These routes discover schemas only; invoke the actual allowed server/tool with
-execute_tool after reading its schema. If an alias is denied, report that route
-as unavailable and use another actually connected tool; do not change permissions.
-An offline Mirai connector does not establish that Philipedia is unavailable.
-An error in one connector blocks only that route: try another already authorized
-connected route, and continue independent work. Never bypass access restrictions,
-invent a tool, or claim an action happened without its result.
-When the user asks for an action, carry out the authorized work and verify it.
-Do not replace execution with a proposed configuration or stop at the first
-recoverable error. For a real blocker, state the exact failed route, completed
-work, remaining work and smallest required next action. Do not infer missing
-credentials from a single process environment; use the credential catalog when
-available, keeping secret values out of chat, logs and source files.
-BB runtime context (not proof of remote connector reachability):
+    """Describe capabilities without assuming a specific user's connectors."""
+    context = json.dumps(
+        {"cwd": session.get("cwd")},
+        ensure_ascii=False,
+    )
+    notice = """[ChatGPT Web ACP adapter — capability and execution contract v2]
+This contract replaces any earlier adapter notice that claimed text-only advisory
+access or guaranteed external tools.
+This ChatGPT conversation is shown through an ACP host. Native ACP tools are not
+exposed by this adapter. connected MCP apps or other ChatGPT tools may be available
+to this account, but you must inspect which ones exist and use their actual schemas.
+Do not assume particular connectors, machines, credentials, or permissions exist.
+Use authorized tools when available, but never invent actions or completed work.
+When an action cannot be performed, report the exact limitation and what remains.
+Client context (not a grant of access):
 """ + context + """
-Write clear, concise Markdown for the BB transcript. Do not emit ChatGPT-only
-XML/JSX UI tags such as <box>, <row>, <Cite>, or internal citation reference IDs.
-Use ordinary Markdown links to sources you actually consulted. Keep code samples
-as code. Distinguish implemented, tested and deployed outcomes.
-[End BB ChatGPT Web adapter contract]
-"""
-    policy = ("[BB Agent Control — published Core Instructions]\n"
-              + load_bb_core_policy().rstrip() + "\n"
-              + "[End published Core Instructions]\n\n" + notice)
+Write readable Markdown for this ACP host. Cite actual sources using ordinary
+links. Never show internal UI markup as working controls.
+[End ChatGPT Web ACP adapter contract]"""
+    core = load_bb_core_policy()
+    policy = (
+        ("[Operator ACP policy]\n" + core.rstrip()
+         + "\n[End operator ACP policy]\n\n") if core else ""
+    ) + notice
     return policy, hashlib.sha256(policy.encode("utf-8")).hexdigest()
 
 
@@ -529,6 +525,41 @@ class Server:
                              **({"name": tool_name[:120]} if tool_name else {}),
                              **({"rawInput": safe_tool_input(detail)}
                                 if detail else {})}}})
+
+    async def wait_rate_limit(self, sid: str, seconds: int) -> None:
+        """Keep a single ACP progress item current until a definite 429 expires."""
+        call_id = "chatgpt-cooldown-" + uuid.uuid4().hex[:16]
+        deadline = time.monotonic() + seconds
+        previous = None
+        started = False
+        try:
+            while True:
+                remaining = max(0, math.ceil(deadline - time.monotonic()))
+                if remaining <= 0:
+                    break
+                if remaining != previous:
+                    label = (f"{remaining // 3600:d}:{(remaining % 3600) // 60:02d}:"
+                             f"{remaining % 60:02d}" if remaining >= 3600 else
+                             f"{remaining // 60:02d}:{remaining % 60:02d}")
+                    await self.activity(
+                        sid, call_id,
+                        "ChatGPT Web · Rate limited · Retrying in " + label,
+                        started=not started, kind="other",
+                    )
+                    previous = remaining
+                    started = True
+                await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+            await self.activity(
+                sid, call_id, "ChatGPT Web · Cooldown elapsed · retrying",
+                status="completed", kind="other",
+            )
+        except asyncio.CancelledError:
+            if started:
+                await self.activity(
+                    sid, call_id, "ChatGPT Web · Retry cancelled",
+                    status="cancelled", kind="other",
+                )
+            raise
 
     def catalog(self):
         details = model_capabilities()
@@ -695,7 +726,7 @@ class Server:
             session["image_session_id"]=str(image["session_id"])
             session["image_version_id"]=str(image["version_id"])
             save_session(session)
-            await self.update(sid, f"\n\n![Generated image]({BB_WORKER_ENDPOINT}?asset={asset})\n")
+            await self.update(sid, image_markdown(asset, BB_WORKER_ENDPOINT))
             return
         state=result.get("state","pending")
         detail=str(result.get("detail") or "")
@@ -1063,7 +1094,7 @@ class Server:
                 if (delay is not None and delay <= 180 and rate_retries < 2
                         and not submitted and not rendered and not final
                         and new_conversation_id is None):
-                    await asyncio.sleep(delay + 1)
+                    await self.wait_rate_limit(sid, delay + 1)
                     await self.do_prompt(request_id, sid, blocks,
                                          rate_retries=rate_retries + 1)
                     return

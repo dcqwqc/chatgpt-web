@@ -30,6 +30,7 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.widgets import TextArea
 
+from cli_preferences import PROJECT_NAME
 from image_backend import generate_image
 import local_history
 from cooldown import retry_after_seconds, remaining_seconds, format_remaining, display_rate_limit
@@ -181,7 +182,7 @@ class PromptMarkdown:
 class SlashCommandCompleter(Completer):
     COMMANDS = (
         ("/new", "start a new conversation"),
-        ("/resume", "search CLI Project conversations"),
+        ("/resume", f"search {PROJECT_NAME} Project conversations"),
         ("/model", "select from available ChatGPT models"),
         ("/usage", "view current ChatGPT Web usage status"),
         ("/history", "reload this conversation"),
@@ -1617,7 +1618,7 @@ class ChatTui:
         self.record_prompt_history(prompt)
         self.pending_attachments.clear()
         if self.legacy_read_only:
-            # The old conversation was outside the CLI Project. Do not make
+            # The old conversation was outside the configured Project. Do not make
             # the UI imply its context will be sent to the new project chat.
             self.persist_local()
             self.local_session_id = local_history.new_id()
@@ -1627,7 +1628,7 @@ class ChatTui:
             with self.lock:
                 self.messages = [{
                     "role": "system",
-                    "text": "Started a fresh CLI Project chat. The older cached conversation "
+                    "text": f"Started a fresh {PROJECT_NAME} Project chat. The older cached conversation "
                             "is preserved separately, but its contents were not sent to ChatGPT.",
                 }]
                 self.committed_message_count = 0
@@ -2235,7 +2236,7 @@ class ChatTui:
                 self.history_position = -1
                 self.legacy_read_only = bool(conversation.get("legacy"))
                 if self.legacy_read_only:
-                    self.status = "Older cached chat is read-only; your next message creates a CLI Project chat"
+                    self.status = f"Older cached chat is read-only; your next message creates a {PROJECT_NAME} Project chat"
                 self.persist_local()
                 self.commit_loaded_history(messages)
             except Exception as error:
@@ -2359,7 +2360,7 @@ class ChatTui:
                         self.messages[-1]["text"] = (
                             f"*Request stopped: {error}*" + chr(10) * 2 +
                             "Your prompt is preserved in the input. "
-                            "Submission status may be uncertain; check the CLI Project "
+                            f"Submission status may be uncertain; check the {PROJECT_NAME} Project "
                             "before retrying to avoid a duplicate."
                         )
                 self.status = "Request failed · draft preserved"

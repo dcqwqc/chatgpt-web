@@ -43,7 +43,7 @@ home beside modern coding agents.
 - `wl-paste` (Wayland), `xclip` (X11), or `pngpaste` (macOS) for image paste
 
 ```bash
-git clone https://github.com/tritao/chatgpt-web.git
+git clone https://github.com/dcqwqc/chatgpt-web.git
 cd chatgpt-web
 
 # Open a dedicated Chrome profile and log in to ChatGPT.
@@ -200,7 +200,7 @@ occasional breakage, rate limits, forced reauthentication, and protocol changes.
 For supported integrations and production applications, use the official OpenAI
 API instead.
 
-## Fork enhancements (dcqwqc)
+## Additional features
 
 This fork adds a high-contrast terminal palette, compact **inline** conversation
 selector (Ctrl+R or /resume), and a compact inline slash-command list in
@@ -254,7 +254,8 @@ review redistribution permissions before packaging this fork elsewhere.
 ### Model selection and CLI Project isolation
 
 All newly created chats (interactive or scripted) are routed to the ChatGPT
-Project named **CLI**. Project resolution uses the authenticated account's
+Project named **CLI** by default. Set CHATGPT_WEB_PROJECT_NAME before launching
+the client to select a differently named Project. Project resolution uses the authenticated account's
 Project listing and requires exactly one exact-name match. A new chat must
 also be confirmed as belonging to that Project after submission; if the
 server returns another parent, the request fails and the client attempts
@@ -549,122 +550,17 @@ Image previews still work as before.
 The upgraded backend uses its own versioned daemon-v4 socket and does not
 stop older daemon instances or active requests.
 
-### BB / ACP provider (Philipedia)
+### ACP / BB integration
 
-The BB integration lives in `bb_acp.py`. It exposes this authenticated ChatGPT Web CLI as the custom `acp-chatgpt-web` provider via Agent Client Protocol v1. The provider advertises the live account model catalog, excluding internal/reserved entries, and selects the model **per request** instead of mutating the user's global CLI model. It supports persistent ACP session IDs mapped to CLI Project conversations, model switching, JSONL streaming, cancellation, and history replay on session load. Existing BB custom provider definitions are preserved when registering this provider.
+The optional bb_acp.py adapter allows an ACP-compatible host to use this authenticated client. It preserves conversation history, tracks accepted turns, reports connected-tool activity when available, and supports account-selected models.
 
-BB displays **four model families** (GPT-6, GPT-6 Mini, GPT-5.6 Sol,
-GPT-5.6 Luna), rather than ten repeated model variants. The native BB
-**Reasoning** row selects the real ChatGPT operating variant: Auto, Instant,
-Thinking, and Extended for full-size models; Instant and Thinking for Mini.
-Auto is available only where the account lists the native `auto` slug;
-there is no synthetic switching or task-based model router. Thinking maps to
-the account's `standard` effort, and Extended to `extended`, on variants
-that advertise configurable thinking. Mini Thinking is a fixed-effort
-model; Extended is deliberately unavailable.
+The adapter has no required user-specific policy file, browser-service name, SSH target, or image-worker path. Additional integrations must be explicitly configured. See [ACP setup](docs/acp.md).
 
-BB does not currently support a conditionally visible thinking-depth
-control in its core model picker: it would advertise Extended even for Mini
-models. Folding depth into the existing native Reasoning row keeps every
-option truthful while retaining BB's original UI and accessibility.
-The ACP adapter resolves model/mode combinations per request, independently
-per conversation, without changing the global CLI model. On load it migrates
-old per-variant session records, preserving conversation IDs and the selected
-thinking effort. Internal/reserved models are excluded. The compact BB icon
-extension in `bb-plugin-provider-icons/` overrides native Codex and Codex
-Lina with the Codex mark, and ChatGPT Web CLI with the ChatGPT knot, using
-BB's supported providerIcon slot and local validated SVG assets.
+### Public development
 
-#### Repeated sends and editor health (2026-10-30)
+The project is a maintained fork of [tritao/chatgpt-web](https://github.com/tritao/chatgpt-web).
+Upstream had no explicit LICENSE file when this fork was reviewed. This repository does not claim a blanket right to relicense the original code.
+See [license status](LICENSE-STATUS.md) before distributing builds outside GitHub.
 
-Recipe tabs open the requested conversation directly. Editor preparation skips
-hidden or detached nodes, clears recognized adapter drafts using native Chrome
-editing events, then queries and focuses the current editor again after rendering.
-ProseMirror paragraphs are read as input lines: `innerText` adds extra newlines
-between paragraphs and cannot reliably recognize a multiline prompt. Real empty
-lines and Unicode are preserved. The inserted draft and intercepted request are
-checked against the intended prompt before an HTTP submission is allowed.
-
-Transient editor failures retry in a fresh owned tab up to three times, only
-before submission. Unknown drafts are preserved. Existing conservative handling
-of ambiguous sends and duplicate prevention still applies.
-
-The watchdog additionally checks the authenticated website/composer, at most
-once every ten minutes while BB is idle. This probe opens and closes its own
-tab, inserts no text and sends no message. `composer_healthy`,
-`composer_checked_at` and `composer_error` in its private status file distinguish
-website readiness from a working browser debugging port. Website failures are
-reported without restarting authenticated Chrome or resetting account state.
-The transport watchdog retains its existing repeated-failure/cooldown checks.
-
-To run the editor tests, including actual native Chrome editing in a disposable
-blank tab on an already running debugger:
-
-```sh
-node --test tests/test_chrome_recipe.js
-CHATGPT_WEB_TEST_CDP_URL=http://127.0.0.1:9334 node --test tests/test_composer_cdp.js
-python3 -m unittest discover -s tests
-```
-
-The browser test replaces the editor during deletion, performs five additional
-multiline/Unicode turns, and checks that hidden editor content remains untouched.
-It does not require an account or submit messages.
-
-#### Login and send compatibility (2026-10-29)
-
-Philipedia's owner-controlled Chrome profile is displayed in Xpra :140.
-Launch it as a normal visible browser (the service's `login_native.py`),
-**not** Playwright's `launch_persistent_context`: Cloudflare's repeated
-challenge previously blocked all sends despite valid saved cookies.
-The existing profile was backed up outside the repository before this
-change, and CDP remains restricted to `127.0.0.1:9334`. Human login
-and security verification stay manual; there is no CAPTCHA bypass.
-
-The ChatGPT UI now uses a ProseMirror `[data-chatgpt-composer]`
-contenteditable and a `button[type=submit][aria-label=Send]` rather
-than the retired `#prompt-textarea` and `data-testid=send-button`.
-`chrome-recipe.js` handles both selectors. The first-party
-sentinel signature can change; the CLI then uses the authenticated
-browser's own send recipe and verifies the saved conversation.
-BB supplies its plugin tools as a large `<system_instructions>...`
-envelope inside ACP prompt text. The adapter deliberately removes that
-BB-only wrapper; this adapter does not execute native BB ACP tools,
-so forwarding those tool definitions caused long composer input and errors.
-All actual user text after the closing tag is preserved.
-
-Verified by a real CLI conversation (QW8-OK), a BB round-trip (BB9-OK),
-and recovery of an existing failed BB thread (reply received, idle).
-If a failed BB turn cannot be recovered by `bb thread retry`, send the
-user's prompt again through the **same** thread: BB's retry may submit
-"Please continue" rather than the original text.
-
-Execution uses the **ChatGPT account's connected tools**. The adapter does not
-implement native BB ACP tool calls, but ChatGPT can discover and use its actual
-MCP connectors for filesystem, shell, Git and other authorized work. Connector
-availability and permissions must be verified at runtime; prose alone is never
-evidence that a change happened. It uses the browser-authenticated ChatGPT Web
-service, not the OpenAI API or Codex quota; account/rate limits and account
-model access apply.
-
-The published BB Core Instructions and an accurate capability contract are
-sent on the first turn and refreshed after policy or workspace changes. Existing
-conversations receive the correction on their next successful turn without
-losing history or model settings. Failed sends do not mark the policy delivered.
-The runtime host and ACP working directory are included so an offline laptop
-connector is not mistaken for loss of the execution host. ChatGPT-only rich
-markup is converted to a readable Markdown fallback in BB; literal code is
-preserved. This does not add new tool permissions or make native BB plugins
-automatically available to the ChatGPT account.
-
-The CLI requires an existing authenticated Chrome profile and its existing ChatGPT Project named `CLI`. The project lookup follows all sidebar pagination cursors and verifies the saved Project ID. If ChatGPT's signer changes or the Chrome session presents a human verification challenge, sending **fails closed**; the user must resolve interactive verification or use a supported alternative provider. This adapter does not bypass website verification.
-
-Sanity checks:
-
-```sh
-chatgpt-web status
-chatgpt-web project
-chatgpt-web model
-bb provider list
-bb provider models acp-chatgpt-web --json
-PYTHONPATH=. python3 -m unittest discover -s tests -p 'test_*.py' -q
-```
+For maintenance and contribution, see [CONTRIBUTING.md](CONTRIBUTING.md),
+[SECURITY.md](SECURITY.md), and [public release checklist](docs/public-release.md).

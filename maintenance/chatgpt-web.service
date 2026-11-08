@@ -2,8 +2,8 @@
 StartLimitIntervalSec=5min
 StartLimitBurst=3
 Description=ChatGPT Web CLI daemon for BB
-Wants=network-online.target qwqc-image-browser-session.service
-After=network-online.target qwqc-image-browser-session.service
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
