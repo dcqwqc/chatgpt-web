@@ -45,6 +45,17 @@ class RequestRetryTests(unittest.TestCase):
                 self.client.request("GET",self.url)
         self.assertEqual(self.client.http.request.call_count,3)
 
+    def test_post_auth_response_must_not_replay(self):
+        response=Mock(status_code=401, headers={"content-type":"application/json"},
+                      url=Mock(path="/backend-api/f/conversation"))
+        self.client.http.request.return_value=response
+        with patch.object(self.client,"refresh_session") as refresh:
+            with self.assertRaisesRegex(self.m.ChatGPTWebError,
+                                        "HTTP 401"):
+                self.client.request("POST",self.url,json={"prompt":"unique"})
+            refresh.assert_not_called()
+        self.assertEqual(self.client.http.request.call_count,1)
+
     def test_429_is_not_retried(self):
         response=Mock(status_code=429,headers={
             "retry-after":"60","content-type":"application/json"})
@@ -111,6 +122,33 @@ class ReadOnlyRecoveryTests(unittest.TestCase):
                 self.client.send_prompt_direct.assert_called_once()
                 self.client.send_prompt_direct.reset_mock()
                 self.client.get_conversation.reset_mock()
+
+    def test_clean_stream_without_saved_final_waits_instead_of_claiming_success(self):
+        self.client.get_conversation.side_effect=[
+            self.before,
+            self.saved_answer(done=False),
+        ]
+        self.client.send_prompt_direct.return_value=("conversation","submitted-uuid")
+        with patch.object(self.m, "wait_for_original_final",
+                          return_value=self.saved_answer()) as wait:
+            cid, result, before = self.client.send_prompt("conversation","prompt")
+        wait.assert_called_once()
+        self.assertEqual(cid,"conversation")
+        self.assertEqual(result["messages"][-1]["status"],"finished_successfully")
+        self.assertEqual(self.client.send_prompt_direct.call_count,1)
+
+    def test_clean_stream_without_final_fails_closed(self):
+        self.client.get_conversation.side_effect=[
+            self.before,
+            self.saved_answer(done=False),
+        ]
+        self.client.send_prompt_direct.return_value=("conversation","submitted-uuid")
+        with patch.object(self.m, "wait_for_original_final",
+                          side_effect=TimeoutError("original not complete")):
+            with self.assertRaisesRegex(self.m.ChatGPTWebError,
+                                        "Accepted ChatGPT turn has no verified final"):
+                self.client.send_prompt("conversation","prompt")
+        self.assertEqual(self.client.send_prompt_direct.call_count,1)
 
     def test_unrelated_message_id_never_recovers(self):
         self.client.get_conversation.side_effect = [self.before, self.saved_answer()]

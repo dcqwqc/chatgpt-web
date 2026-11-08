@@ -8,6 +8,7 @@ services only after repeated failures and with bounded restart cooldowns.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import sqlite3
@@ -35,6 +36,7 @@ DAEMON = "chatgpt-web.service"
 COOLDOWN = 900
 FAILURE_THRESHOLD = 3
 COMPOSER_CHECK_INTERVAL = 600
+UPGRADE_COOLDOWN = 180
 
 
 def cmd(*argv: str, timeout: int = 12) -> subprocess.CompletedProcess | None:
@@ -78,6 +80,29 @@ def daemon_ready() -> bool:
         return bool(json.loads(data.decode().splitlines()[0]).get("ok"))
     except (OSError, ValueError, IndexError, TimeoutError):
         return False
+
+
+def daemon_build_current() -> bool | None:
+    """Compare the live daemon's boot-time code fingerprint to installed code.
+
+    Old daemons answer ping without a build field, which proves an update is
+    needed. Inaccessible/malformed replies are UNKNOWN, not restart permission.
+    """
+    try:
+        expected = hashlib.sha256(
+            (Path(__file__).resolve().parents[1] / "chatgpt-web").read_bytes()
+        ).hexdigest()[:16]
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(3)
+            conn.connect(str(DAEMON_SOCKET))
+            conn.sendall(b'{"command":"ping"}\n')
+            conn.shutdown(socket.SHUT_WR)
+            reply = json.loads(conn.recv(16384).decode().splitlines()[0])
+        if not reply.get("ok") or not reply.get("result", {}).get("ready"):
+            return None
+        return reply.get("result", {}).get("build") == expected
+    except (OSError, ValueError, IndexError, TypeError, TimeoutError):
+        return None
 
 
 def composer_ready() -> tuple[bool, str]:
@@ -203,6 +228,28 @@ def run_once() -> dict:
         ok = result is not None and result.returncode == 0
         print(f"BB ChatGPT Web: {name} restart {'issued' if ok else 'failed'}",
               flush=True)
+
+    # Source releases do not automatically reload a long-lived Python
+    # daemon. Deploy only when the *global* BB/CLI/pending-source guards agree
+    # idle; never send a prompt, restart Chrome, or touch active workers.
+    build_current = daemon_build_current() if daemon else None
+    state["daemon_build_current"] = build_current
+    if (daemon and browser and build_current is False
+            and now - state.get("daemon_upgrade_last_restart", 0)
+            >= UPGRADE_COOLDOWN):
+        if (busy_threads() is False
+                and shared_daemon_busy(Path.home()) is False):
+            state["daemon_upgrade_last_restart"] = now
+            result = cmd("systemctl", "--user", "restart", DAEMON, timeout=45)
+            if result is not None and result.returncode == 0:
+                print("BB ChatGPT Web: upgraded idle daemon to installed build",
+                      flush=True)
+            else:
+                print("BB ChatGPT Web: idle daemon upgrade failed; cooldown active",
+                      flush=True)
+        else:
+            print("BB ChatGPT Web: deferred code upgrade; work/recovery active",
+                  flush=True)
 
     state["checked_at"] = now
     state["browser_healthy"] = browser

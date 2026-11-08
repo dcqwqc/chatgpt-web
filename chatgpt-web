@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import base64
 import fcntl
+import hashlib
 from http.cookies import SimpleCookie
 import json
 import os
@@ -25,6 +26,7 @@ import shutil
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import socket
 import subprocess
 import sys
@@ -56,6 +58,11 @@ FORBIDDEN_REPLAY_HEADERS = {
     "host", "content-length", "connection", ":authority", ":method",
     ":path", ":scheme", "x-openai-target-path", "x-openai-target-route",
 }
+
+
+# Baked into each running process. A health probe can detect an installed
+# source update while the old daemon is still serving the previous code.
+DAEMON_BUILD = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 
 
 class ChatGPTWebError(RuntimeError):
@@ -366,6 +373,11 @@ class ChatGPTWebClient:
                         raise
                     time.sleep(0.5 * (2 ** read_attempt))
             if response.status_code not in (401, 403) or attempt == 1:
+                break
+            if method.upper() != "GET":
+                # A write with an unexpected auth response must not be sent
+                # twice. The source may have accepted the first request even
+                # if an intermediary returned the error.
                 break
             try:
                 self.refresh_session()
@@ -730,6 +742,39 @@ class ChatGPTWebClient:
                 raise ChatGPTWebError(
                     "ChatGPT did not attach the submitted message to the conversation"
                 )
+            # Clean SSE EOF and a successful GET do not imply the assistant
+            # finished. A proxy can silently close the stream before [DONE],
+            # or the saved conversation may lag behind a completed SSE. Never
+            # turn either into an apparently successful, empty BB answer.
+            if not verified_saved_answer(conversation, submitted_message_id, previous_ids):
+                if on_event:
+                    on_event({"type": "phase",
+                              "status": "Stream ended before verified final · "
+                                        "following original message read-only…",
+                              "submitted": True})
+                try:
+                    conversation = wait_for_original_final(
+                        lambda: self.get_conversation(resolved_id),
+                        lambda doc: (doc.get("id") == resolved_id and
+                                     verified_saved_answer(doc, submitted_message_id, previous_ids)),
+                        on_progress=(
+                            (lambda attempt: on_event({
+                                "type": "phase",
+                                "status": f"Waiting for original saved final (check {attempt})…",
+                                "submitted": True}))
+                            if on_event else None),
+                        transient_errors=(httpx.HTTPError, OSError, ValueError, ChatGPTWebError),
+                        rate_limit_delay=lambda err: (
+                            retry_after_seconds(str(err))
+                            if isinstance(err, ChatGPTWebError) else None),
+                        timeout_seconds=1050,
+                        poll_seconds=75,
+                    )
+                except TimeoutError as error:
+                    raise ChatGPTWebError(
+                        "Accepted ChatGPT turn has no verified final after stream "
+                        "closure. Do not resend; resume by accepted source message ID."
+                    ) from error
             return resolved_id, conversation, previous_ids
 
         helper = Path(__file__).with_name("chrome-send.js")
@@ -2362,6 +2407,47 @@ def client_for_connection(
     return client
 
 
+@contextmanager
+def resilient_stream_sender(connection: socket.socket, interval: float = 25.0):
+    """Keep local CLI stream alive; never let a disconnected UI abort ChatGPT.
+
+    The source HTTP/SSE request belongs to the server worker. If BB or the CLI
+    closes its local socket, the worker must still finish/verify the website
+    operation and persist the result for subsequent read-only reconciliation.
+    A single writer lock keeps heartbeats from interleaving with JSON lines.
+    """
+    if interval <= 0:
+        raise ValueError("heartbeat interval must be positive")
+    lock = threading.Lock()
+    done = threading.Event()
+    disconnected = threading.Event()
+
+    def send(record: dict[str, Any]) -> None:
+        if disconnected.is_set():
+            return
+        with lock:
+            if disconnected.is_set():
+                return
+            try:
+                send_json_line(connection, record)
+            except (OSError, TimeoutError):
+                disconnected.set()
+
+    def heartbeats() -> None:
+        while not done.wait(interval) and not disconnected.is_set():
+            send({"ok": True, "event": {"type": "heartbeat"}})
+
+    thread = threading.Thread(
+        target=heartbeats, name="chatgpt-web-stream-heartbeat", daemon=True
+    )
+    thread.start()
+    try:
+        yield send
+    finally:
+        done.set()
+        thread.join(timeout=2)
+
+
 def process_daemon_connection(
     connection: socket.socket,
     request: dict[str, Any],
@@ -2418,37 +2504,38 @@ def process_daemon_connection(
                     )
             client._request_model = requested_model
             client._request_thinking_effort = requested_effort
-            resolved_id, conversation, previous_ids = client.send_prompt(
-                conversation_id, prompt, attachments,
-                lambda event: send_json_line(connection, {"ok": True, "event": event}),
-                allow_existing_outside_project=request.get("interactive_allow_external") is True,
-            )
-            normalized = cache_conversation(conversation)
-            media_paths: list[str] = []
-            media_warning = None
-            if image_asset_ids(conversation):
-                send_json_line(connection, {"ok": True, "event": {
-                    "type": "phase", "status": "Saving generated image locally…",
-                    "submitted": True,
+            with resilient_stream_sender(connection) as send_record:
+                resolved_id, conversation, previous_ids = client.send_prompt(
+                    conversation_id, prompt, attachments,
+                    lambda event: send_record( {"ok": True, "event": event}),
+                    allow_existing_outside_project=request.get("interactive_allow_external") is True,
+                )
+                normalized = cache_conversation(conversation)
+                media_paths: list[str] = []
+                media_warning = None
+                if image_asset_ids(conversation):
+                    send_record( {"ok": True, "event": {
+                        "type": "phase", "status": "Saving generated image locally…",
+                        "submitted": True,
+                    }})
+                    try:
+                        media_paths = download_generated_images(
+                            client, conversation,
+                            conversation_cache_dir().parent / "images" / "web-generated",
+                        )
+                    except (ValueError, httpx.HTTPError, OSError, ChatGPTWebError) as error:
+                        media_warning = str(error)[:200]
+                normalized["media_files"] = media_paths
+                if media_warning:
+                    normalized["media_warning"] = media_warning
+                cache_conversation(normalized)
+                send_record( {"ok": True, "result": {
+                    "conversation_id": resolved_id,
+                    "conversation": conversation,
+                    "previous_ids": sorted(previous_ids),
+                    "media_files": media_paths,
+                    "media_warning": media_warning,
                 }})
-                try:
-                    media_paths = download_generated_images(
-                        client, conversation,
-                        conversation_cache_dir().parent / "images" / "web-generated",
-                    )
-                except (ValueError, httpx.HTTPError, OSError, ChatGPTWebError) as error:
-                    media_warning = str(error)[:200]
-            normalized["media_files"] = media_paths
-            if media_warning:
-                normalized["media_warning"] = media_warning
-            cache_conversation(normalized)
-            send_json_line(connection, {"ok": True, "result": {
-                "conversation_id": resolved_id,
-                "conversation": conversation,
-                "previous_ids": sorted(previous_ids),
-                "media_files": media_paths,
-                "media_warning": media_warning,
-            }})
         else:
             result, should_stop = handle_daemon_command(client, request)
             send_json(connection, {"ok": True, "result": result})
@@ -2541,7 +2628,9 @@ def run_daemon(socket_path: Path, cdp_url: str) -> int:
                     connection.settimeout(3.0)
                     try:
                         request = receive_json(connection)
-                        connection.settimeout(None)
+                        # Outbound writes must be bounded too. A frozen/closed
+                        # BB client must never stall the website SSE worker.
+                        connection.settimeout(15.0)
                     except (OSError, ChatGPTWebError) as error:
                         with connection:
                             try:
@@ -2552,7 +2641,8 @@ def run_daemon(socket_path: Path, cdp_url: str) -> int:
                     command = request.get("command")
                     if command == "ping":
                         with connection:
-                            send_json(connection, {"ok": True, "result": {"ready": True}})
+                            send_json(connection, {"ok": True, "result": {
+                                "ready": True, "build": DAEMON_BUILD}})
                         continue
                     if not slots.acquire(blocking=False):
                         with connection:

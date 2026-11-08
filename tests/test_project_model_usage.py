@@ -142,7 +142,13 @@ class BackendTests(unittest.TestCase):
         self.client.target_project_id = Mock(return_value=PROJECT_ID)
         self.client.send_prompt_direct = Mock(return_value=("test-chat", "user-msg"))
         self.client.get_conversation = Mock(return_value={
-            "gizmo_id": PROJECT_ID, "messages": [{"id": "user-msg"}]
+            "id": "test-chat", "gizmo_id": PROJECT_ID, "messages": [
+                {"id": "user-msg", "author": {"role": "user"}},
+                {"id": "reply-msg", "author": {"role": "assistant"},
+                 "channel": "final", "recipient": "all",
+                 "status": "finished_successfully",
+                 "content": {"parts": ["Hello."]}},
+            ]
         })
         result = self.client.send_prompt(None, "hello")
         self.assertEqual(result[0], "test-chat")
@@ -301,7 +307,13 @@ class InteractiveContinuationTests(unittest.TestCase):
     def test_interactive_normal_chat_preserves_original_context(self):
         before = {"id":"external-chat","gizmo_id":None,"messages":[]}
         after = {"id":"external-chat","gizmo_id":None,
-                 "messages":[{"id":"submitted-user"}]}
+                 "messages":[
+                     {"id":"submitted-user","author":{"role":"user"}},
+                     {"id":"saved-final","author":{"role":"assistant"},
+                      "recipient":"all","channel":"final",
+                      "status":"finished_successfully",
+                      "content":{"parts":["Success"]}},
+                 ]}
         self.client.get_conversation = Mock(side_effect=[before, after])
         self.client.send_prompt_direct = Mock(return_value=("external-chat","submitted-user"))
         cid, _, _ = self.client.send_prompt(

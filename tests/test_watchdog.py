@@ -29,6 +29,7 @@ class WatchdogPolicyTests(unittest.TestCase):
             patch.object(watchdog.time, "time", return_value=10000),
             patch.object(watchdog, "composer_ready", return_value=(True, "")),
             patch.object(watchdog, "shared_daemon_busy", return_value=False),
+            patch.object(watchdog, "daemon_build_current", return_value=True),
         ]
         self.mocks = [p.start() for p in self.patches]
         for p in self.patches:
@@ -69,6 +70,31 @@ class WatchdogPolicyTests(unittest.TestCase):
         self.mocks[6].return_value.stdout=json.dumps(
             [{"id":"thr_unknown","status":"active"}])
         self.assertIsNone(REAL_BUSY_THREADS())
+
+    def test_stale_idle_daemon_upgrades_once(self):
+        self.mocks[10].return_value = False
+        self.mocks[6].return_value.returncode = 0
+        first=watchdog.run_once()
+        self.assertFalse(first["daemon_build_current"])
+        self.mocks[6].assert_called_once_with(
+            "systemctl", "--user", "restart", watchdog.DAEMON, timeout=45)
+        self.assertEqual(first["daemon_upgrade_last_restart"], 10000)
+        self.mocks[6].reset_mock()
+        watchdog.run_once()
+        self.mocks[6].assert_not_called()
+
+    def test_stale_daemon_with_active_work_cannot_restart(self):
+        self.mocks[10].return_value = False
+        self.mocks[9].return_value = True
+        first=watchdog.run_once()
+        self.assertFalse(first["daemon_build_current"])
+        self.mocks[6].assert_not_called()
+        self.assertNotIn("daemon_upgrade_last_restart",first)
+
+    def test_unknown_daemon_build_cannot_trigger_upgrade(self):
+        self.mocks[10].return_value = None
+        watchdog.run_once()
+        self.mocks[6].assert_not_called()
 
     def test_single_failure_never_restarts(self):
         self.mocks[2].return_value = False
