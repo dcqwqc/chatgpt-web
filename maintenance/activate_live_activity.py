@@ -14,6 +14,13 @@ import subprocess
 import sys
 import time
 
+if __package__:
+    from .stream_guard import shared_daemon_busy
+else:
+    # Also load correctly from a direct systemd ExecStart or importlib tests.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from stream_guard import shared_daemon_busy
+
 BB = Path.home() / '.bb'
 THREAD = 'thr_tqgb78fdsw'
 STATE = Path.home() / '.local/state/chatgpt-web/live-activity-activation.json'
@@ -61,11 +68,13 @@ def active_sends():
 
 
 def ready():
-    if not current_completed() or active_sends():
+    if (not current_completed() or active_sends()
+            or shared_daemon_busy(Path.home()) is not False):
         return False
-    # Avoid resetting the worker immediately after its process exits.
+    # Recheck all threads after the quiet window; a new request may start.
     time.sleep(5)
-    return current_completed() and not active_sends()
+    return (current_completed() and not active_sends()
+            and shared_daemon_busy(Path.home()) is False)
 
 
 
@@ -137,8 +146,8 @@ def main():
     if stop.returncode:
         log('failed', 'Scoped BB thread stop failed: ' + (stop.stderr or stop.stdout).strip()[:240])
         return 3
-    if active_sends():
-        log('deferred', 'New send began after release; daemon restart deferred')
+    if active_sends() or shared_daemon_busy(Path.home()) is not False:
+        log('deferred', 'Another active or unresolved ChatGPT turn; no restart')
         return 5
     log('reloading-daemon', 'Restarting ChatGPT Web local service')
     restart = call('systemctl', '--user', 'restart', 'chatgpt-web.service', timeout=50)

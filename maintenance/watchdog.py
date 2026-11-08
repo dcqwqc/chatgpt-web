@@ -19,6 +19,13 @@ import sys
 import time
 import urllib.request
 
+if __package__:
+    from .stream_guard import shared_daemon_busy
+else:
+    # Also load correctly from a direct systemd ExecStart or importlib tests.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from stream_guard import shared_daemon_busy
+
 ROOT = Path.home() / ".local/state/chatgpt-web/watchdog"
 STATE = ROOT / "status.json"
 RUNTIME = Path(os.getenv("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
@@ -179,8 +186,12 @@ def run_once() -> dict:
         if name == "daemon" and not browser:
             continue
         busy = busy_threads()
-        if busy is not False:
-            print(f"BB ChatGPT Web: deferred {name} restart; BB work is active or unknown",
+        # A terminated BB turn may still have an accepted ChatGPT request
+        # generating on the website. Check all active CLI new/send processes
+        # and durable accepted-but-unreconciled sessions as well.
+        if busy is not False or shared_daemon_busy(Path.home()) is not False:
+            print(f"BB ChatGPT Web: deferred {name} restart; "
+                  "ChatGPT work is active or recovery is pending",
                   flush=True)
             continue
         if name == "browser" and busy_image_jobs() is not False:
@@ -198,7 +209,8 @@ def run_once() -> dict:
     state["daemon_healthy"] = daemon
     if (browser and daemon
             and now - state.get("composer_checked_at", 0) >= COMPOSER_CHECK_INTERVAL
-            and busy_threads() is False):
+            and busy_threads() is False
+            and shared_daemon_busy(Path.home()) is False):
         ready, detail = composer_ready()
         state["composer_checked_at"] = now
         state["composer_healthy"] = ready

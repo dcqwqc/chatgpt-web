@@ -21,6 +21,8 @@ from typing import Any
 
 from cooldown import retry_after_seconds
 from web_content import render_web_elements
+from maintenance.verified_recovery import verified_final
+from maintenance.bb_retry_guard import original_prompt_for_retry
 
 ROOT = Path.home() / ".local/state/chatgpt-web/bb-acp"
 SOCKET = Path(os.environ.get("CHATGPT_WEB_ACP_SOCKET",
@@ -230,6 +232,33 @@ def load_session(sid: str) -> dict[str, Any]:
     if not isinstance(s, dict) or s.get("sessionId") != sid:
         raise ValueError("Invalid stored session")
     return s
+
+
+def accepted_session_for_cwd(cwd: Any) -> dict[str, Any] | None:
+    """Recover across a new ACP session ID only for the exact BB workspace.
+
+    BB may allocate a replacement ACP session on a failed-turn retry.
+    The previous accepted message must not be sent again in that case.
+    """
+    if not isinstance(cwd, str) or not cwd or not ROOT.is_dir():
+        return None
+    matches = []
+    for candidate in ROOT.glob("*.json"):
+        if not SESSION_RE.fullmatch(candidate.stem):
+            continue
+        try:
+            session = load_session(candidate.stem)
+        except (OSError, ValueError):
+            continue
+        pending = session.get("pending_turn")
+        if (session.get("cwd") == cwd and isinstance(pending, dict)
+                and pending.get("accepted") is True):
+            matches.append(session)
+    if len(matches) > 1:
+        raise RuntimeError(
+            "Multiple accepted ChatGPT turns exist for this workspace; "
+            "ambiguous recovery is blocked without resubmitting.")
+    return matches[0] if matches else None
 
 
 def remove_bb_system_envelope(text: str) -> str:
@@ -503,6 +532,60 @@ class Server:
         await self.update(sid, f"Image generation did not complete ({state}). {detail}. "
                           f"Job: {job['job_id']}. No image has been generated for this request.")
 
+    async def recover_accepted_turn(
+        self, request_id: Any, sid: str, session: dict[str, Any],
+        pending: dict[str, Any], user_prompt: str,
+    ) -> None:
+        """Reconcile an accepted turn by GET only; never send a second prompt."""
+        conversation_id = pending.get("conversation_id")
+        message_id = pending.get("message_id")
+        if (not isinstance(conversation_id, str)
+                or not CONVERSATION_RE.fullmatch(conversation_id)
+                or not isinstance(message_id, str) or not message_id):
+            raise RuntimeError(
+                "Accepted ChatGPT request has no verified recovery IDs. "
+                "Preserved without resubmitting; manual correlation is required.")
+        row_id = "chatgpt-recover-" + hashlib.sha256(message_id.encode()).hexdigest()[:12]
+        await self.activity(sid, row_id, "ChatGPT Web · Recovering accepted turn",
+                            started=True, kind="think")
+        deadline = asyncio.get_running_loop().time() + 1050
+        attempt = 0
+        while asyncio.get_running_loop().time() < deadline:
+            attempt += 1
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    CLI, "show", conversation_id, "--output", "json",
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE)
+                output, error = await asyncio.wait_for(process.communicate(), timeout=38)
+                if process.returncode == 0 and len(output) <= 12_000_000:
+                    document = json.loads(output)
+                    answer = verified_final(
+                        document, conversation_id=conversation_id,
+                        message_id=message_id, user_prompt=user_prompt)
+                    if answer is not None:
+                        session["conversation_id"] = conversation_id
+                        session["adapter_policy_hash"] = adapter_policy(session)[1]
+                        session.pop("pending_turn", None)
+                        save_session(session)
+                        await self.update(sid, answer)
+                        await self.activity(sid, row_id,
+                                            "ChatGPT Web · Original response recovered",
+                                            status="completed", kind="think")
+                        await self.emit({"jsonrpc": "2.0", "id": request_id,
+                                         "result": {"stopReason": "end_turn"}})
+                        return
+            except (OSError, ValueError, asyncio.TimeoutError):
+                pass  # Transient read-only fetch failure is not permission to resend.
+            await self.activity(sid, row_id,
+                                f"ChatGPT Web · Awaiting original saved response (check {attempt})",
+                                kind="think")
+            await asyncio.sleep(12)
+        raise RuntimeError(
+            "The original accepted ChatGPT turn has not produced a verifiable "
+            "final answer. Recovery is still pending; no request was resubmitted.")
+
     async def do_prompt(self, request_id: Any, sid: str, blocks: list, rate_retries: int = 0):
         session = self.sessions[sid]
         pieces = []
@@ -517,6 +600,22 @@ class Server:
         if not prompt.strip():
             raise ValueError("User prompt is empty after removing BB host instructions")
         user_prompt = prompt
+        prompt_hash = hashlib.sha256(user_prompt.encode("utf-8")).hexdigest()
+        pending = session.get("pending_turn")
+        if isinstance(pending, dict) and pending.get("accepted") is True:
+            original_prompt = user_prompt
+            if pending.get("prompt_sha256") != prompt_hash:
+                original_prompt = original_prompt_for_retry(
+                    session.get("cwd"), pending, user_prompt, Path.home() / ".bb")
+                if original_prompt is None:
+                    raise RuntimeError(
+                        "A previous accepted ChatGPT turn needs read-only recovery "
+                        "before a different prompt can be sent. No prompt was submitted.")
+            try:
+                await self.recover_accepted_turn(request_id, sid, session, pending, original_prompt)
+            finally:
+                self.running.pop(sid, None)
+            return
 
         previous_image_order = generated_media(session.get("conversation_id"))
         previous_images = set(previous_image_order)
@@ -563,6 +662,8 @@ class Server:
         new_conversation_id = None
         errors = []
         submitted = False
+        submission = {"prompt_sha256": prompt_hash, "accepted": False,
+                      "message_id": None, "conversation_id": session.get("conversation_id")}
         activity_prefix = "chatgpt-" + uuid.uuid4().hex[:12]
         phase_title = None
         activity_rows: set[str] = set()
@@ -582,8 +683,19 @@ class Server:
                 # The CLI marks a 2xx accepted send explicitly. A later 429
                 # can be a read/verification throttle; resending it would
                 # duplicate a user message, so only retry pre-acceptance 429s.
+                if typ == "submission_identity" and isinstance(event.get("message_id"), str):
+                    submission["message_id"] = event["message_id"]
+                if typ == "stream_conversation_id" and isinstance(event.get("conversation_id"), str):
+                    submission["conversation_id"] = event["conversation_id"]
                 if event.get("submitted") is True:
                     submitted = True
+                    submission["accepted"] = True
+                if submission["accepted"] and submission["message_id"]:
+                    # Persist observed request identity while the SSE is alive.
+                    # This survives a local daemon/ACP crash; no prompt replay.
+                    if session.get("pending_turn") != submission:
+                        session["pending_turn"] = submission.copy()
+                        save_session(session)
                 if typ == "phase" and isinstance(event.get("status"), str):
                     title = event["status"].strip()
                     if title and title != phase_title:
@@ -714,6 +826,7 @@ class Server:
             if new_conversation_id:
                 session["conversation_id"] = new_conversation_id
             session["adapter_policy_hash"] = policy_hash
+            session.pop("pending_turn", None)
             save_session(session)
             # Prefer the provider's completed message, falling back to the
             # most recent stream snapshot when no final message was included.
@@ -797,6 +910,12 @@ class Server:
                     session = {"sessionId": sid, "conversation_id": None,
                                "cwd": params.get("cwd"),
                                "model": default, "mode": "thinking"}
+                    prior = accepted_session_for_cwd(params.get("cwd"))
+                    if prior is not None:
+                        for key in ("pending_turn", "conversation_id", "model",
+                                    "mode", "adapter_policy_hash"):
+                            if key in prior:
+                                session[key] = prior[key]
                     self.sessions[sid] = session
                     save_session(session)
                 else:
@@ -808,7 +927,7 @@ class Server:
                     session["cwd"] = params["cwd"]
                 self.normalize_session(session)
                 save_session(session)
-                if method == "session/load":
+                if method == "session/load" and not session.get("pending_turn"):
                     await self.replay(sid, session)
                 result = {"sessionId": sid, "models": self.model_state(session["model"]),
                           "configOptions": self.config_options(session)}

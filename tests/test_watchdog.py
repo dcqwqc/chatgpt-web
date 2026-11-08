@@ -28,6 +28,7 @@ class WatchdogPolicyTests(unittest.TestCase):
             patch.object(watchdog, "cmd"),
             patch.object(watchdog.time, "time", return_value=10000),
             patch.object(watchdog, "composer_ready", return_value=(True, "")),
+            patch.object(watchdog, "shared_daemon_busy", return_value=False),
         ]
         self.mocks = [p.start() for p in self.patches]
         for p in self.patches:
@@ -78,6 +79,13 @@ class WatchdogPolicyTests(unittest.TestCase):
         self.mocks[2].return_value = False
         self.mocks[4].return_value = True
         self.state(browser_failures=2)
+        watchdog.run_once()
+        self.mocks[6].assert_not_called()
+
+    def test_active_cli_or_unreconciled_stream_defers_restart(self):
+        self.mocks[2].return_value = False
+        self.state(browser_failures=2)
+        self.mocks[9].return_value = True
         watchdog.run_once()
         self.mocks[6].assert_not_called()
 

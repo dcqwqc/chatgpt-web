@@ -642,7 +642,10 @@ class ChatGPTWebClient:
                     submission["message_id"] = event.get("message_id")
                 elif event.get("type") == "stream_conversation_id":
                     submission["conversation_id"] = event.get("conversation_id")
-                elif on_event:
+                # ACP also needs these durable IDs *before* a completed result.
+                # Otherwise a daemon restart can orphan an accepted ChatGPT
+                # turn whose answer is still being produced on the website.
+                if on_event:
                     on_event(event)
 
             try:
