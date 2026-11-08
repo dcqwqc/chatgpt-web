@@ -1,9 +1,22 @@
 # ChatGPT Rich UI for BB
 
-Renders ChatGPT progress tracks as a BB-native accessible progress bar using the supported `messageDirective` slot. It does not replace BB's chat timeline, composer, tools, or theme.
+Uses BB's supported `messageDirective` slot for progress tracks, status badges,
+and literal timing label/value rows. It does not replace the chat timeline.
 
-The adapter emits `::chatgpt-progress{value="73"}` only after the local opt-in marker `~/.local/state/chatgpt-web/bb-native-rich-ui-ready` exists. Without that marker it emits a readable text progress bar. Install and verify the plugin before enabling the marker. Deleting the marker restores the text fallback on new render events without restarting services; older already-rendered messages are unchanged.
+The adapter emits rich directives only with the local opt-in marker
+`~/.local/state/chatgpt-web/bb-native-rich-ui-ready`. Install and verify a plugin
+revision supporting all emitted directives before enabling new adapter formatting.
+Without the marker the adapter preserves readable plain text. Removing the marker
+changes future render events; it does not rewrite recorded messages.
 
-The percent attribute is validated as an integer from 0 through 100. Invalid directives show their original source. No external assets, web requests, or remote code are used.
+Build with `bb plugin build ./bb-plugin-rich-ui`. Reproducible local Chromium
+fixtures: `npm ci` and `npm run qa:build` inside this directory, followed by
+`python3 qa/review.py --chromium "$CHROMIUM" --out "$EVIDENCE"`. Supply a locally
+installed Chromium and Python Playwright. No model calls or shared process restarts
+are required. Fixture screenshots are explicitly distinct from live host evidence.
+See [acceptance and SDK audit](../docs/bb-native-rendering-acceptance.md) for the
+read-only host capture command, precise limitations, gates, and upstream API draft.
 
-Build: `bb plugin build ./bb-plugin-rich-ui`. Integration check: send a **new hidden test turn** whose assistant message contains the directive and visually inspect it with a real browser. Do not interrupt active BB turns to deploy.
+Directive attributes are untrusted bounded text. Invalid values retain source.
+The components make no requests and execute no generated markup or scripts.
+Theme styles target only plugin-owned badge classes.

@@ -1,3 +1,4 @@
+import "./app.css";
 import { definePluginApp } from "@get-bb/plugin-sdk/app";
 import type { PluginMessageDirectiveProps } from "@get-bb/plugin-sdk/app";
 
@@ -40,7 +41,7 @@ export function ChatGPTBadge({ attributes, source }: PluginMessageDirectiveProps
   const tone = attributes.tone;
   const color = tone === "success" ? "var(--success-foreground)" :
                 tone === "danger" ? "var(--destructive)" :
-                tone === "warning" ? "var(--warning-foreground)" :
+                tone === "warning" ? "var(--foreground)" :
                 tone === "info" ? "var(--color-blue-700)" : "var(--muted-foreground)";
   const tint = tone === "success" ? "var(--success)" :
                tone === "danger" ? "var(--destructive)" :
@@ -48,15 +49,31 @@ export function ChatGPTBadge({ attributes, source }: PluginMessageDirectiveProps
                tone === "info" ? "var(--color-blue-500)" : "var(--muted)";
   return (
     <span
-      className="inline-flex max-w-full items-center rounded-full px-2.5 py-0.5 text-xs font-medium leading-5"
-      style={{ color, backgroundColor: `color-mix(in oklch, ${tint} 13%, transparent)` }}
+      data-tone={tone}
+      className="chatgpt-status-badge inline-flex max-w-full break-words items-center rounded-full px-2.5 py-0.5 text-xs font-medium leading-5"
+      style={{ color: `var(--chatgpt-badge-text, ${color})`, overflowWrap: "anywhere", backgroundColor: `color-mix(in oklch, ${tint} 13%, transparent)` }}
     >
       {label}
     </span>
   );
 }
 
+/** A source metric row keeps its label/value association at narrow widths. */
+export function ChatGPTMetric({ attributes, source }: PluginMessageDirectiveProps) {
+  const label = attributes.label?.slice(0, 160) ?? "";
+  const value = attributes.value?.slice(0, 80) ?? "";
+  if (!label.trim() || !value.trim()) return <span>{source}</span>;
+  return (
+    <div className="my-2 grid max-w-full items-baseline gap-x-4 gap-y-1"
+      style={{ gridTemplateColumns: "minmax(0, 1fr) auto" }}>
+      <span className="min-w-0 text-sm text-muted-foreground" style={{ overflowWrap: "anywhere" }}>{label}</span>
+      <strong className="text-right font-semibold" style={{ maxWidth: "12em", overflowWrap: "anywhere" }}>{value}</strong>
+    </div>
+  );
+}
+
 export default definePluginApp((app) => {
   app.slots.messageDirective({ id: "chatgpt-progress", component: ChatGPTProgress });
   app.slots.messageDirective({ id: "chatgpt-badge", component: ChatGPTBadge });
+  app.slots.messageDirective({ id: "chatgpt-metric", component: ChatGPTMetric });
 });

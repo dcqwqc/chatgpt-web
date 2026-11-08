@@ -1,0 +1,7 @@
+/* Theme adjustments are scoped to plugin-owned badges. */
+.dark .chatgpt-status-badge[data-tone="info"] { --chatgpt-badge-text: var(--color-blue-300); }
+.dark .chatgpt-status-badge[data-tone="danger"] { --chatgpt-badge-text: var(--color-red-300); }
+.chatgpt-status-badge[data-tone="success"] {
+  --chatgpt-badge-text: color-mix(in oklch, var(--success-foreground) 90%, var(--foreground));
+}
+.dark .chatgpt-status-badge[data-tone="success"] { --chatgpt-badge-text: var(--success-foreground); }

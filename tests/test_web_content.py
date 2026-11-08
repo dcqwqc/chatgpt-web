@@ -104,5 +104,54 @@ class RichContentTests(unittest.TestCase):
                          '<badge>High</badge>' + chr(96) + ' in code.')
 
 
+class LiteralCodeRegressionTests(unittest.TestCase):
+    def test_interrupted_fence_never_promotes_code_to_ui(self):
+        for fence in ('```html', '~~~~html', '````html'):
+            source = fence + '\n<badge color="success">Verified</badge>\n<Chart title="Literal"/>'
+            self.assertEqual(render_web_elements(source, rich_ui=True), source)
+
+    def test_shorter_fence_cannot_close_longer_literal_example(self):
+        source = '````markdown\n```html\n<badge>literal</badge>\n```\n````\n'
+        self.assertEqual(render_web_elements(source, rich_ui=True), source)
+
+    def test_codeblock_containing_fences_uses_longer_delimiter(self):
+        output = render_web_elements('<CodeBlock language="markdown">```html\n<badge>literal</badge>\n```</CodeBlock>', rich_ui=True)
+        self.assertTrue(output.startswith('\n````markdown\n'))
+        self.assertTrue(output.endswith('\n````\n'))
+        self.assertIn('<badge>literal</badge>', output)
+
+    def test_interrupted_codeblock_keeps_literal_code(self):
+        output = render_web_elements('<CodeBlock language="html"><badge>literal</badge>', rich_ui=True)
+        self.assertEqual(output, '\n```html\n<badge>literal</badge>')
+
+    def test_code_language_cannot_inject_a_new_fence(self):
+        output = render_web_elements('<CodeBlock language="html\n::chatgpt-badge{}">text</CodeBlock>', rich_ui=True)
+        self.assertEqual(output, '\n```\ntext\n```\n')
+
+    def test_metric_row_retains_associated_value(self):
+        source = '<row align="center" justify="between">\n<text color="secondary">Before — browser readiness</text>\n**4.06 s**\n</row>'
+        self.assertIn('::chatgpt-metric{label="Before — browser readiness" value="4.06 s"}', render_web_elements(source, rich_ui=True))
+        self.assertNotIn('::chatgpt-metric', render_web_elements(source))
+
+    def test_metric_with_unsafe_attribute_uses_plain_fallback(self):
+        source = '<row align="center" justify="between"><text>A "quote"</text>**3 s**</row>'
+        self.assertNotIn('::chatgpt-metric', render_web_elements(source, rich_ui=True))
+
+    def test_badge_backslash_cannot_escape_directive_delimiter(self):
+        self.assertNotIn('::chatgpt-badge', render_web_elements('<badge>bad\\</badge>', rich_ui=True))
+
+    def test_chart_fallback_retains_available_metadata_without_executing(self):
+        output = render_web_elements('<Chart type="bar" title="Readiness" data={run()}/>', rich_ui=True)
+        self.assertIn('Readiness (bar)', output)
+        self.assertIn('data unavailable', output)
+        self.assertNotIn('run()', output)
+
+
+class InlineLiteralRegressionTests(unittest.TestCase):
+    def test_inline_codeblock_tag_is_literal(self):
+        for source in ('Use `<CodeBlock>literal</CodeBlock>` here.',
+                       'Use ``<badge>literal ` tick</badge>`` here.'):
+            self.assertEqual(render_web_elements(source, rich_ui=True), source)
+
 if __name__ == '__main__':
     unittest.main()
