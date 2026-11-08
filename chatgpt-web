@@ -41,6 +41,7 @@ import local_history
 from generated_media import download_generated_images, image_asset_ids
 from maintenance.accepted_stream import wait_for_original_final
 from cooldown import retry_after_seconds
+from retry_after import rate_limit_message
 
 from cli_preferences import (
     PROJECT_NAME, PROJECT_ID_RE, MODEL_RE, load_preferences, save_preferences,
@@ -387,9 +388,8 @@ class ChatGPTWebClient:
                 self.list_url, self.headers = capture_auth(self.cdp_url)
                 save_auth_snapshot(self.list_url, self.headers)
         if response.status_code == 429:
-            retry_after = response.headers.get("retry-after")
-            suffix = f"; retry after {retry_after} seconds" if retry_after else ""
-            raise ChatGPTWebError(f"ChatGPT web rate limit reached{suffix}")
+            raise ChatGPTWebError(
+                rate_limit_message(response.headers.get("retry-after")))
         if response.status_code >= 400:
             raise ChatGPTWebError(
                 f"ChatGPT returned HTTP {response.status_code} for {method} {response.url.path}"
@@ -936,9 +936,8 @@ class ChatGPTWebClient:
                                   write=30.0, pool=30.0),
         ) as response:
             if response.status_code == 429:
-                retry_after = response.headers.get("retry-after")
-                suffix = f"; retry after {retry_after} seconds" if retry_after else ""
-                raise ChatGPTWebError(f"ChatGPT web rate limit reached{suffix}")
+                raise ChatGPTWebError(
+                    rate_limit_message(response.headers.get("retry-after")))
             if response.status_code >= 400:
                 raise ChatGPTWebError(
                     f"ChatGPT submission returned HTTP {response.status_code}"

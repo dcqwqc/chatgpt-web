@@ -401,7 +401,8 @@ until you reach the first/last line. The model and conversation selection
 panels keep their own Up/Down navigation. The CLI reads previous user prompts
 from its private local session history, so recall works after restarting.
 
-When ChatGPT Web returns HTTP 429 with a Retry-After number, the TUI displays
+When ChatGPT Web returns HTTP 429 with a validated Retry-After value
+(seconds or an HTTP date), the TUI displays
 a **live second-by-second countdown** in the failed assistant message and in
 the bottom-right status bar. These are the same server-provided deadline,
 not two independent estimates. Existing messages remain visible while the
