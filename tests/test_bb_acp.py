@@ -276,42 +276,46 @@ class GeneratedMediaTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(bb_acp.generated_media("../etc/passwd"), [])
                 self.assertIn(name, bb_acp.markdown_images([name]))
     
-    async def test_image_only_reply_emits_markdown_in_bb(self):
-        import json
-        with tempfile.TemporaryDirectory() as work:
-            root = Path(work); media=root/"images"; convs=root/"conversations"
-            media.mkdir(); convs.mkdir()
-            cid = "6ae3116a-1fa8-83ed-aa4a-12c775163884"
-            image_id = "file_00000000fb3c81f4aa4a0d784f93834b"
-            image = media / (image_id + ".png")
-            events=[]
-            server=bb_acp.Server()
-            async def emit(obj): events.append(obj)
-            server.emit=emit
-            sid="a"*32
-            server.sessions[sid]={"sessionId":sid,"conversation_id":None,
-                                  "model":"gpt-6","mode":"instant"}
-            with patch.object(bb_acp, "ROOT", root/"sessions"), patch.object(bb_acp,"MEDIA_ROOT",media),patch.object(bb_acp,"CONVERSATION_ROOT",convs),patch.object(bb_acp,"model_capabilities",return_value=source_catalog()):
-                server.catalog()
-                async def fake_exec(*args,**kwargs):
-                    image.write_bytes(b"\x89PNG\r\n\x1a\nrest")
-                    (convs/(cid+".json")).write_text(json.dumps({"media_files":[str(image)]}))
-                    class Process:
-                        def __init__(self):
-                            self.stdout=asyncio.StreamReader()
-                            self.stdout.feed_data(json.dumps({"type":"result","conversation_id":cid}).encode()+b"\n")
-                            self.stdout.feed_eof()
-                            self.stderr=asyncio.StreamReader();self.stderr.feed_eof()
-                            self.returncode=0
-                        async def wait(self):return 0
-                    return Process()
-                with patch.object(bb_acp.asyncio,"create_subprocess_exec",side_effect=fake_exec):
-                    await server.do_prompt(123,sid,[{"type":"text","text":"generate a tree image"}])
-                chunks=[obj["params"]["update"]["content"]["text"] for obj in events if obj.get("method")=="session/update"]
-                self.assertEqual(len(chunks),1)
-                self.assertIn(image_id,chunks[0])
-                self.assertNotIn("no text",chunks[0])
-                self.assertEqual(events[-1]["result"]["stopReason"],"end_turn")
+    async def test_generated_image_emits_once_with_or_without_asset_reference(self):
+        for final_text in ("", '<AsyncImage ref="file_00000000fb3c81f4aa4a0d784f93834b"/>'):
+            import json
+            with tempfile.TemporaryDirectory() as work:
+                root = Path(work); media=root/"images"; convs=root/"conversations"
+                media.mkdir(); convs.mkdir()
+                cid = "6ae3116a-1fa8-83ed-aa4a-12c775163884"
+                image_id = "file_00000000fb3c81f4aa4a0d784f93834b"
+                image = media / (image_id + ".png")
+                events=[]
+                server=bb_acp.Server()
+                async def emit(obj): events.append(obj)
+                server.emit=emit
+                sid="a"*32
+                server.sessions[sid]={"sessionId":sid,"conversation_id":None,
+                                      "model":"gpt-6","mode":"instant"}
+                with patch.object(bb_acp, "ROOT", root/"sessions"), patch.object(bb_acp,"MEDIA_ROOT",media),patch.object(bb_acp,"CONVERSATION_ROOT",convs),patch.object(bb_acp,"model_capabilities",return_value=source_catalog()):
+                    server.catalog()
+                    async def fake_exec(*args,**kwargs):
+                        image.write_bytes(b"\x89PNG\r\n\x1a\nrest")
+                        (convs/(cid+".json")).write_text(json.dumps({"media_files":[str(image)]}))
+                        class Process:
+                            def __init__(self):
+                                self.stdout=asyncio.StreamReader()
+                                replies = ([{"type":"message","role":"assistant","text":final_text}]
+                                           if final_text else []) + [{"type":"result","conversation_id":cid}]
+                                self.stdout.feed_data(("\n".join(json.dumps(reply) for reply in replies)+"\n").encode())
+                                self.stdout.feed_eof()
+                                self.stderr=asyncio.StreamReader();self.stderr.feed_eof()
+                                self.returncode=0
+                            async def wait(self):return 0
+                        return Process()
+                    with patch.object(bb_acp.asyncio,"create_subprocess_exec",side_effect=fake_exec):
+                        await server.do_prompt(123,sid,[{"type":"text","text":"generate a tree image"}])
+                    chunks=[obj["params"]["update"]["content"]["text"] for obj in events if obj.get("method")=="session/update"]
+                    self.assertEqual(len(chunks),1)
+                    self.assertIn(image_id,chunks[0])
+                    self.assertEqual(chunks[0].count(image_id), 1)
+                    self.assertNotIn("no text",chunks[0])
+                    self.assertEqual(events[-1]["result"]["stopReason"],"end_turn")
 
 class ImageFallbackTests(unittest.IsolatedAsyncioTestCase):
     def test_only_explicit_image_intents_trigger_fallback(self):

@@ -120,8 +120,9 @@ def chart_fallback(match: re.Match[str]) -> str:
 # Preserve images with a real source URL. Never invent one from a query.
 IMAGE_SOURCE = re.compile(r'<AsyncImage\b([^<>]*?)/>', re.S)
 BB_IMAGE_ROUTE = re.compile(
-    r'^/api/v1/plugins/image-generation/http/(?:cli-image|worker-image)'
-    r'\?asset=file_[A-Za-z0-9]{12,80}$'
+    r'^/api/v1/plugins/image-generation/http/(?:'
+    r'cli-image\?asset=file_[A-Za-z0-9]{12,80}|'
+    r'worker-image\?asset=[a-f0-9]{32})$'
 )
 
 
@@ -136,10 +137,11 @@ def safe_image_url(source: str) -> str | None:
         return source
     try:
         url = urlsplit(source)
+        port = url.port
     except ValueError:
         return None
     if (url.scheme == 'http' and url.hostname in ('127.0.0.1', 'localhost')
-            and url.port == 38886 and not url.username and not url.password):
+            and port == 38886 and not url.username and not url.password):
         path = url.path + ('?' + url.query if url.query else '')
         return path if BB_IMAGE_ROUTE.fullmatch(path) else None
     if (url.scheme != 'https' or not url.netloc or not url.hostname
@@ -147,21 +149,37 @@ def safe_image_url(source: str) -> str | None:
             or any(c in source for c in ('<', '>', '`', chr(92)))):
         return None
     # Markdown URLs must not contain unescaped parentheses.
-    return source.replace('(', '%28').replace(')', '%29')
+    def escape(value: str) -> str:
+        return value.replace('(', '%28').replace(')', '%29').replace('[', '%5B').replace(']', '%5D')
+    return url._replace(path=escape(url.path), query=escape(url.query),
+                        fragment=escape(url.fragment)).geturl()
 
 
-def image_with_source(match: re.Match[str]) -> str:
+def image_with_source(match: re.Match[str], *, image_assets: frozenset[str] = frozenset()) -> str:
     attributes = match.group(1)
     alt = image_attribute(attributes, 'alt') or 'Image'
     alt = re.sub(r'[\[\]\r\n]', ' ', alt).strip()[:120] or 'Image'
     src = image_attribute(attributes, 'src')
     url = safe_image_url(src) if src else None
+    reference = image_attribute(attributes, 'ref')
+    if not src and reference:
+        asset = re.fullmatch(r'(?:(?:file-service|sediment)://)?(file_[A-Za-z0-9]{12,80})', reference)
+        if asset and asset.group(1) in image_assets:
+            url = '/api/v1/plugins/image-generation/http/cli-image?asset=' + asset.group(1)
     if url:
-        return f'\n\n![{alt}]({url})\n\n'
+        # Keep the image itself clickable by BB's native lightbox. Sources are
+        # separate links rather than anchors that swallow the image click.
+        citation = image_attribute(attributes, 'href')
+        citation_url = safe_image_url(citation) if citation else None
+        source_link = f'\n\n[Image source]({citation_url})' if citation_url else ''
+        return f'\n\n![{alt}]({url}){source_link}\n\n'
     query = image_attribute(attributes, 'query')
     if query:
         description = re.sub(r'[\r\n\[\]]', ' ', query).strip()[:120]
         return f'[Image search unavailable in BB: {description} — view in ChatGPT Web]'
+    if reference:
+        label = re.sub(r'[\r\n\[\]`\\]', ' ', reference).strip()[:100]
+        return f'[Image reference unavailable in BB: {label} — view in ChatGPT Web]'
     return f'[Image source unavailable in BB: {alt}]'
 
 
@@ -184,7 +202,7 @@ def normalize_layout_indentation(fragment: str) -> str:
     return ''.join(lines)
 
 
-def flatten(fragment: str, *, rich_ui: bool = False) -> str:
+def flatten(fragment: str, *, rich_ui: bool = False, image_assets: frozenset[str] = frozenset()) -> str:
     if '<' not in fragment:
         return fragment
     value = normalize_layout_indentation(preserve_progress(fragment, rich_ui=rich_ui))
@@ -192,10 +210,13 @@ def flatten(fragment: str, *, rich_ui: bool = False) -> str:
         value = preserve_metric_rows(preserve_status_badges(value))
     value = re.sub(r'<AppBlock\b[^>]*>.*?</AppBlock>', '[Interactive app — open in ChatGPT Web]', value, flags=re.S)
     value = re.sub(r'<svg\b[^>]*>.*?</svg>', '[Vector image — open in ChatGPT Web]', value, flags=re.S)
-    value = IMAGE_SOURCE.sub(image_with_source, value)
+    # Strip only the gallery container; retain ordered, individually validated
+    # child images. A self-closing group has no explicit child assets to retain.
+    value = re.sub(r'<AsyncImageGroup\b[^>]*?/>', '[Image gallery sources unavailable in BB — view in ChatGPT Web]', value)
+    value = re.sub(r'</?AsyncImageGroup\b[^>]*>', '\n\n', value)
+    value = IMAGE_SOURCE.sub(lambda match: image_with_source(match, image_assets=image_assets), value)
     value = re.sub(r'<Chart\b[^>]*(?:/>|>.*?</Chart>)', chart_fallback, value, flags=re.S)
-    for tag, label in [('AsyncImageGroup','Image gallery'),
-                       ('AsyncVideo','Video'),('MapWidgetV2','Map'),
+    for tag, label in [('AsyncVideo','Video'),('MapWidgetV2','Map'),
                        ('FileNavList','Files')]:
         value = re.sub(r'<'+tag+r'\b[^>]*(?:/>|>.*?</'+tag+r'>)',
                        '['+label+' — open in ChatGPT Web]', value, flags=re.S)
@@ -224,7 +245,15 @@ def flatten(fragment: str, *, rich_ui: bool = False) -> str:
     value = re.sub(r'<icon\b[^>]*\bname="([^"]+)"[^>]*/>',
                    lambda m: {'check':'✓','copy':'⧉','alert-triangle':'!','x':'×'}.get(m.group(1), ''), value)
     value = re.sub(r'<Entity\b[^>]*\bvalue="([^"]+)"[^>]*/>', r'\1', value)
-    value = re.sub(r'<(?:Cite|FileCite|MemoryCite)\b[^>]*/>', '[citation]', value)
+    def citation_link(match: re.Match[str]) -> str:
+        attrs = match.group(1)
+        raw = image_attribute(attrs, 'url') or image_attribute(attrs, 'href')
+        url = safe_image_url(raw) if raw else None
+        label = image_attribute(attrs, 'title') or 'Source'
+        label = re.sub(r'[\[\]\r\n`\\]', ' ', label).strip()[:120] or 'Source'
+        return f'[{label}]({url})' if url else '[Citation target unavailable in BB]'
+    value = re.sub(r'<Cite\b([^>]*)/>', citation_link, value)
+    value = re.sub(r'<(?:FileCite|MemoryCite)\b[^>]*/>', '[Citation target unavailable in BB]', value)
     value = re.sub(r'<divider\b[^>]*/>', '\n---\n', value)
     value = re.sub(r'<table-row\b[^>]*>', '\n• ', value)
     value = re.sub(r'<table-cell\b[^>]*>', '  |  ', value)
@@ -235,7 +264,7 @@ def flatten(fragment: str, *, rich_ui: bool = False) -> str:
     return re.sub(r'\n{4,}', '\n\n\n', value)
 
 
-def render_web_elements(text: str, *, rich_ui: bool = False) -> str:
+def render_web_elements(text: str, *, rich_ui: bool = False, image_assets: frozenset[str] = frozenset()) -> str:
     """Format rich ChatGPT text; preserve fenced and inline code verbatim."""
     if '<' not in text:
         return text
@@ -244,6 +273,13 @@ def render_web_elements(text: str, *, rich_ui: bool = False) -> str:
         if protected:
             result.append(chunk)
         else:
-            result.extend(flatten(part, rich_ui=rich_ui) if n % 2 == 0 else part
+            result.extend(flatten(part, rich_ui=rich_ui, image_assets=image_assets) if n % 2 == 0 else part
                           for n, part in enumerate(INLINE.split(chunk)))
     return ''.join(result)
+
+
+def embedded_image_assets(text: str) -> frozenset[str]:
+    """Find rendered local image links, excluding fenced/inline source examples."""
+    pattern = re.compile(r'!\[[^\n]*?\]\(/api/v1/plugins/image-generation/http/cli-image\?asset=(file_[A-Za-z0-9]{12,80})\)')
+    return frozenset(match.group(1) for protected, chunk in protected_segments(text)
+                     if not protected for match in pattern.finditer(chunk))

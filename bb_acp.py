@@ -21,7 +21,7 @@ import uuid
 from typing import Any
 
 from cooldown import retry_after_seconds
-from web_content import render_web_elements
+from web_content import render_web_elements, embedded_image_assets
 # Enabled only after BB's native directive component was installed and checked.
 RICH_UI_READY = Path.home() / ".local/state/chatgpt-web/bb-native-rich-ui-ready"
 
@@ -503,7 +503,10 @@ class Server:
 
     async def update(self, sid: str, text: str):
         if text:
-            text = render_web_elements(text, rich_ui=RICH_UI_READY.is_file())
+            text = render_web_elements(text, rich_ui=RICH_UI_READY.is_file(),
+                                       image_assets=(frozenset(generated_media(
+                                           self.sessions.get(sid, {}).get("conversation_id")))
+                                           if "<AsyncImage" in text else frozenset()))
             await self.emit({"jsonrpc": "2.0", "method": "session/update",
                              "params": {"sessionId": sid,
                                         "update": {"sessionUpdate": "agent_message_chunk",
@@ -641,6 +644,7 @@ class Server:
             raise RuntimeError("Could not load ChatGPT Web history: "
                                + err.decode("utf8", "replace")[:400])
         conversation = json.loads(out)
+        image_assets = frozenset(generated_media(conversation_id))
         for msg in conversation.get("messages", []):
             if not isinstance(msg, dict):
                 continue
@@ -651,7 +655,8 @@ class Server:
             if not isinstance(content, str) or not content:
                 continue
             if role == "assistant":
-                content = render_web_elements(content, rich_ui=RICH_UI_READY.is_file())
+                content = render_web_elements(content, rich_ui=RICH_UI_READY.is_file(),
+                                              image_assets=image_assets)
             await self.emit({"jsonrpc": "2.0", "method": "session/update",
                              "params": {"sessionId": sid, "update": {
                                  "sessionUpdate": ("user_message_chunk"
@@ -1091,8 +1096,12 @@ class Server:
                     call_id = activity_prefix + "-tool-" + hashlib.sha256(raw_id.encode()).hexdigest()[:12]
                     title = activity_titles[raw_id]
                 await self.activity(sid, call_id, title, status="completed")
-            fresh_images = [image for image in generated_media(session.get("conversation_id"))
-                            if image not in previous_images]
+            available_images = generated_media(session.get("conversation_id"))
+            embedded = embedded_image_assets(render_web_elements(
+                canonical, rich_ui=RICH_UI_READY.is_file(),
+                image_assets=frozenset(available_images)))
+            fresh_images = [image for image in available_images
+                            if image not in previous_images and image not in embedded]
             if fresh_images:
                 await self.update(sid, markdown_images(fresh_images))
             elif not rendered.strip() and not final.strip():
