@@ -439,7 +439,8 @@ class Server:
                              "toolCallId": call_id, "title": title[:240],
                              "kind": kind, "status": status,
                              **({"content": [{"type": "content", "content":
-                                  {"type": "text", "text": detail[:12000]}}]}
+                                  {"type": "text", "text": detail[:12000]}}],
+                                 "rawInput": detail[:4000]}
                                 if detail else {})}}})
 
     def catalog(self):
