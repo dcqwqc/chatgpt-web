@@ -22,9 +22,11 @@ PROGRESS_TRACK = re.compile(
 LAYOUT_TAG = re.compile(r'</?(?:box|row|col|grid|grid-item|flow|flow-item|card)\b[^>]*>')
 
 
-def preserve_progress(fragment: str) -> str:
+def preserve_progress(fragment: str, *, rich_ui: bool = False) -> str:
     def substitute(match: re.Match[str]) -> str:
         percent = min(100, max(0, int(match.group(1))))
+        if rich_ui:
+            return '\n\n::chatgpt-progress{value="' + str(percent) + '"}\n\n'
         filled = round(percent * 16 / 100)
         return '\n' + '━' * filled + '─' * (16 - filled) + '\n'
     return PROGRESS_TRACK.sub(substitute, fragment)
@@ -49,10 +51,10 @@ def normalize_layout_indentation(fragment: str) -> str:
     return ''.join(lines)
 
 
-def flatten(fragment: str) -> str:
+def flatten(fragment: str, *, rich_ui: bool = False) -> str:
     if '<' not in fragment:
         return fragment
-    value = normalize_layout_indentation(preserve_progress(fragment))
+    value = normalize_layout_indentation(preserve_progress(fragment, rich_ui=rich_ui))
     value = re.sub(r'<AppBlock\b[^>]*>.*?</AppBlock>', '[Interactive app — open in ChatGPT Web]', value, flags=re.S)
     value = re.sub(r'<svg\b[^>]*>.*?</svg>', '[Vector image — open in ChatGPT Web]', value, flags=re.S)
     for tag, label in [('AsyncImage','Image'),('AsyncImageGroup','Image gallery'),
@@ -96,7 +98,7 @@ def flatten(fragment: str) -> str:
     return re.sub(r'\n{4,}', '\n\n\n', value)
 
 
-def render_web_elements(text: str) -> str:
+def render_web_elements(text: str, *, rich_ui: bool = False) -> str:
     """Format rich ChatGPT text; preserve fenced and inline code verbatim."""
     if '<' not in text:
         return text
@@ -104,7 +106,7 @@ def render_web_elements(text: str) -> str:
     end = 0
     for fence in PROTECTED.finditer(text):
         before = text[end:fence.start()]
-        result.extend(flatten(chunk) if n % 2 == 0 else chunk
+        result.extend(flatten(chunk, rich_ui=rich_ui) if n % 2 == 0 else chunk
                       for n, chunk in enumerate(INLINE.split(before)))
         raw = fence.group()
         if raw.startswith("<CodeBlock"):
@@ -116,6 +118,6 @@ def render_web_elements(text: str) -> str:
         else:
             result.append(raw)
         end = fence.end()
-    result.extend(flatten(chunk) if n % 2 == 0 else chunk
+    result.extend(flatten(chunk, rich_ui=rich_ui) if n % 2 == 0 else chunk
                   for n, chunk in enumerate(INLINE.split(text[end:])))
     return ''.join(result)

@@ -58,6 +58,19 @@ class RichContentTests(unittest.TestCase):
         self.assertNotIn('    **4.06 s**', rendered)
         self.assertNotIn('<box', rendered)
 
+    def test_native_progress_directive_only_when_explicitly_enabled(self):
+        source = ('<box background="surface-tertiary" height="8px" radius="full" clip>'
+                  '<box width="73%" height="100%" background="success-solid"/>'
+                  '</box>')
+        self.assertEqual(render_web_elements(source, rich_ui=True).strip(),
+                         '::chatgpt-progress{value="73"}')
+        self.assertIn('━━━━', render_web_elements(source))
+
+    def test_directive_not_inserted_inside_fenced_source(self):
+        example = ('```jsx\n<box background="surface-tertiary" height="8px" radius="full" clip>'
+                   '<box width="73%" background="success-solid"/></box>\n```')
+        self.assertEqual(render_web_elements(example, rich_ui=True), example)
+
     def test_layout_normalization_does_not_change_indented_code_outside_layout(self):
         source = '<row>\n  A paragraph\n</row>\n\n    a = 1\n    b = 2'
         rendered = render_web_elements(source)

@@ -22,6 +22,9 @@ from typing import Any
 
 from cooldown import retry_after_seconds
 from web_content import render_web_elements
+# Enabled only after BB's native directive component was installed and checked.
+RICH_UI_READY = Path.home() / ".local/state/chatgpt-web/bb-native-rich-ui-ready"
+
 from maintenance.verified_recovery import verified_final
 from maintenance.source_activity import observe_source
 from maintenance.bb_retry_guard import original_prompt_for_retry
@@ -463,7 +466,7 @@ class Server:
 
     async def update(self, sid: str, text: str):
         if text:
-            text = render_web_elements(text)
+            text = render_web_elements(text, rich_ui=RICH_UI_READY.is_file())
             await self.emit({"jsonrpc": "2.0", "method": "session/update",
                              "params": {"sessionId": sid,
                                         "update": {"sessionUpdate": "agent_message_chunk",
@@ -611,7 +614,7 @@ class Server:
             if not isinstance(content, str) or not content:
                 continue
             if role == "assistant":
-                content = render_web_elements(content)
+                content = render_web_elements(content, rich_ui=RICH_UI_READY.is_file())
             await self.emit({"jsonrpc": "2.0", "method": "session/update",
                              "params": {"sessionId": sid, "update": {
                                  "sessionUpdate": ("user_message_chunk"

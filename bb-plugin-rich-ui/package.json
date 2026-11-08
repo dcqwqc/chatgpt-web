@@ -1,0 +1,26 @@
+{
+  "name": "bb-plugin-chatgpt-rich-ui",
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "bb": ">=0.48",
+    "bbPluginSdk": ">=0.6.94"
+  },
+  "bb": {
+    "name": "ChatGPT Rich UI",
+    "description": "Render ChatGPT progress indicators inside BB messages using BB native design tokens.",
+    "branding": {
+      "icon": "ChartNoAxesColumn"
+    },
+    "app": "./app.tsx",
+    "server": "./server.ts"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.94",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "typescript": "^5.7.0"
+  }
+}
