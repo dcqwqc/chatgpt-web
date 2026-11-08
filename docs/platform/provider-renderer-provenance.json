@@ -1,0 +1,24 @@
+{
+  "upstream": "https://github.com/get-bb/bb.git",
+  "baseTag": "desktop-v0.48.0",
+  "baseSha": "1a4a1d254c7b1f70d340ef9c800dad77dbeb8e66",
+  "candidateSha": "912572faee1fd17ace5ac1a98b2ea5699543895f",
+  "patchSha256": "10e833386a6d34c3e80a1ff0ced204b0361109231032fc37e7966fd06d7e31d0",
+  "patchAppliesToBase": true,
+  "appAndSdkTypecheck": "passed",
+  "targetedTestsPassed": 36,
+  "sourceScreenshots": 8,
+  "sourceViewportWidths": [
+    520,
+    1500
+  ],
+  "sourceThemes": [
+    "light",
+    "dark"
+  ],
+  "productionBuild": "not run",
+  "deployed": false,
+  "published": false,
+  "nativePairedCapture": "blocked: connected isolated graphical route rejects remote clients",
+  "nativeExactParity": "not accepted"
+}

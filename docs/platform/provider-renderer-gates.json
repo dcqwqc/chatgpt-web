@@ -1,0 +1,8 @@
+[
+  {"name":"Provider registration and source call sites","requirement":"Explicit provider/surface, no wildcard or permission controls; Original fallback"},
+  {"name":"Stream identity","requirement":"Retain plugin and Original state through snapshot replacements and nonstreaming transition"},
+  {"name":"Group safety","requirement":"Both bundle and step all-tool groups supported; mixed approval groups stay core-owned"},
+  {"name":"Isolation","requirement":"Untargeted provider text/styles and Original code font unchanged at all four width/theme combinations"},
+  {"name":"Host adoption","requirement":"Independent source review, exact custom build and isolated live verification before deployment"},
+  {"name":"Native parity","requirement":"Authorized matched native captures, streaming/interruption and independent exact comparison"}
+]

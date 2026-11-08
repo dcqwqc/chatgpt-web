@@ -1,0 +1,1306 @@
+From 912572faee1fd17ace5ac1a98b2ea5699543895f Mon Sep 17 00:00:00 2001
+From: Higan Studio <admin@higan.studio>
+Date: Sun, 8 Nov 2026 14:27:59 +0100
+Subject: [PATCH] feat(app): add opt-in provider-scoped message and tool header
+ renderer
+
+---
+ apps/app/qa/provider-renderer/README.md       |  34 +++
+ apps/app/qa/provider-renderer/capture.py      |  44 ++++
+ apps/app/qa/provider-renderer/index.html      |  11 +
+ apps/app/qa/provider-renderer/main.tsx        | 114 ++++++++++
+ apps/app/qa/provider-renderer/style.css       |  40 ++++
+ apps/app/qa/provider-renderer/vite.config.ts  |  16 ++
+ .../timeline/ConversationMessageContent.tsx   |  16 +-
+ .../thread/timeline/ExpandableTimelineRow.tsx |  40 ++--
+ .../timeline/ProviderContentRenderer.test.tsx | 206 ++++++++++++++++++
+ .../timeline/ProviderContentRenderer.tsx      |  70 ++++++
+ .../thread/timeline/ProviderToolHeader.tsx    |  43 ++++
+ .../ThreadTimelineRows.presentation.test.tsx  |  57 +++++
+ .../thread/timeline/ThreadTimelineRows.tsx    |  24 +-
+ apps/app/src/lib/plugin-slots.ts              |  12 +-
+ .../lib/provider-renderer-resolution.test.ts  |  93 ++++++++
+ .../src/lib/provider-renderer-resolution.ts   |  14 ++
+ docs/api_to_audit.md                          |  24 ++
+ packages/plugin-sdk/src/app-contract.ts       |  34 +++
+ .../plugin-app-registration-collector.ts      |  30 +++
+ packages/plugin-sdk/src/testing/app.tsx       |   6 +-
+ plugins/plugin-api-docs/src/surfaces.ts       |  17 ++
+ 21 files changed, 917 insertions(+), 28 deletions(-)
+ create mode 100644 apps/app/qa/provider-renderer/README.md
+ create mode 100644 apps/app/qa/provider-renderer/capture.py
+ create mode 100644 apps/app/qa/provider-renderer/index.html
+ create mode 100644 apps/app/qa/provider-renderer/main.tsx
+ create mode 100644 apps/app/qa/provider-renderer/style.css
+ create mode 100644 apps/app/qa/provider-renderer/vite.config.ts
+ create mode 100644 apps/app/src/components/thread/timeline/ProviderContentRenderer.test.tsx
+ create mode 100644 apps/app/src/components/thread/timeline/ProviderContentRenderer.tsx
+ create mode 100644 apps/app/src/components/thread/timeline/ProviderToolHeader.tsx
+ create mode 100644 apps/app/src/lib/provider-renderer-resolution.test.ts
+ create mode 100644 apps/app/src/lib/provider-renderer-resolution.ts
+
+diff --git a/apps/app/qa/provider-renderer/README.md b/apps/app/qa/provider-renderer/README.md
+new file mode 100644
+index 0000000..94a5fa8
+--- /dev/null
++++ b/apps/app/qa/provider-renderer/README.md
+@@ -0,0 +1,34 @@
++# Provider renderer source fixture
++
++This fixture renders real BB source components and the new registration path.
++It is not a deployed host, an actual tool execution, or a native ChatGPT capture.
++The synthetic message/tool rows are identical across provider contexts. Only the
++explicitly opted-in provider receives demo typography and tool header content.
++The chosen typography is demonstrative, not an asserted native measurement.
++
++From the repository root, install locked dependencies, then use Turbo for types:
++`pnpm exec turbo run typecheck --filter=@bb/app --filter=@get-bb/plugin-sdk`.
++Start only the fixture: `pnpm --filter @bb/app exec vite --config
++qa/provider-renderer/vite.config.ts`. It binds loopback on 4189 with no production
++API proxy. Supply `--port` if needed and pass its URL to the capture runner.
++
++With Python Playwright and a Chromium executable already installed, run:
++`python3 apps/app/qa/provider-renderer/capture.py --chromium "$CHROMIUM"
++--out "$EVIDENCE"`. The runner captures actual source UI at 520/1500 CSS px,
++DPR 1, light/dark, enabled/disabled. It waits for fonts, checks horizontal overflow,
++compares the untargeted provider's content/styles, verifies unchanged message text
++and code font, and measures changed heading styles. It blocks API requests and
++never sends a prompt. No preferences or production service state are changed.
++
++The standard orchestration test entry is `pnpm exec turbo run test
++--filter=@bb/app -- --run src/lib/provider-renderer-resolution.test.ts
++src/components/thread/timeline/ProviderContentRenderer.test.tsx`. Its native
++module prerequisite can be expensive on a fresh worktree. For deliberate
++no-database test investigation, use `pnpm --filter @bb/app exec vitest run
++--config vitest.config.ts` with those same paths and the existing streaming,
++row-presentation, disclosure and provider-context test files.
++
++The API declaration, registration validation, host resolution and real message/
++row call sites are all source changes. No vendor distribution file is patched.
++Source tests do not prove deployment, ACP revision support, native typography or
++whole-timeline equality. Stop only this fixture server when finished.
+diff --git a/apps/app/qa/provider-renderer/capture.py b/apps/app/qa/provider-renderer/capture.py
+new file mode 100644
+index 0000000..e522a1d
+--- /dev/null
++++ b/apps/app/qa/provider-renderer/capture.py
+@@ -0,0 +1,44 @@
++import argparse, asyncio, json
++from pathlib import Path
++from playwright.async_api import async_playwright
++async def main(args):
++ out=Path(args.out);out.mkdir(exist_ok=True)
++ report={'surface':'isolated BB 0.48.0 source fixture, not deployed and not native ChatGPT','results':[],'errors':[]}
++ async with async_playwright() as p:
++  browser=await p.chromium.launch(executable_path=args.chromium,args=['--no-sandbox'])
++  try:
++   for width in (520,1500):
++    for theme in ('light','dark'):
++     for enabled in (0,1):
++      page=await browser.new_page(viewport={'width':width,'height':1200},color_scheme=theme,device_scale_factor=1)
++      page.on('pageerror',lambda err:report['errors'].append(str(err)))
++      await page.route('**/api/v1/**',lambda route:route.abort())
++      await page.goto(f'{args.url.rstrip("/")}/qa/provider-renderer/index.html?theme={theme}&enabled={enabled}',wait_until='domcontentloaded',timeout=60000)
++      await page.locator('[data-provider="codex"] h2').wait_for(timeout=60000)
++      await page.evaluate('document.fonts.ready')
++      data=await page.locator('main').evaluate('''el=>({width:innerWidth,scrollWidth:document.documentElement.scrollWidth,providers:[...el.querySelectorAll('[data-provider]')].map(s=>({provider:s.dataset.provider,headings:[...s.querySelectorAll('h2,h3')].map(h=>({tag:h.tagName,text:h.textContent,fontSize:getComputedStyle(h).fontSize,marginTop:getComputedStyle(h).marginTop,marginBottom:getComputedStyle(h).marginBottom})),bodyFont:getComputedStyle(s.querySelector('p')).fontSize,fontFamily:getComputedStyle(s.querySelector('p')).fontFamily,codeFont:getComputedStyle(s.querySelector('code')).fontSize,messageText:s.querySelector('[data-message-column]').textContent,text:s.textContent}))})''')
++      data.update(theme=theme,enabled=bool(enabled));report['results'].append(data)
++      assert data['scrollWidth']<=width,data
++      assert len(data['providers'])==2,data
++      await page.locator('main').screenshot(path=str(out/f'source-{width}-{theme}-{enabled}.png'))
++      await page.close()
++  finally:
++   await browser.close();(out/'report.json').write_text(json.dumps(report,indent=2))
++parser=argparse.ArgumentParser()
++parser.add_argument('--chromium',required=True)
++parser.add_argument('--out',required=True)
++parser.add_argument('--url',default='http://127.0.0.1:4189')
++args=parser.parse_args()
++asyncio.run(main(args))
++r=json.loads((Path(args.out)/'report.json').read_text())
++assert not r['errors'],r['errors']
++for w in (520,1500):
++ for theme in ('light','dark'):
++  pair=[v for v in r['results'] if v['width']==w and v['theme']==theme]
++  assert len(pair)==2
++  before,after=pair
++  assert before['providers'][1]==after['providers'][1], 'Codex changed'
++  assert before['providers'][0]['messageText']==after['providers'][0]['messageText'], 'Source content changed'
++  assert before['providers'][0]['codeFont']==after['providers'][0]['codeFont'], 'Original code font changed'
++  assert before['providers'][0]['headings'][0]['fontSize']=='15px'
++  assert after['providers'][0]['headings'][0]['fontSize']=='20px'
+diff --git a/apps/app/qa/provider-renderer/index.html b/apps/app/qa/provider-renderer/index.html
+new file mode 100644
+index 0000000..7eb55be
+--- /dev/null
++++ b/apps/app/qa/provider-renderer/index.html
+@@ -0,0 +1,11 @@
++<!doctype html>
++<html>
++  <head>
++    <meta charset="utf-8" />
++    <meta name="viewport" content="width=device-width,initial-scale=1" />
++  </head>
++  <body>
++    <div id="root"></div>
++    <script type="module" src="/qa/provider-renderer/main.tsx"></script>
++  </body>
++</html>
+diff --git a/apps/app/qa/provider-renderer/main.tsx b/apps/app/qa/provider-renderer/main.tsx
+new file mode 100644
+index 0000000..17378ac
+--- /dev/null
++++ b/apps/app/qa/provider-renderer/main.tsx
+@@ -0,0 +1,114 @@
++import { useState } from "react";
++import { createRoot } from "react-dom/client";
++import { MemoryRouter } from "react-router-dom";
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import type { ExperimentalProviderRendererProps } from "@get-bb/plugin-sdk";
++import { ThreadTimelineRows } from "../../src/components/thread/timeline/ThreadTimelineRows";
++import { ThreadProviderContext } from "../../src/components/thread/thread-provider-context";
++import { RouteNavigationProvider } from "../../src/components/ui/app-route-anchor";
++import { ThreadTitleMentionResourcesProvider } from "../../src/components/thread/ThreadTitleMentions";
++import { setPluginSlotRegistrations } from "../../src/lib/plugin-slots";
++import { makePluginRegistrationSet } from "../../src/test/fixtures/plugins";
++import {
++  conversationRow,
++  toolRow,
++} from "../../src/test/fixtures/thread-timeline-rows";
++import "@bb/shared-ui/icon-extended";
++import "../../src/app.css";
++import "./style.css";
++
++const parameters = new URLSearchParams(location.search);
++document.documentElement.classList.toggle(
++  "dark",
++  parameters.get("theme") === "dark",
++);
++const message =
++  "## Results\n\nI inspected the current thread and service status.\n\n**Implemented and verified:** The same content renders through a provider-scoped host extension.\n\n```python\nprint('Readiness verified')\n```\n\n### What remains\n\n- Matched native capture\n- Independent exact comparison";
++function Renderer({ content, Original }: ExperimentalProviderRendererProps) {
++  return content.surface === "assistant-message" ? (
++    <div className="provider-demo-prose">
++      <Original />
++    </div>
++  ) : (
++    <span className="provider-demo-tool">
++      Tool activity · <Original />
++    </span>
++  );
++}
++if (parameters.get("enabled") === "1")
++  setPluginSlotRegistrations(
++    "qa-provider-renderer",
++    makePluginRegistrationSet({
++      providerRenderers: (
++        ["assistant-message", "tool-header", "tool-group-header"] as const
++      ).map((surface) => ({
++        id: surface,
++        providerId: "acp-chatgpt-web",
++        surface,
++        component: Renderer,
++      })),
++    }),
++  );
++function Stage({ providerId }: { providerId: string }) {
++  const [rows] = useState(() => [
++    toolRow({
++      id: "tool-one",
++      threadId: "qa-thread",
++      turnId: "qa-turn",
++      toolName: "Inspect current thread",
++      toolArgs: { scope: "fixture" },
++      output: "Verified local fixture",
++    }),
++    toolRow({
++      id: "tool-two",
++      threadId: "qa-thread",
++      turnId: "qa-turn",
++      toolName: "Read service status",
++      toolArgs: { scope: "fixture" },
++      output: "No production request made",
++    }),
++    conversationRow({
++      id: "same-message",
++      threadId: "qa-thread",
++      turnId: "qa-turn",
++      role: "assistant",
++      text: message,
++    }),
++  ]);
++  return (
++    <ThreadProviderContext.Provider value={{ providerId, pluginId: null }}>
++      <section data-provider={providerId}>
++        <h1>{providerId}</h1>
++        <ThreadTimelineRows
++          threadId="qa-thread"
++          threadRuntimeDisplayStatus="idle"
++          timelineRows={rows}
++          workspaceRootPath={undefined}
++        />
++      </section>
++    </ThreadProviderContext.Provider>
++  );
++}
++createRoot(document.getElementById("root")!).render(
++  <QueryClientProvider
++    client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
++  >
++    <MemoryRouter>
++      <RouteNavigationProvider>
++        <ThreadTitleMentionResourcesProvider
++          sectionNamesById={new Map()}
++          projectNamesById={new Map()}
++          threadById={new Map()}
++        >
++          <main>
++            <p>
++              BB source fixture · not deployed · not a native ChatGPT capture
++            </p>
++            <Stage providerId="acp-chatgpt-web" />
++            <Stage providerId="codex" />
++          </main>
++        </ThreadTitleMentionResourcesProvider>
++      </RouteNavigationProvider>
++    </MemoryRouter>
++  </QueryClientProvider>,
++);
+diff --git a/apps/app/qa/provider-renderer/style.css b/apps/app/qa/provider-renderer/style.css
+new file mode 100644
+index 0000000..3aae5b2
+--- /dev/null
++++ b/apps/app/qa/provider-renderer/style.css
+@@ -0,0 +1,40 @@
++@source "./main.tsx";
++body {
++  margin: 0;
++  overflow: auto;
++  background: var(--background);
++  color: var(--foreground);
++}
++main {
++  max-width: 48rem;
++  padding: 1.5rem;
++  margin-inline: auto;
++}
++section {
++  margin-block: 1.5rem;
++  min-width: 0;
++}
++h1 {
++  margin-block: 1rem;
++  font-size: var(--text-base);
++}
++.provider-demo-prose {
++  font-size: var(--text-base);
++  line-height: var(--text-base--line-height);
++}
++.provider-demo-prose h2 {
++  font-size: var(--text-xl);
++  margin-block: 1.5rem 0.75rem;
++}
++.provider-demo-prose h3 {
++  font-size: var(--text-lg);
++  margin-block: 1.25rem 0.5rem;
++}
++.provider-demo-tool {
++  font-size: var(--text-sm);
++  color: var(--muted-foreground);
++}
++.provider-demo-prose :where(p, li) {
++  font-size: var(--text-base);
++  line-height: var(--text-base--line-height);
++}
+diff --git a/apps/app/qa/provider-renderer/vite.config.ts b/apps/app/qa/provider-renderer/vite.config.ts
+new file mode 100644
+index 0000000..770139d
+--- /dev/null
++++ b/apps/app/qa/provider-renderer/vite.config.ts
+@@ -0,0 +1,16 @@
++import { defineConfig } from "vite";
++import react from "@vitejs/plugin-react";
++import tailwindcss from "@tailwindcss/vite";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++const app = fileURLToPath(new URL("../../", import.meta.url));
++export default defineConfig({
++  root: app,
++  plugins: [react(), tailwindcss()],
++  resolve: {
++    conditions: ["source"],
++    dedupe: ["react", "react-dom"],
++    alias: { "@": path.join(app, "src") },
++  },
++  server: { host: "127.0.0.1", port: 4189, strictPort: true },
++});
+diff --git a/apps/app/src/components/thread/timeline/ConversationMessageContent.tsx b/apps/app/src/components/thread/timeline/ConversationMessageContent.tsx
+index 3b0eb1a..a5f0f29 100644
+--- a/apps/app/src/components/thread/timeline/ConversationMessageContent.tsx
++++ b/apps/app/src/components/thread/timeline/ConversationMessageContent.tsx
+@@ -1,3 +1,4 @@
++import { ProviderContentRenderer } from "./ProviderContentRenderer.js";
+ import {
+   useLayoutEffect,
+   useMemo,
+@@ -604,7 +605,7 @@ function AssistantConversationMessage({
+     () => ({ id, threadId, turnId, projectId: projectId ?? null }),
+     [id, threadId, turnId, projectId],
+   );
+-  const markdown = (
++  const originalMarkdown = (
+     <>
+       <MarkdownPreview
+         allowHtml
+@@ -636,6 +637,19 @@ function AssistantConversationMessage({
+     </>
+   );
+
++  const markdown = (
++    <ProviderContentRenderer
++      content={{
++        surface: "assistant-message",
++        message: codeFenceMessage,
++        text,
++        streaming,
++      }}
++    >
++      {originalMarkdown}
++    </ProviderContentRenderer>
++  );
++
+   return (
+     <div
+       className={cn(
+diff --git a/apps/app/src/components/thread/timeline/ExpandableTimelineRow.tsx b/apps/app/src/components/thread/timeline/ExpandableTimelineRow.tsx
+index a7daf57..1d885af 100644
+--- a/apps/app/src/components/thread/timeline/ExpandableTimelineRow.tsx
++++ b/apps/app/src/components/thread/timeline/ExpandableTimelineRow.tsx
+@@ -40,6 +40,7 @@ interface ExpandableTimelineRowProps {
+   renderBody: () => ReactNode;
+   title: TimelineTitle;
+   titleContent?: ReactNode;
++  renderHeaderContent?: (original: ReactNode) => ReactNode;
+   collapsedPreview?: ReactNode;
+   expandable?: boolean;
+   horizontalPadding?: TimelineRowHorizontalPadding;
+@@ -141,6 +142,7 @@ function ExpandableTimelineRowComponent({
+   terminalAutoExpanded = false,
+   title,
+   titleContent,
++  renderHeaderContent,
+ }: ExpandableTimelineRowProps) {
+   const [manualExpansionOverride, setManualExpansionOverride] =
+     useTimelineReasoningExpansion(reasoningExpansionKey);
+@@ -208,6 +210,25 @@ function ExpandableTimelineRowComponent({
+     [],
+   );
+
++  const originalHeader = (
++    <span
++      className={cn(
++        "inline-flex min-w-0 max-w-full items-center gap-1.5",
++        summaryClassName,
++      )}
++    >
++      <TimelineLeadingIcon
++        icon={leadingIcon}
++        fallback={leadingIconFallback}
++        iconUrl={leadingIconUrl}
++        style={leadingIconStyle}
++      />
++      {titleContent ?? (
++        <TimelineTitleView title={title} onTitleAction={onTitleAction} />
++      )}
++    </span>
++  );
++
+   return (
+     <ExpandablePanel
+       animate={manualExpansionOverride !== null || forceExpanded}
+@@ -248,22 +269,9 @@ function ExpandableTimelineRowComponent({
+         ) : null
+       }
+       summaryContent={
+-        <span
+-          className={cn(
+-            "inline-flex min-w-0 max-w-full items-center gap-1.5",
+-            summaryClassName,
+-          )}
+-        >
+-          <TimelineLeadingIcon
+-            icon={leadingIcon}
+-            fallback={leadingIconFallback}
+-            iconUrl={leadingIconUrl}
+-            style={leadingIconStyle}
+-          />
+-          {titleContent ?? (
+-            <TimelineTitleView title={title} onTitleAction={onTitleAction} />
+-          )}
+-        </span>
++        renderHeaderContent
++          ? renderHeaderContent(originalHeader)
++          : originalHeader
+       }
+       summaryContentClassName={TIMELINE_ROW_HEADER_CONTENT_CLASS_NAME}
+       forceHeaderChevronVisible={
+diff --git a/apps/app/src/components/thread/timeline/ProviderContentRenderer.test.tsx b/apps/app/src/components/thread/timeline/ProviderContentRenderer.test.tsx
+new file mode 100644
+index 0000000..301924a
+--- /dev/null
++++ b/apps/app/src/components/thread/timeline/ProviderContentRenderer.test.tsx
+@@ -0,0 +1,206 @@
++// @vitest-environment jsdom
++import { useEffect, useState } from "react";
++import { cleanup, fireEvent, render, screen } from "@testing-library/react";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import type {
++  ExperimentalProviderRendererContent,
++  ExperimentalProviderRendererProps,
++} from "@get-bb/plugin-sdk";
++import { ProviderContentRenderer } from "./ProviderContentRenderer";
++import { ProviderToolHeader } from "./ProviderToolHeader";
++import { ExpandableTimelineRow } from "./ExpandableTimelineRow";
++import { ThreadProviderContext } from "../thread-provider-context";
++import { resetAllCrashedPluginSlotsForTest } from "../../plugin/PluginSlotMount";
++import {
++  resetPluginSlotStoreForTest,
++  setPluginSlotRegistrations,
++} from "@/lib/plugin-slots";
++import { makePluginRegistrationSet } from "@/test/fixtures/plugins";
++import { toolRow, approvalRow } from "@/test/fixtures/thread-timeline-rows";
++import { buildTimelineRowTitle } from "@bb/thread-view";
++
++const message = {
++  id: "message",
++  threadId: "thread",
++  turnId: "turn",
++  projectId: null,
++};
++const mounts = vi.fn();
++function Renderer({ content, Original }: ExperimentalProviderRendererProps) {
++  const [count, setCount] = useState(0);
++  useEffect(() => {
++    mounts();
++  }, []);
++  return (
++    <section>
++      <button onClick={() => setCount(count + 1)}>local {count}</button>
++      <span data-testid="snapshot">{JSON.stringify(content)}</span>
++      <Original />
++    </section>
++  );
++}
++function OriginalChild({ text }: { text: string }) {
++  const [count, setCount] = useState(0);
++  return (
++    <button onClick={() => setCount(count + 1)}>
++      {text} {count}
++    </button>
++  );
++}
++function view(
++  text: string,
++  streaming: boolean,
++  providerId = "acp-chatgpt-web",
++) {
++  const content: ExperimentalProviderRendererContent = {
++    surface: "assistant-message",
++    message,
++    text,
++    streaming,
++  };
++  return (
++    <ThreadProviderContext.Provider value={{ providerId, pluginId: null }}>
++      <ProviderContentRenderer content={content}>
++        <OriginalChild text={text} />
++      </ProviderContentRenderer>
++    </ThreadProviderContext.Provider>
++  );
++}
++function install(
++  component = Renderer,
++  surface:
++    | "assistant-message"
++    | "tool-header"
++    | "tool-group-header" = "assistant-message",
++) {
++  setPluginSlotRegistrations(
++    "visual",
++    makePluginRegistrationSet({
++      providerRenderers: [
++        { id: "native", providerId: "acp-chatgpt-web", surface, component },
++      ],
++    }),
++  );
++}
++afterEach(() => {
++  cleanup();
++  resetPluginSlotStoreForTest();
++  resetAllCrashedPluginSlotsForTest();
++  vi.restoreAllMocks();
++  mounts.mockClear();
++});
++
++describe("provider renderer identity and fallback", () => {
++  it("retains plugin and Original state through snapshots, replacements and interrupted completion", () => {
++    install();
++    const v = render(view("draft", true));
++    fireEvent.click(screen.getByText("local 0"));
++    fireEvent.click(screen.getByText("draft 0"));
++    v.rerender(view("replaced", true));
++    expect(screen.getByText("local 1")).toBeDefined();
++    expect(screen.getByText("replaced 1")).toBeDefined();
++    v.rerender(view("interrupted", false));
++    expect(screen.getByText("interrupted 1")).toBeDefined();
++    expect(mounts).toHaveBeenCalledTimes(1);
++    expect(screen.getByTestId("snapshot").textContent).toContain(
++      '"streaming":false',
++    );
++  });
++  it("delegates on absent or mismatched provider and on a throwing renderer, then recovers on a new snapshot", () => {
++    install();
++    render(view("other", false, "codex"));
++    expect(screen.getByText("other 0")).toBeDefined();
++    expect(screen.queryByTestId("snapshot")).toBeNull();
++    cleanup();
++    resetPluginSlotStoreForTest();
++    function Broken(props: ExperimentalProviderRendererProps) {
++      if (
++        props.content.surface === "assistant-message" &&
++        props.content.text === "broken"
++      )
++        throw new Error("bad renderer");
++      return <props.Original />;
++    }
++    install(Broken);
++    vi.spyOn(console, "error").mockImplementation(() => {});
++    vi.spyOn(console, "warn").mockImplementation(() => {});
++    const w = render(view("broken", true));
++    expect(screen.getByText("broken 0")).toBeDefined();
++    w.rerender(view("recovered", false));
++    expect(screen.getByText("recovered 0")).toBeDefined();
++  });
++  it("leaves tool disclosure keyboard interaction and the body owned by core", () => {
++    function Header({ content }: ExperimentalProviderRendererProps) {
++      return <span>Native {content.surface}</span>;
++    }
++    install(Header, "tool-header");
++    const row = toolRow({
++      id: "tool",
++      threadId: "thread",
++      toolName: "example",
++    });
++    const title = buildTimelineRowTitle(row, {
++      summaryStyle: "bundle",
++      workStyle: "default",
++    });
++    render(
++      <ThreadProviderContext.Provider
++        value={{ providerId: "acp-chatgpt-web", pluginId: null }}
++      >
++        <ExpandableTimelineRow
++          title={title}
++          renderHeaderContent={(original) => (
++            <ProviderToolHeader row={row} title={title.plain}>
++              {original}
++            </ProviderToolHeader>
++          )}
++          renderBody={() => <div>core body</div>}
++        />
++      </ThreadProviderContext.Provider>,
++    );
++    const button = screen.getByRole("button", { name: /Native tool-header/ });
++    expect(button.getAttribute("aria-expanded")).toBe("false");
++    button.focus();
++    expect(document.activeElement).toBe(button);
++    fireEvent.click(button);
++    expect(button.getAttribute("aria-expanded")).toBe("true");
++    expect(screen.getByText("core body")).toBeDefined();
++  });
++});
++
++it.each(["bundle-summary", "step-summary"] as const)(
++  "offers %s all-tool headers but keeps mixed permission groups core-owned",
++  (kind) => {
++    function Header() {
++      return <span>native group</span>;
++    }
++    install(Header, "tool-group-header");
++    const tool = toolRow({ id: "tool", threadId: "thread" });
++    const group = {
++      id: "group",
++      threadId: "thread",
++      turnId: "turn",
++      sourceSeqStart: 0,
++      sourceSeqEnd: 2,
++      startedAt: 0,
++      createdAt: 0,
++      kind,
++      status: "completed" as const,
++      children: [tool],
++    };
++    const wrap = (row: import("@bb/thread-view").ThreadTimelineViewRow) => (
++      <ThreadProviderContext.Provider
++        value={{ providerId: "acp-chatgpt-web", pluginId: null }}
++      >
++        <ProviderToolHeader row={row} title="tools">
++          <span>core group</span>
++        </ProviderToolHeader>
++      </ThreadProviderContext.Provider>
++    );
++    const v = render(wrap(group));
++    expect(screen.getByText("native group")).toBeDefined();
++    v.rerender(wrap({ ...group, children: [tool, approvalRow({})] }));
++    expect(screen.getByText("core group")).toBeDefined();
++    expect(screen.queryByText("native group")).toBeNull();
++  },
++);
+diff --git a/apps/app/src/components/thread/timeline/ProviderContentRenderer.tsx b/apps/app/src/components/thread/timeline/ProviderContentRenderer.tsx
+new file mode 100644
+index 0000000..59ab542
+--- /dev/null
++++ b/apps/app/src/components/thread/timeline/ProviderContentRenderer.tsx
+@@ -0,0 +1,70 @@
++import {
++  createContext,
++  useContext,
++  useSyncExternalStore,
++  type ReactNode,
++} from "react";
++import type { ExperimentalProviderRendererContent } from "@get-bb/plugin-sdk";
++import { PluginSlotMount } from "../../plugin/PluginSlotMount.js";
++import { useThreadProvider } from "../thread-provider-context.js";
++import {
++  EMPTY_PLUGIN_SLOT_SNAPSHOT,
++  getPluginSlotSnapshot,
++  subscribePluginSlots,
++} from "@/lib/plugin-slots";
++import { resolveProviderRenderer } from "@/lib/provider-renderer-resolution";
++
++const OriginalContent = createContext<ReactNode>(null);
++
++function Original() {
++  return useContext(OriginalContent);
++}
++
++export function ProviderContentRenderer({
++  content,
++  children,
++}: {
++  content: ExperimentalProviderRendererContent;
++  children: ReactNode;
++}) {
++  const { providerId } = useThreadProvider();
++  const slots = useSyncExternalStore(
++    subscribePluginSlots,
++    () => getPluginSlotSnapshot().providerRenderers,
++    () => EMPTY_PLUGIN_SLOT_SNAPSHOT.providerRenderers,
++  );
++  const slot = resolveProviderRenderer(slots, providerId, content.surface);
++  if (slot === null || providerId === null) return children;
++  const identity =
++    content.surface === "assistant-message" ? content.message : content.row;
++  const rendered = (
++    <slot.component
++      providerId={providerId}
++      content={content}
++      Original={Original}
++    />
++  );
++  return (
++    <OriginalContent.Provider value={children}>
++      <PluginSlotMount
++        pluginId={slot.pluginId}
++        slotKind="providerRenderer"
++        slotId={slot.id}
++        instanceId={`${providerId}/${content.surface}/${identity.threadId}/${identity.id}`}
++        crashResetKey={JSON.stringify(content)}
++        crashFallback={children}
++        wrapRoot={false}
++      >
++        {content.surface === "assistant-message" ? (
++          <div data-bb-plugin-root="" data-bb-plugin={slot.pluginId}>
++            {rendered}
++          </div>
++        ) : (
++          <span data-bb-plugin-root="" data-bb-plugin={slot.pluginId}>
++            {rendered}
++          </span>
++        )}
++      </PluginSlotMount>
++    </OriginalContent.Provider>
++  );
++}
+diff --git a/apps/app/src/components/thread/timeline/ProviderToolHeader.tsx b/apps/app/src/components/thread/timeline/ProviderToolHeader.tsx
+new file mode 100644
+index 0000000..c9efeaf
+--- /dev/null
++++ b/apps/app/src/components/thread/timeline/ProviderToolHeader.tsx
+@@ -0,0 +1,43 @@
++import type { ReactNode } from "react";
++import type { ThreadTimelineViewRow } from "@bb/thread-view";
++import { ProviderContentRenderer } from "./ProviderContentRenderer.js";
++
++export function ProviderToolHeader({
++  row,
++  title,
++  children,
++}: {
++  row: ThreadTimelineViewRow;
++  title: string;
++  children: ReactNode;
++}) {
++  if (
++    row.kind !== "work" &&
++    row.kind !== "bundle-summary" &&
++    row.kind !== "step-summary"
++  )
++    return children;
++  const surface =
++    row.kind === "work" && row.workKind === "tool"
++      ? "tool-header"
++      : (row.kind === "bundle-summary" || row.kind === "step-summary") &&
++          row.children.length > 0 &&
++          row.children.every(
++            (child) => child.kind === "work" && child.workKind === "tool",
++          )
++        ? "tool-group-header"
++        : null;
++  if (surface === null) return children;
++  return (
++    <ProviderContentRenderer
++      content={{
++        surface,
++        row: { id: row.id, threadId: row.threadId, turnId: row.turnId },
++        title,
++        status: row.status,
++      }}
++    >
++      {children}
++    </ProviderContentRenderer>
++  );
++}
+diff --git a/apps/app/src/components/thread/timeline/ThreadTimelineRows.presentation.test.tsx b/apps/app/src/components/thread/timeline/ThreadTimelineRows.presentation.test.tsx
+index b5046c1..10644fb 100644
+--- a/apps/app/src/components/thread/timeline/ThreadTimelineRows.presentation.test.tsx
++++ b/apps/app/src/components/thread/timeline/ThreadTimelineRows.presentation.test.tsx
+@@ -9,6 +9,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+ import type { PluginTimelineRendererProps } from "@get-bb/plugin-sdk";
+ import {
+   commandRow,
++  conversationRow,
+   ECHO_RECEIPT_PRESENTATION,
+   extensionRow,
+   planStepsRow,
+@@ -347,3 +348,59 @@ describe("plugin timeline renderers", () => {
+     expect(screen.getByText("Echoed", { exact: false })).toBeTruthy();
+   });
+ });
++
++it.each([false, true])(
++  "routes actual tool grouping through provider header content (closed step: %s)",
++  (closed) => {
++    function Header({
++      Original,
++    }: import("@get-bb/plugin-sdk").ExperimentalProviderRendererProps) {
++      return (
++        <span>
++          <span>provider group</span>
++          <Original />
++        </span>
++      );
++    }
++    setPluginSlotRegistrations(
++      "visual",
++      registrationSet({
++        providerRenderers: [
++          {
++            id: "group",
++            providerId: "echo-agent",
++            surface: "tool-group-header",
++            component: Header,
++          },
++        ],
++      }),
++    );
++    const rows = [
++      toolRow({ id: "first", threadId: "thr_main", turnId: "turn" }),
++      toolRow({ id: "second", threadId: "thr_main", turnId: "turn", seq: 2 }),
++    ];
++    renderRows(
++      <ThreadTimelineRows
++        threadId="thr_main"
++        threadRuntimeDisplayStatus="idle"
++        workspaceRootPath={undefined}
++        timelineRows={
++          closed
++            ? [
++                ...rows,
++                conversationRow({
++                  id: "answer",
++                  threadId: "thr_main",
++                  turnId: "turn",
++                  role: "assistant",
++                  text: "Answer",
++                  seq: 3,
++                }),
++              ]
++            : rows
++        }
++      />,
++    );
++    expect(screen.getByText("provider group")).toBeDefined();
++  },
++);
+diff --git a/apps/app/src/components/thread/timeline/ThreadTimelineRows.tsx b/apps/app/src/components/thread/timeline/ThreadTimelineRows.tsx
+index 5300123..b3645d6 100644
+--- a/apps/app/src/components/thread/timeline/ThreadTimelineRows.tsx
++++ b/apps/app/src/components/thread/timeline/ThreadTimelineRows.tsx
+@@ -1,3 +1,4 @@
++import { ProviderToolHeader } from "./ProviderToolHeader.js";
+ import {
+   createContext,
+   memo,
+@@ -1772,14 +1773,16 @@ function TimelineRowView({
+           scopeActive,
+         })}
+       >
+-        <span className="inline-flex min-w-0 max-w-full items-center gap-1.5">
+-          <TimelineLeadingIcon
+-            icon={staticLeadingIcon}
+-            iconUrl={staticLeadingIconUrl}
+-            style={staticLeadingIconStyle}
+-          />
+-          <TitleView title={titleState.title} onTitleAction={onTitleAction} />
+-        </span>
++        <ProviderToolHeader row={row} title={titleState.title.plain}>
++          <span className="inline-flex min-w-0 max-w-full items-center gap-1.5">
++            <TimelineLeadingIcon
++              icon={staticLeadingIcon}
++              iconUrl={staticLeadingIconUrl}
++              style={staticLeadingIconStyle}
++            />
++            <TitleView title={titleState.title} onTitleAction={onTitleAction} />
++          </span>
++        </ProviderToolHeader>
+       </TimelineStaticRowHeader>
+     );
+   }
+@@ -1850,6 +1853,11 @@ function TimelineExpandableRowView({
+           : undefined
+       }
+       title={title}
++      renderHeaderContent={(original) => (
++        <ProviderToolHeader row={row} title={title.plain}>
++          {original}
++        </ProviderToolHeader>
++      )}
+       summaryClassName={pastRowDimClassName({
+         activeLatestBundleId,
+         row,
+diff --git a/apps/app/src/lib/plugin-slots.ts b/apps/app/src/lib/plugin-slots.ts
+index 82e7589..a8b9a86 100644
+--- a/apps/app/src/lib/plugin-slots.ts
++++ b/apps/app/src/lib/plugin-slots.ts
+@@ -29,6 +29,7 @@ import type {
+   ExperimentalPluginBrowserToolbarActionRegistration,
+   PluginThreadListRegistration,
+   PluginTimelineRendererRegistration,
++  ExperimentalProviderRendererRegistration,
+ } from "@get-bb/plugin-sdk";
+ import {
+   type CollectedPluginCommandRegistration,
+@@ -76,6 +77,7 @@ export interface PluginRegistrationSet {
+   providerIcons?: readonly CollectedPluginProviderIconRegistration[];
+   icons?: readonly ExperimentalIconRegistration[];
+   timelineRenderers?: readonly PluginTimelineRendererRegistration[];
++  providerRenderers?: readonly ExperimentalProviderRendererRegistration[];
+   environmentProviderInputs?: readonly PluginEnvironmentProviderInputsRegistration[];
+   machineProviderInputs?: readonly PluginMachineProviderInputsRegistration[];
+ }
+@@ -85,6 +87,9 @@ interface PluginSlotBase {
+   generation: number;
+ }
+
++export interface ExperimentalProviderRendererSlot
++  extends ExperimentalProviderRendererRegistration, PluginSlotBase {}
++
+ export interface PluginHomepageSectionSlot
+   extends PluginHomepageSectionRegistration, PluginSlotBase {}
+ export interface PluginSettingsSectionSlot
+@@ -133,8 +138,7 @@ export interface PluginThreadContextSegmentSlot
+ export interface PluginThreadInfoRowSlot
+   extends ExperimentalThreadInfoRowRegistration, PluginSlotBase {}
+ export interface PluginThreadRowMetadataSlot
+-  extends ExperimentalThreadRowMetadataRegistration<unknown>,
+-    PluginSlotBase {}
++  extends ExperimentalThreadRowMetadataRegistration<unknown>, PluginSlotBase {}
+ export interface PluginThreadInfoSectionSlot
+   extends ExperimentalThreadInfoSectionRegistration, PluginSlotBase {}
+ export interface PluginThreadActionSlot
+@@ -198,6 +202,7 @@ export interface PluginSlotSnapshot {
+   providerIcons: readonly PluginProviderIconSlot[];
+   icons: readonly PluginIconSlot[];
+   timelineRenderers: readonly PluginTimelineRendererSlot[];
++  providerRenderers: readonly ExperimentalProviderRendererSlot[];
+   environmentProviderInputs: readonly PluginEnvironmentProviderInputsSlot[];
+   machineProviderInputs: readonly PluginMachineProviderInputsSlot[];
+ }
+@@ -233,6 +238,7 @@ export const EMPTY_PLUGIN_SLOT_SNAPSHOT: PluginSlotSnapshot = {
+   providerIcons: [],
+   icons: [],
+   timelineRenderers: [],
++  providerRenderers: [],
+   environmentProviderInputs: [],
+   machineProviderInputs: [],
+ };
+@@ -275,6 +281,7 @@ const SLOT_KINDS: readonly SlotKind[] = [
+   "providerIcons",
+   "icons",
+   "timelineRenderers",
++  "providerRenderers",
+   "environmentProviderInputs",
+   "machineProviderInputs",
+ ];
+@@ -365,6 +372,7 @@ function flattenRegistrations(
+     providerIcons: stamp(set.providerIcons),
+     icons: stamp(set.icons),
+     timelineRenderers: stamp(set.timelineRenderers),
++    providerRenderers: stamp(set.providerRenderers),
+     environmentProviderInputs: stamp(set.environmentProviderInputs),
+     machineProviderInputs: stamp(set.machineProviderInputs),
+   };
+diff --git a/apps/app/src/lib/provider-renderer-resolution.test.ts b/apps/app/src/lib/provider-renderer-resolution.test.ts
+new file mode 100644
+index 0000000..2b5958e
+--- /dev/null
++++ b/apps/app/src/lib/provider-renderer-resolution.test.ts
+@@ -0,0 +1,93 @@
++import { afterEach, describe, expect, it } from "vitest";
++import { collectPluginAppRegistrations } from "./plugin-app-definition";
++import { resolveProviderRenderer } from "./provider-renderer-resolution";
++import {
++  getPluginSlotSnapshot,
++  resetPluginSlotStoreForTest,
++  setPluginSlotRegistrations,
++} from "./plugin-slots";
++import { makePluginRegistrationSet } from "@/test/fixtures/plugins";
++
++const component = () => null;
++const registration = {
++  id: "native",
++  providerId: "acp-chatgpt-web",
++  surface: "assistant-message" as const,
++  component,
++};
++afterEach(resetPluginSlotStoreForTest);
++
++describe("provider scoped visual rendering", () => {
++  it("validates provider, surface, component and duplicate scope at the same collector used by plugins", () => {
++    const collect = (extra: object) =>
++      collectPluginAppRegistrations({
++        __bbPluginApp: true,
++        setup(app) {
++          app.slots.experimental_providerRenderer({
++            ...registration,
++            ...extra,
++          });
++        },
++      });
++    expect(collect({}).providerRenderers).toEqual([registration]);
++    expect(() => collect({ providerId: "*" })).toThrow(/providerId/);
++    expect(() => collect({ surface: "approval" })).toThrow(/surface/);
++    expect(() => collect({ component: false })).toThrow(/component/);
++    expect(() =>
++      collectPluginAppRegistrations({
++        __bbPluginApp: true,
++        setup(app) {
++          app.slots.experimental_providerRenderer(registration);
++          app.slots.experimental_providerRenderer({
++            ...registration,
++            id: "duplicate",
++          });
++        },
++      }),
++    ).toThrow(/duplicate/);
++  });
++
++  it("does not target another provider, unknown context, user messages, or other surfaces", () => {
++    setPluginSlotRegistrations(
++      "visual",
++      makePluginRegistrationSet({ providerRenderers: [registration] }),
++    );
++    const slots = getPluginSlotSnapshot().providerRenderers;
++    expect(
++      resolveProviderRenderer(slots, "acp-chatgpt-web", "assistant-message")
++        ?.id,
++    ).toBe("native");
++    expect(
++      resolveProviderRenderer(slots, "codex", "assistant-message"),
++    ).toBeNull();
++    expect(
++      resolveProviderRenderer(slots, null, "assistant-message"),
++    ).toBeNull();
++    expect(
++      resolveProviderRenderer(slots, "acp-chatgpt-web", "tool-header"),
++    ).toBeNull();
++  });
++
++  it("fails closed on competing plugins and restores core on unload", () => {
++    const set = makePluginRegistrationSet({
++      providerRenderers: [registration],
++    });
++    setPluginSlotRegistrations("first", set);
++    setPluginSlotRegistrations("second", set);
++    expect(
++      resolveProviderRenderer(
++        getPluginSlotSnapshot().providerRenderers,
++        "acp-chatgpt-web",
++        "assistant-message",
++      ),
++    ).toBeNull();
++    resetPluginSlotStoreForTest();
++    expect(
++      resolveProviderRenderer(
++        getPluginSlotSnapshot().providerRenderers,
++        "acp-chatgpt-web",
++        "assistant-message",
++      ),
++    ).toBeNull();
++  });
++});
+diff --git a/apps/app/src/lib/provider-renderer-resolution.ts b/apps/app/src/lib/provider-renderer-resolution.ts
+new file mode 100644
+index 0000000..e7cb6a4
+--- /dev/null
++++ b/apps/app/src/lib/provider-renderer-resolution.ts
+@@ -0,0 +1,14 @@
++import type { ExperimentalProviderRendererContent } from "@get-bb/plugin-sdk";
++import type { ExperimentalProviderRendererSlot } from "./plugin-slots";
++
++export function resolveProviderRenderer(
++  slots: readonly ExperimentalProviderRendererSlot[],
++  providerId: string | null,
++  surface: ExperimentalProviderRendererContent["surface"],
++): ExperimentalProviderRendererSlot | null {
++  if (providerId === null) return null;
++  const matches = slots.filter(
++    (slot) => slot.providerId === providerId && slot.surface === surface,
++  );
++  return matches.length === 1 ? matches[0]! : null;
++}
+diff --git a/docs/api_to_audit.md b/docs/api_to_audit.md
+index 22921d2..1ebecba 100644
+--- a/docs/api_to_audit.md
++++ b/docs/api_to_audit.md
+@@ -3914,3 +3914,27 @@ precedence, bounded discovery failure, and module-ABI preservation after Node
+ replacement. Settle the shared process-local instance lifecycle across SDK
+ bundle versions and whether `bundledNpmCli` belongs on the public surface before
+ removing the prefix.
++
++
++## experimental_providerRenderer
++
++Registration opts into one exact provider ID and one assistant-message, tool-header,
++or tool-group-header surface. No wildcard, user-message, approval, or permission
++surface exists. The host renders through ProviderContentRenderer in its normal
++ConversationMessageContent and ThreadTimelineRows paths, including embedded chats.
++A conflicting registration restores core. Disabled/unloaded plugins disappear
++through the existing registration lifecycle. Exceptions restore Original and retry
++on changed snapshots. Content is current state, never an append command. Stable
++message/turn/row identity and a context-backed Original preserve React state across
++updates. Core retains message selection, actions, attachments, code-fence context,
++expand/collapse controls, authorization, and all mixed and non-tool summary headers.
++
++Stabilization requires tests for no-registration/other-provider behavior, malformed
++scope, collisions, unload, crash/recovery, Original state, streaming replacement and
++interruption, nested provider contexts, tool disclosure keyboard use, and a visual
++matrix. Typography plugins may style only their own provider-renderer root. This API
++adds no message mutation or permission callback and no server/daemon wire fields.
++Header replacement changes only visual summary content, not group membership or row
++ordering. Full timeline/group restructuring and mutable ACP messages remain outside
++this extension's scope. Only explicit provider snapshots are exposed, never raw
++permission objects or internal timeline model references.
+diff --git a/packages/plugin-sdk/src/app-contract.ts b/packages/plugin-sdk/src/app-contract.ts
+index c58c297..d38625e 100644
+--- a/packages/plugin-sdk/src/app-contract.ts
++++ b/packages/plugin-sdk/src/app-contract.ts
+@@ -3406,6 +3406,36 @@ export interface PluginTimelineRendererProps {
+   Original: ComponentType<Record<never, never>>;
+ }
+
++/** Provider-scoped visual content; host controls and permissions stay outside. */
++export type ExperimentalProviderRendererContent =
++  | {
++      surface: "assistant-message";
++      message: PluginMessageDirectiveMessage;
++      text: string;
++      streaming: boolean;
++    }
++  | {
++      surface: "tool-header" | "tool-group-header";
++      row: { id: string; threadId: string; turnId: string | null };
++      title: string;
++      status: PluginTimelineRowStatus;
++    };
++
++/** A current snapshot, never an append event. Original is stable across revisions. */
++export interface ExperimentalProviderRendererProps {
++  providerId: string;
++  content: ExperimentalProviderRendererContent;
++  Original: ComponentType;
++}
++
++/** Explicit opt-in for one provider/surface. Conflicts fall back to core. */
++export interface ExperimentalProviderRendererRegistration {
++  id: string;
++  providerId: string;
++  surface: ExperimentalProviderRendererContent["surface"];
++  component: ComponentType<ExperimentalProviderRendererProps>;
++}
++
+ /**
+  * Render the expanded body of the timeline rows this plugin owns: its own
+  * extension item kinds (`"<pluginId>/<name>"`, where `<pluginId>` is this
+@@ -3610,6 +3640,10 @@ export interface PluginAppSlots {
+    * docs/api_to_audit.md.
+    */
+   experimental_composer(registration: ExperimentalComposerRegistration): void;
++  /** Opt in to one provider's assistant content or tool header content. */
++  experimental_providerRenderer(
++    registration: ExperimentalProviderRendererRegistration,
++  ): void;
+   messageDirective(registration: PluginMessageDirectiveRegistration): void;
+   /**
+    * Render fenced code blocks of chosen languages in assistant messages (see
+diff --git a/packages/plugin-sdk/src/internal/plugin-app-registration-collector.ts b/packages/plugin-sdk/src/internal/plugin-app-registration-collector.ts
+index c79fb99..9796288 100644
+--- a/packages/plugin-sdk/src/internal/plugin-app-registration-collector.ts
++++ b/packages/plugin-sdk/src/internal/plugin-app-registration-collector.ts
+@@ -41,6 +41,7 @@ import type {
+   ExperimentalSidebarNavigationRegistration,
+   PluginThreadListRegistration,
+   PluginTimelineRendererRegistration,
++  ExperimentalProviderRendererRegistration,
+ } from "@get-bb/plugin-sdk";
+ import {
+   collectComposerCustomization,
+@@ -332,6 +333,7 @@ export interface CollectedPluginAppRegistrations {
+   providerIcons: CollectedPluginProviderIconRegistration[];
+   icons: ExperimentalIconRegistration[];
+   timelineRenderers: PluginTimelineRendererRegistration[];
++  providerRenderers: ExperimentalProviderRendererRegistration[];
+   environmentProviderInputs: PluginEnvironmentProviderInputsRegistration[];
+   machineProviderInputs: PluginMachineProviderInputsRegistration[];
+   contentScripts: PluginContentScriptRegistration[];
+@@ -472,6 +474,7 @@ export function collectPluginAppRegistrations(
+     providerIcons: [],
+     icons: [],
+     timelineRenderers: [],
++    providerRenderers: [],
+     environmentProviderInputs: [],
+     machineProviderInputs: [],
+     contentScripts: [],
+@@ -509,6 +512,8 @@ export function collectPluginAppRegistrations(
+     command: new Set<string>(),
+     providerIcon: new Set<string>(),
+     timelineRenderer: new Set<string>(),
++    providerRenderer: new Set<string>(),
++    providerRendererScope: new Set<string>(),
+     environmentProviderInputs: new Set<string>(),
+     machineProviderInputs: new Set<string>(),
+     contentScript: new Set<string>(),
+@@ -1104,6 +1109,31 @@ export function collectPluginAppRegistrations(
+           ),
+         );
+       },
++      experimental_providerRenderer(registration) {
++        const kind = "slots.experimental_providerRenderer";
++        const id = requireSlotId(kind, registration?.id);
++        requireUniqueId(kind, seenIds.providerRenderer, id);
++        const providerId = requireProviderId(kind, registration.providerId);
++        const surface = registration.surface;
++        if (
++          surface !== "assistant-message" &&
++          surface !== "tool-header" &&
++          surface !== "tool-group-header"
++        ) {
++          throw new Error(`${kind}: invalid surface`);
++        }
++        requireUniqueId(
++          kind,
++          seenIds.providerRendererScope,
++          `${providerId}/${surface}`,
++        );
++        collected.providerRenderers.push({
++          id,
++          providerId,
++          surface,
++          component: requireComponent(kind, registration.component),
++        });
++      },
+       messageDirective(registration) {
+         const kind = "slots.messageDirective";
+         const id = requireMessageDirectiveId(kind, registration?.id);
+diff --git a/packages/plugin-sdk/src/testing/app.tsx b/packages/plugin-sdk/src/testing/app.tsx
+index 7a85853..53cfbea 100644
+--- a/packages/plugin-sdk/src/testing/app.tsx
++++ b/packages/plugin-sdk/src/testing/app.tsx
+@@ -141,6 +141,7 @@ import {
+   type CheckoutState,
+   type ExperimentalPermissionModePickerProps,
+   type ExperimentalProviderModelPickerProps,
++  type ExperimentalProviderRendererRegistration,
+   type ExperimentalVoiceInputTextareaProps,
+   type PluginEnvironmentProviderInputsRegistration,
+   type PluginMachineProviderInputsRegistration,
+@@ -561,7 +562,9 @@ function TestThreadStatusGlyph({
+  * `experimental_ThreadRowMetadata` marks where a row renders other plugins' row
+  * items; the test runtime knows no other plugins, so it renders a marker.
+  */
+-function TestThreadRowMetadata({ thread }: ExperimentalThreadRowMetadataLineProps) {
++function TestThreadRowMetadata({
++  thread,
++}: ExperimentalThreadRowMetadataLineProps) {
+   return <span data-thread-row-metadata={thread.id} />;
+ }
+
+@@ -2016,6 +2019,7 @@ export interface CapturedPluginApp {
+   providerIcons: CollectedPluginProviderIconRegistration[];
+   icons: ExperimentalIconRegistration[];
+   timelineRenderers: PluginTimelineRendererRegistration[];
++  providerRenderers: ExperimentalProviderRendererRegistration[];
+   environmentProviderInputs: PluginEnvironmentProviderInputsRegistration[];
+   machineProviderInputs: PluginMachineProviderInputsRegistration[];
+   contentScripts: PluginContentScriptRegistration[];
+diff --git a/plugins/plugin-api-docs/src/surfaces.ts b/plugins/plugin-api-docs/src/surfaces.ts
+index 32a88d4..c8fd4fb 100644
+--- a/plugins/plugin-api-docs/src/surfaces.ts
++++ b/plugins/plugin-api-docs/src/surfaces.ts
+@@ -267,6 +267,23 @@ export const SURFACE_GROUPS: SurfaceGroup[] = [
+         firstParty: ["Push notifications", "Thread list"],
+         experimental: true,
+       },
++      {
++        id: "provider-renderers",
++        title: "Provider-scoped message and tool headers",
++        summary:
++          "Opt in to visual content for one provider without replacing host permission controls. With this, a plugin can:",
++        bullets: [
++          "Render assistant snapshots or tool/group header content for an explicit provider ID",
++          "Style its own Original wrapper while other providers keep core typography",
++          "Retain core selection, actions, attachments, tool disclosure and fallback on conflict or crash",
++        ],
++        apiSymbols: [
++          "ExperimentalProviderRendererRegistration",
++          "ExperimentalProviderRendererProps",
++          "ExperimentalProviderRendererContent",
++        ],
++        experimental: true,
++      },
+       {
+         id: "timeline-renderers",
+         title: "Timeline entry content",
+--
+2.47.3
