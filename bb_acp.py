@@ -16,12 +16,14 @@ import re
 import socket
 import sys
 import tempfile
+import time
 import uuid
 from typing import Any
 
 from cooldown import retry_after_seconds
 from web_content import render_web_elements
 from maintenance.verified_recovery import verified_final
+from maintenance.source_activity import observe_source
 from maintenance.bb_retry_guard import original_prompt_for_retry
 
 ROOT = Path.home() / ".local/state/chatgpt-web/bb-acp"
@@ -651,8 +653,11 @@ class Server:
                             started=True, kind="think")
         deadline = asyncio.get_running_loop().time() + 1050
         attempt = 0
+        stale_observations = 0
+        last_source_time: float | None = None
         while asyncio.get_running_loop().time() < deadline:
             attempt += 1
+            observed_source = False
             delay = 75  # Bound GETs; fast polling can exhaust account rate limits.
             try:
                 process = await asyncio.create_subprocess_exec(
@@ -672,6 +677,35 @@ class Server:
                     answer = verified_final(
                         document, conversation_id=conversation_id,
                         message_id=message_id, user_prompt=user_prompt)
+                    observation = observe_source(
+                        document, conversation_id=conversation_id,
+                        message_id=message_id, user_prompt=user_prompt,
+                        now=time.time(),
+                    )
+                    if observation is not None and answer is None:
+                        observed_source = True
+                        fresh = observation["age_seconds"] < 360
+                        label = ("Source still active" if fresh else
+                                 "Source inactive · final response not saved")
+                        await self.activity(
+                            sid, row_id,
+                            f"ChatGPT Web · {label} · "
+                            f"{observation['tool_calls']} saved tool calls · "
+                            f"last {observation['last_at']}",
+                            status="in_progress", kind="think",
+                            detail=observation["detail"],
+                        )
+                        if (not fresh and last_source_time == observation["last_activity"]):
+                            stale_observations += 1
+                        else:
+                            stale_observations = 1 if not fresh else 0
+                        last_source_time = observation["last_activity"]
+                        if stale_observations >= 2:
+                            raise RuntimeError(
+                                f"Original ChatGPT source inactive since {observation['last_at']}; "
+                                "no verified final answer exists. The broken SSE "
+                                "cannot be reattached and no prompt was resent. "
+                                "Saved ChatGPT conversation and BB history are preserved.")
                     if answer is not None:
                         session["conversation_id"] = conversation_id
                         session["adapter_policy_hash"] = adapter_policy(session)[1]
@@ -686,9 +720,13 @@ class Server:
                         return
             except (OSError, ValueError, asyncio.TimeoutError):
                 pass  # Transient read-only fetch failure is not permission to resend.
-            await self.activity(sid, row_id,
-                                f"ChatGPT Web · Awaiting original saved response (check {attempt})",
-                                kind="think")
+            if not observed_source:
+                await self.activity(
+                    sid, row_id,
+                    f"ChatGPT Web · Source read unavailable · "
+                    f"next read-only check in {delay}s",
+                    kind="think",
+                )
             await asyncio.sleep(min(delay, max(0, deadline - asyncio.get_running_loop().time())))
         raise RuntimeError(
             "The original accepted ChatGPT turn has not produced a verifiable "
