@@ -89,19 +89,31 @@ def post_restart_smoke() -> tuple[bool, str]:
                       '--timeout', '100s', '--json', timeout=112)
         if waited.returncode:
             return False, 'Hidden smoke response did not complete'
-        output = call(bb, 'thread', 'output', thread, '--json', timeout=15)
-        events = call(bb, 'thread', 'log', thread, '--json',
-                      '--limit', '100', timeout=15)
-        if output.returncode or events.returncode:
-            return False, 'Hidden smoke output or event log was not accessible'
-        answer = json.loads(output.stdout).get('output')
-        rows = json.loads(events.stdout)
-        starts = [e for e in rows if e.get('type') == 'item/started']
-        has_activity = any((e.get('data', {}).get('item', {}).get('type')
-                            in ('reasoning', 'toolCall')) for e in starts)
-        if answer != 'BB-STREAM-RELOAD-OK-20261108.' or not has_activity:
-            return False, 'Hidden smoke had incorrect answer or missing live activity'
-        return True, 'Hidden BB answer and activity rows verified'
+        # BB can acknowledge turn/completed before its output and activity
+        # projections are consistently visible. Re-read evidence; NEVER
+        # resend the accepted ChatGPT prompt to repair a read-side race.
+        for attempt in range(10):
+            output = call(bb, 'thread', 'output', thread, '--json', timeout=15)
+            events = call(bb, 'thread', 'log', thread, '--json',
+                          '--limit', '100', timeout=15)
+            if output.returncode == 0 and events.returncode == 0:
+                answer = json.loads(output.stdout).get('output')
+                rows = json.loads(events.stdout)
+                starts = [e for e in rows if e.get('type') == 'item/started']
+                has_activity = any((e.get('data', {}).get('item', {}).get('type')
+                                    in ('reasoning', 'toolCall')) for e in starts)
+                if answer == 'BB-STREAM-RELOAD-OK-20261108.' and has_activity:
+                    return True, 'Hidden BB answer and activity rows verified'
+                # The current ChatGPT model may omit the final period while
+                # following an exact-token instruction. Compare the marker,
+                # not its optional punctuation.
+                if (isinstance(answer, str) and
+                        answer.strip().rstrip('.') == 'BB-STREAM-RELOAD-OK-20261108'
+                        and has_activity):
+                    return True, 'Hidden BB answer and activity rows verified'
+            if attempt < 9:
+                time.sleep(0.4)
+        return False, 'Hidden smoke missing final answer or live activity after reconciliation'
     except (ValueError, TypeError, KeyError):
         return False, 'Hidden smoke verification returned invalid data'
     finally:
