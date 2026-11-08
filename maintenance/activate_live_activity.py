@@ -68,6 +68,45 @@ def ready():
     return current_completed() and not active_sends()
 
 
+
+def post_restart_smoke() -> tuple[bool, str]:
+    """Run an isolated hidden request; verify reply and early BB activity."""
+    bb = str(Path.home() / '.local/bin/bb')
+    spawned = call(bb, 'thread', 'spawn', '--project', 'proj_personal',
+                   '--provider', 'acp-chatgpt-web', '--model', 'gpt-6',
+                   '--reasoning-level', 'instant', '--new-environment', 'personal',
+                   '--visibility', 'hidden', '--title', 'ChatGPT Web reload smoke',
+                   '--prompt', 'Reply exactly BB-STREAM-RELOAD-OK-20261108.',
+                   '--json', timeout=30)
+    if spawned.returncode:
+        return False, 'Hidden smoke request could not start'
+    try:
+        thread = json.loads(spawned.stdout)['id']
+    except (ValueError, KeyError, TypeError):
+        return False, 'Hidden smoke request returned no thread ID'
+    try:
+        waited = call(bb, 'thread', 'wait', thread, '--event', 'turn/completed',
+                      '--timeout', '100s', '--json', timeout=112)
+        if waited.returncode:
+            return False, 'Hidden smoke response did not complete'
+        output = call(bb, 'thread', 'output', thread, '--json', timeout=15)
+        events = call(bb, 'thread', 'log', thread, '--json',
+                      '--limit', '100', timeout=15)
+        if output.returncode or events.returncode:
+            return False, 'Hidden smoke output or event log was not accessible'
+        answer = json.loads(output.stdout).get('output')
+        rows = json.loads(events.stdout)
+        starts = [e for e in rows if e.get('type') == 'item/started']
+        has_activity = any((e.get('data', {}).get('item', {}).get('type')
+                            in ('reasoning', 'toolCall')) for e in starts)
+        if answer != 'BB-STREAM-RELOAD-OK-20261108.' or not has_activity:
+            return False, 'Hidden smoke had incorrect answer or missing live activity'
+        return True, 'Hidden BB answer and activity rows verified'
+    except (ValueError, TypeError, KeyError):
+        return False, 'Hidden smoke verification returned invalid data'
+    finally:
+        call(bb, 'thread', 'archive', thread, '--json', timeout=15)
+
 def main():
     log('waiting-for-idle', 'Preserving the active BB response')
     deadline = time.monotonic() + 900
@@ -104,7 +143,12 @@ def main():
     if models.returncode:
         log('failed', 'Provider models check failed: ' + (models.stderr or models.stdout).strip()[:240])
         return 7
-    log('activated', 'Daemon restarted; this thread ACP runtime released; provider catalog reachable')
+    log('smoke-check', 'Testing fresh hidden BB ChatGPT response and progress')
+    healthy, detail = post_restart_smoke()
+    if not healthy:
+        log('failed', detail)
+        return 8
+    log('activated', 'Daemon and ACP reloaded; catalog reachable; ' + detail)
     return 0
 
 
