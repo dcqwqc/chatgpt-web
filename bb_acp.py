@@ -511,6 +511,37 @@ class Server:
         session.pop("depth", None)
         session.pop("reasoning", None)
 
+    def pending_recovery_ui(self, session: dict[str, Any]) -> dict[str, Any]:
+        """Return truthful, narrowly scoped controls with NO model API lookup.
+
+        An accepted original message already has a fixed model and mode.
+        During GET-only reconciliation, a model-catalog outage must never stop
+        delivery of that saved answer or offer a misleading new model choice.
+        """
+        pending = session.get("pending_turn")
+        model = session.get("model")
+        mode = session.get("mode")
+        if (not isinstance(pending, dict) or pending.get("accepted") is not True
+                or not isinstance(pending.get("conversation_id"), str)
+                or not CONVERSATION_RE.fullmatch(pending["conversation_id"])
+                or not isinstance(pending.get("message_id"), str)
+                or not pending.get("message_id")
+                or model not in FAMILY_LABELS or mode not in MODE_LABELS):
+            raise RuntimeError("Cannot restore accepted session without verified recovery state")
+        selected = {"modelId": model, "name": FAMILY_LABELS[model]}
+        return {
+            "models": {"currentModelId": model, "availableModels": [selected]},
+            "configOptions": [{
+                "id": "model", "name": "Model", "category": "model",
+                "type": "select", "currentValue": model,
+                "options": [{"value": model, "name": FAMILY_LABELS[model]}],
+            }, {
+                "id": "mode", "name": "Mode", "category": "thought_level",
+                "type": "select", "currentValue": mode,
+                "options": [{"value": mode, "name": MODE_LABELS[mode]}],
+            }],
+        }
+
     def mode_options(self, family: str) -> list[dict[str, str]]:
         return [{"value": key, "name": MODE_LABELS[key]}
                 for key in self.variants[family]]
@@ -988,14 +1019,24 @@ class Server:
                                   "title": "ChatGPT Web CLI", "version": "0.1.0"}}
             elif method in ("session/new", "session/load", "session/resume"):
                 if method == "session/new":
-                    catalog = self.catalog()
+                    # Check for an accepted previous POST BEFORE any model
+                    # catalog request: recovery needs no new model selection.
+                    prior = accepted_session_for_cwd(params.get("cwd"))
+                    recovery = (isinstance(prior, dict) and
+                                isinstance(prior.get("pending_turn"), dict) and
+                                prior["pending_turn"].get("accepted") is True)
+                    catalog = None if recovery else self.catalog()
                     sid = uuid.uuid4().hex
-                    ids = [m["modelId"] for m in catalog]
-                    default = "gpt-6" if "gpt-6" in ids else ids[0]
+                    if recovery:
+                        model = prior.get("model")
+                        mode = prior.get("mode")
+                    else:
+                        ids = [m["modelId"] for m in catalog]
+                        model = "gpt-6" if "gpt-6" in ids else ids[0]
+                        mode = "thinking"
                     session = {"sessionId": sid, "conversation_id": None,
                                "cwd": params.get("cwd"),
-                               "model": default, "mode": "thinking"}
-                    prior = accepted_session_for_cwd(params.get("cwd"))
+                               "model": model, "mode": mode}
                     if prior is not None:
                         for key in ("pending_turn", "conversation_id", "model",
                                     "mode", "adapter_policy_hash"):
@@ -1007,20 +1048,30 @@ class Server:
                     sid = params["sessionId"]
                     session = load_session(sid)
                     self.sessions[sid] = session
-                    self.catalog()
+                    recovery = (isinstance(session.get("pending_turn"), dict) and
+                                session["pending_turn"].get("accepted") is True)
+                    if not recovery:
+                        self.catalog()
                 if isinstance(params.get("cwd"), str):
                     session["cwd"] = params["cwd"]
-                self.normalize_session(session)
+                if recovery:
+                    presentation = self.pending_recovery_ui(session)
+                else:
+                    self.normalize_session(session)
+                    presentation = {"models": self.model_state(session["model"]),
+                                    "configOptions": self.config_options(session)}
                 save_session(session)
-                if method == "session/load" and not session.get("pending_turn"):
+                if method == "session/load" and not recovery:
                     await self.replay(sid, session)
-                result = {"sessionId": sid, "models": self.model_state(session["model"]),
-                          "configOptions": self.config_options(session)}
+                result = {"sessionId": sid, **presentation}
             elif method in ("session/set_model", "session/set_config_option"):
                 sid = params["sessionId"]
                 if sid not in self.sessions:
                     self.sessions[sid] = load_session(sid)
                 session = self.sessions[sid]
+                if (isinstance(session.get("pending_turn"), dict) and
+                        session["pending_turn"].get("accepted") is True):
+                    raise ValueError("Model settings are locked while recovering the accepted turn")
                 self.catalog()
                 if sid in self.running:
                     raise ValueError("Cannot change model or reasoning while prompting")
