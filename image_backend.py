@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from cli_preferences import PROJECT_NAME
 from datetime import datetime
 import json
 import os
@@ -80,7 +81,7 @@ def prepare_image_command(
         command.append("animate")
     command += [prompt, "--backend", resolved_backend, "--out", str(destination), "--no-progress"]
     if resolved_backend == "web":
-        command += ["--project", "CLI", "--require-project"]
+        command += ["--project", PROJECT_NAME, "--require-project"]
     if action == "edit":
         command += ["--ref", str(ref_path)]
     return command, destination

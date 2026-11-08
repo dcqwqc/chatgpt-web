@@ -1,8 +1,23 @@
 #!/bin/sh
 set -eu
 
-launcher_path=$(readlink -f -- "$0")
-script_dir=$(CDPATH= cd -- "$(dirname -- "$launcher_path")" && pwd)
+# Resolve linked launchers with POSIX readlink (GNU readlink -f is not portable).
+script_path=$0
+link_count=0
+while [ -L "$script_path" ]; do
+    link_count=$((link_count + 1))
+    if [ "$link_count" -gt 20 ]; then
+        echo 'chatgpt-web: too many launcher symlinks' >&2
+        exit 1
+    fi
+    script_dir=$(CDPATH= cd -P "$(dirname "$script_path")" && pwd)
+    target=$(readlink "$script_path")
+    case "$target" in
+        /*) script_path=$target ;;
+        *) script_path=$script_dir/$target ;;
+    esac
+done
+script_dir=$(CDPATH= cd -P "$(dirname "$script_path")" && pwd)
 data_root=${XDG_DATA_HOME:-"$HOME/.local/share"}
 venv_python="$data_root/chatgpt-web/venv/bin/python"
 

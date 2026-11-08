@@ -557,6 +557,11 @@ The optional bb_acp.py adapter allows an ACP-compatible host to use this authent
 
 The adapter has no required user-specific policy file, browser-service name, SSH target, or image-worker path. Additional integrations must be explicitly configured. See [ACP setup](docs/acp.md).
 
+The Node helper finds `node` from the system PATH; override it with
+`CHATGPT_WEB_NODE_BINARY` if necessary. The portable `./run` launcher supports
+symbolic links on Unix-like systems. `CHATGPT_WEB_PROJECT_NAME` also controls
+the Project used for browser-backed image requests, not only text chats.
+
 ### Public development
 
 The project is a maintained fork of [tritao/chatgpt-web](https://github.com/tritao/chatgpt-web).

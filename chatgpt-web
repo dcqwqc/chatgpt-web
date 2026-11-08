@@ -51,7 +51,10 @@ from cli_preferences import (
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 # Pin Chrome CDP helpers to a verified Node runtime with WebSocket support.
-NODE_BINARY = os.environ.get("CHATGPT_WEB_NODE_BINARY", "/usr/bin/node")
+def node_binary() -> str:
+    """Use a configured Node runtime or resolve it from PATH."""
+    return os.environ.get("CHATGPT_WEB_NODE_BINARY") or shutil.which("node") or "node"
+
 DEFAULT_PAGE_SIZE = 28
 CHATGPT_ORIGIN = "https://chatgpt.com"
 MAX_DAEMON_MESSAGE = 64 * 1024 * 1024
@@ -249,7 +252,7 @@ def capture_auth(cdp_url: str) -> tuple[str, dict[str, str]]:
     environment["CHATGPT_WEB_CDP_URL"] = cdp_url.rstrip("/")
     try:
         result = subprocess.run(
-            [NODE_BINARY, str(helper)],
+            [node_binary(), str(helper)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -783,7 +786,7 @@ class ChatGPTWebClient:
         process = None
         try:
             process = subprocess.Popen(
-                [NODE_BINARY, str(helper)],
+                [node_binary(), str(helper)],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1057,7 +1060,7 @@ class ChatGPTWebClient:
         environment = os.environ.copy()
         try:
             result = subprocess.run(
-                [NODE_BINARY, str(helper), *arguments],
+                [node_binary(), str(helper), *arguments],
                 input=json.dumps(payload) if payload is not None else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1360,7 +1363,7 @@ class ChatGPTWebClient:
         for attempt in range(3):
             try:
                 captured = subprocess.run(
-                    [NODE_BINARY, str(helper)],
+                    [node_binary(), str(helper)],
                     input=request,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,

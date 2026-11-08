@@ -26,6 +26,7 @@
   },
   "scripts": {
     "qa:build": "bb plugin build . && node qa/build.mjs",
-    "test": "node qa/test-rich.mjs"
+    "test": "node qa/test-rich.mjs",
+    "typecheck": "tsc --noEmit"
   }
 }

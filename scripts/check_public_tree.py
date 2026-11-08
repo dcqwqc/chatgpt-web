@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit a public checkout for common personal paths and credential leaks."""
+"""Reject private files, credentials and device-specific content before publishing."""
 
 from __future__ import annotations
 
@@ -9,10 +9,11 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+MAX_TEXT_BYTES = 5_000_000
 BANNED_FILES = re.compile(
-    r"(^|/)(?:\.env[^/]*|Cookies|Local State|auth\.json|credentials?\.json|"
-    r"chrome-profile|recovery-jobs|token\.json|id_rsa|id_ed25519|"
-    r"[^/]*\.pem|[^/]*\.key)$", re.I,
+    r"(^|/)(?:\.env[^/]*|\.netrc|\.npmrc|\.pypirc|Cookies|Local State|"
+    r"auth\.json|credentials?\.json|chrome-profile|recovery-jobs|token\.json|"
+    r"id_rsa|id_ed25519|[^/]*\.pem|[^/]*\.key)$", re.I,
 )
 HOME_PATH = re.compile(r"/home/(?!USER\b|example\b)[A-Za-z][\w.-]+/", re.I)
 PRIVATE_IP = re.compile(
@@ -25,40 +26,58 @@ CREDENTIAL = re.compile(
     r"(?i)(?:sk-[A-Za-z0-9_-]{25,}|gh[pousr]_[A-Za-z0-9_]{28,}|"
     r"github_pat_[A-Za-z0-9_]{25,}|-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----)"
 )
-TEXT_EXTENSIONS = {".py", ".md", ".js", ".json", ".yaml", ".yml", ".sh", ".toml", ".txt", ".ts", ".tsx", ".css", ".html", ".svg", ".cjs", ".mjs", ".service", ".timer"}
-PERSONAL_LABELS = re.compile(r"\b(?:" + "|".join(("phili" + "pedia", "tachi" + "bana", "mi" + "rai", "qw" + "qc")) + r")\b", re.I)
+PERSONAL_LABELS = re.compile(
+    r"\b(?:" + "|".join(
+        ("phili" + "pedia", "tachi" + "bana", "mi" + "rai", "qw" + "qc")
+    ) + r")\b", re.I
+)
+PATTERNS = (
+    (HOME_PATH, "personal home path"),
+    (PRIVATE_IP, "private or CGNAT IP address"),
+    (CREDENTIAL, "credential-like content"),
+    (PERSONAL_LABELS, "private project or device label"),
+)
+
+def inspect_path(root: Path, name: str) -> list[str]:
+    """Check every text-like tracked artifact, regardless of extension."""
+    path = root / name
+    if path.is_symlink():
+        return [f"{name}: symbolic link not permitted in public sources"]
+    if not path.is_file():
+        return []
+    if BANNED_FILES.search(name):
+        return [f"{name}: forbidden private artifact"]
+    if path.stat().st_size > MAX_TEXT_BYTES:
+        return [f"{name}: oversize artifact requires explicit review"]
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return [f"{name}: cannot read tracked file"]
+    # Images and other binary assets cannot be searched reliably as text.
+    if b"\x00" in data:
+        return []
+    try:
+        body = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return []
+    return [
+        f"{name}: {label}"
+        for pattern, label in PATTERNS if pattern.search(body)
+    ]
 
 def main() -> int:
-    files = subprocess.check_output(
-        ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
-        cwd=ROOT, text=True,
-    ).splitlines()
+    names = subprocess.check_output(
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        cwd=ROOT,
+    ).decode("utf-8").rstrip("\0").split("\0")
     errors = []
-    for name in files:
-        path = ROOT / name
-        if not path.is_file():
-            continue
-        if BANNED_FILES.search(name):
-            errors.append(f"{name}: forbidden private artifact")
-            continue
-        if path.suffix not in TEXT_EXTENSIONS and path.name not in {"chatgpt-web", "run"}:
-            continue
-        try:
-            body = path.read_text(encoding="utf-8")
-        except (UnicodeError, OSError):
-            continue
-        for pattern, label in (
-            (HOME_PATH, "personal home path"),
-            (PRIVATE_IP, "private or CGNAT IP address"),
-            (CREDENTIAL, "credential-like content"),
-            (PERSONAL_LABELS, "private project or device label"),
-        ):
-            if pattern.search(body):
-                errors.append(f"{name}: {label}")
+    for name in names:
+        if name:
+            errors.extend(inspect_path(ROOT, name))
     if errors:
         print("Public tree audit failed:\n" + "\n".join(errors), file=sys.stderr)
         return 1
-    print(f"Public tree audit passed ({len(files)} files)")
+    print(f"Public tree audit passed ({len([n for n in names if n])} files)")
     return 0
 
 if __name__ == "__main__":

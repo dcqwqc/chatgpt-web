@@ -28,3 +28,30 @@ jobs:
       - run: python -m unittest discover -s tests -q
       - run: node --test tests/test_chrome_recipe.js tests/test_composer_cdp.js
       - run: python scripts/check_public_tree.py
+
+  plugins:
+    name: BB plugins
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            bb-plugin-provider-icons/package-lock.json
+            bb-plugin-rich-ui/package-lock.json
+      - name: Install provider icons dependencies
+        working-directory: bb-plugin-provider-icons
+        run: npm ci --no-audit --no-fund
+      - name: Check provider icons types
+        working-directory: bb-plugin-provider-icons
+        run: npm test
+      - name: Install Rich UI dependencies
+        working-directory: bb-plugin-rich-ui
+        run: npm ci --no-audit --no-fund
+      - name: Check Rich UI types and rendering
+        working-directory: bb-plugin-rich-ui
+        run: |
+          npm run typecheck
+          npm test
