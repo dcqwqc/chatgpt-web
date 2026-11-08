@@ -37,6 +37,8 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 import local_history
 from generated_media import download_generated_images, image_asset_ids
+from maintenance.accepted_stream import wait_for_original_final
+from cooldown import retry_after_seconds
 
 from cli_preferences import (
     PROJECT_NAME, PROJECT_ID_RE, MODEL_RE, load_preferences, save_preferences,
@@ -653,25 +655,47 @@ class ChatGPTWebClient:
                     previous, prompt, attachments or [], observe
                 )
             except (httpx.ReadTimeout, httpx.ReadError,
-                    httpx.RemoteProtocolError):
-                # The POST may already be accepted. NEVER resend. A read-only
-                # recovery succeeds only when the exact submitted user message
-                # and a completed final answer are both present in the same
-                # verified conversation. Otherwise propagate the original error.
+                    httpx.RemoteProtocolError) as transport_error:
+                # The original POST was accepted and the assistant may still
+                # be actively using tools even when its SSE peer disconnects.
+                # Keep the ACP response alive through GET-only verification,
+                # without touching the running ChatGPT turn or shared daemon.
                 candidate = submission.get("conversation_id")
                 message_id = submission.get("message_id")
                 if not (isinstance(candidate, str) and candidate
                         and isinstance(message_id, str) and message_id):
                     raise
-                try:
-                    recovered = self.get_conversation(candidate)
-                except (ChatGPTWebError, httpx.HTTPError, ValueError, OSError):
-                    raise
-                if not verified_saved_answer(recovered, message_id, previous_ids):
-                    raise
                 if on_event:
                     on_event({"type": "phase",
-                              "status": "Recovered verified saved answer…"})
+                              "status": "Stream interrupted · following original saved response…"})
+                try:
+                    recovered = wait_for_original_final(
+                        lambda: self.get_conversation(candidate),
+                        lambda doc: (doc.get("id") == candidate
+                                     and verified_saved_answer(doc, message_id, previous_ids)),
+                        on_progress=(
+                            (lambda attempt: on_event({
+                                "type": "phase",
+                                "status": "Original ChatGPT turn still running · read-only check "
+                                          + str(attempt) + "…"}))
+                            if on_event else None),
+                        transient_errors=(httpx.HTTPError, OSError, ValueError, ChatGPTWebError),
+                        rate_limit_delay=lambda err: (
+                            retry_after_seconds(str(err))
+                            if isinstance(err, ChatGPTWebError)
+                            else None),
+                        timeout_seconds=1050,
+                        poll_seconds=75,
+                    )
+                except TimeoutError as wait_error:
+                    raise ChatGPTWebError(
+                        "Accepted ChatGPT request is still running after transport "
+                        "recovery deadline. Do not resend; restore the verified "
+                        "original saved response by message ID."
+                    ) from wait_error
+                if on_event:
+                    on_event({"type": "phase",
+                              "status": "Recovered verified original response"})
                 resolved_id, submitted_message_id = candidate, message_id
                 conversation = recovered
             if on_event:

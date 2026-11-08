@@ -72,6 +72,128 @@ def original_prompt(db: sqlite3.Connection, tid: str, digest: str) -> str | None
     return found[0] if len(found) == 1 else None
 
 
+
+TRANSPORT_FAILURE_MARKERS = (
+    "incomplete chunked read", "daemon stream ended without a result",
+    "peer closed connection", "remoteprotocolerror", "read timeout",
+)
+
+
+def legacy_candidate(db: sqlite3.Connection, session: dict, path: Path) -> dict | None:
+    """Detect errored, older ACP sessions that lost the accepted message ID.
+
+    This read-only step does NOT infer acceptance: the real website message
+    must later be fetched, matched by exact prompt and timestamp, and finished.
+    """
+    if session.get("pending_turn") is not None:
+        return None
+    cid = session.get("conversation_id")
+    cwd = session.get("cwd")
+    if (not isinstance(cid, str) or not CONVERSATION_RE.fullmatch(cid)
+            or not isinstance(cwd, str)):
+        return None
+    tid = Path(cwd).name
+    if not THREAD_RE.fullmatch(tid):
+        return None
+    if db.execute("SELECT provider_id,status FROM threads WHERE id=?",
+                  (tid,)).fetchone() != ("acp-chatgpt-web", "error"):
+        return None
+    err = db.execute("""
+        SELECT data FROM events WHERE thread_id=? AND type='provider/error'
+        ORDER BY sequence DESC LIMIT 1""", (tid,)).fetchone()
+    if not err:
+        return None
+    try:
+        detail = str(json.loads(err[0]).get("detail", "")).lower()
+    except (ValueError, TypeError):
+        return None
+    if not any(marker in detail for marker in TRANSPORT_FAILURE_MARKERS):
+        return None
+    # Only consider the most recent user-authored turn. An intervening BB
+    # retry/continuation makes reconstruction ambiguous and must fail closed.
+    request = db.execute("""
+        SELECT data,created_at FROM events WHERE thread_id=?
+        AND type='client/turn/requested' ORDER BY sequence DESC LIMIT 1
+        """, (tid,)).fetchone()
+    if request is None:
+        return None
+    try:
+        data = json.loads(request[0])
+        blocks = data.get("input")
+        if (data.get("initiator") != "user" or data.get("retryOfRequestId")
+                or not isinstance(blocks, list) or len(blocks) != 1
+                or not isinstance(blocks[0], dict)
+                or blocks[0].get("type") != "text"
+                or not isinstance(blocks[0].get("text"), str)):
+            return None
+        prompt = blocks[0]["text"]
+        created = int(request[1])
+        if not prompt.strip():
+            return None
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+    return {"thread_id": tid, "conversation_id": cid,
+            "prompt": prompt, "created_at_ms": created,
+            "session_id": path.stem, "legacy": True}
+
+
+def reconstruct_identity(item: dict) -> bool:
+    """Confirm the last ChatGPT user ID against BB before saving it atomically."""
+    got = run(str(CLI), "show", item["conversation_id"], "--output", "json",
+              timeout=42)
+    if got is None or got.returncode or len(got.stdout) > 12_000_000:
+        return False
+    try:
+        doc = json.loads(got.stdout)
+        if doc.get("id") != item["conversation_id"]:
+            return False
+        messages = doc.get("messages")
+        if not isinstance(messages, list):
+            return False
+        users = [(i, m) for i, m in enumerate(messages)
+                 if isinstance(m, dict) and m.get("role") == "user"]
+        if not users:
+            return False
+        index, last = users[-1]
+        mid = last.get("id")
+        source = "\n".join(part for part in last.get("parts", [])
+                           if isinstance(part, str))
+        created = last.get("create_time")
+        if (not isinstance(mid, str) or not mid
+                or last.get("status") != "finished_successfully"
+                or not isinstance(created, (int, float))
+                or abs(created * 1000 - item["created_at_ms"]) > 300000
+                or item["prompt"] not in source):
+            return False
+        if verified_final(doc, conversation_id=item["conversation_id"],
+                          message_id=mid, user_prompt=item["prompt"]) is None:
+            return False
+        session_file = SESSIONS / (item["session_id"] + ".json")
+        original = session_file.read_bytes()
+        session = json.loads(original)
+        if (session.get("pending_turn") is not None
+                or session.get("conversation_id") != item["conversation_id"]
+                or Path(str(session.get("cwd", ""))).name != item["thread_id"]
+                or check_status(item["thread_id"]) != "error"):
+            return False
+        session["pending_turn"] = {
+            "accepted": True, "message_id": mid,
+            "conversation_id": item["conversation_id"],
+            "prompt_sha256": hashlib.sha256(item["prompt"].encode()).hexdigest(),
+        }
+        tmp = session_file.with_suffix(".json.reconcile.tmp")
+        tmp.write_text(json.dumps(session, ensure_ascii=False, indent=2) + "\n")
+        os.chmod(tmp, 0o600)
+        # Confirm the source did not change during the GET or our write.
+        if session_file.read_bytes() != original:
+            tmp.unlink(missing_ok=True)
+            return False
+        tmp.replace(session_file)
+        item["message_id"] = mid
+        return True
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+
 def candidates() -> list[dict[str, str]]:
     result = []
     if not SESSIONS.is_dir():
@@ -89,6 +211,9 @@ def candidates() -> list[dict[str, str]]:
                     continue
                 pending = session.get("pending_turn")
                 if not isinstance(pending, dict) or pending.get("accepted") is not True:
+                    old = legacy_candidate(db, session, path)
+                    if old is not None:
+                        result.append(old)
                     continue
                 cwd = session.get("cwd")
                 if not isinstance(cwd, str):
@@ -160,6 +285,11 @@ def reconcile_once() -> list[dict[str, str]]:
             return []
         for item in budget:
             tid = item["thread_id"]
+            # An older adapter can finish the website turn while losing its
+            # pending_turn metadata. Reconstruct only after independent,
+            # read-only final-response evidence; never re-post the prompt.
+            if item.get("legacy") and not reconstruct_identity(item):
+                continue
             key = item["message_id"]
             path = STATE / (hashlib.sha256((tid + ":" + key).encode()).hexdigest() + ".json")
             try:

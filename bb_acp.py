@@ -622,6 +622,7 @@ class Server:
         attempt = 0
         while asyncio.get_running_loop().time() < deadline:
             attempt += 1
+            delay = 75  # Bound GETs; fast polling can exhaust account rate limits.
             try:
                 process = await asyncio.create_subprocess_exec(
                     CLI, "show", conversation_id, "--output", "json",
@@ -629,6 +630,12 @@ class Server:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE)
                 output, error = await asyncio.wait_for(process.communicate(), timeout=38)
+                if process.returncode != 0:
+                    # A GET throttle is not a prompt failure. Honor the
+                    # server's Retry-After before another read-only check.
+                    cooldown = retry_after_seconds(error.decode("utf8", "replace"))
+                    if cooldown is not None:
+                        delay = max(delay, cooldown + 5)
                 if process.returncode == 0 and len(output) <= 12_000_000:
                     document = json.loads(output)
                     answer = verified_final(
@@ -651,7 +658,7 @@ class Server:
             await self.activity(sid, row_id,
                                 f"ChatGPT Web · Awaiting original saved response (check {attempt})",
                                 kind="think")
-            await asyncio.sleep(12)
+            await asyncio.sleep(min(delay, max(0, deadline - asyncio.get_running_loop().time())))
         raise RuntimeError(
             "The original accepted ChatGPT turn has not produced a verifiable "
             "final answer. Recovery is still pending; no request was resubmitted.")

@@ -37,13 +37,13 @@ class AcceptedTurnReconcilerTests(unittest.TestCase):
         }))
         with sqlite3.connect(self.bb / "bb.db") as db:
             db.execute("CREATE TABLE threads (id TEXT, provider_id TEXT, status TEXT)")
-            db.execute("CREATE TABLE events (thread_id TEXT,sequence INTEGER,type TEXT,data TEXT)")
+            db.execute("CREATE TABLE events (thread_id TEXT,sequence INTEGER,type TEXT,data TEXT,created_at INTEGER)")
             db.execute("INSERT INTO threads VALUES (?,?,?)",(
                 self.tid, "acp-chatgpt-web", "error"))
-            db.execute("INSERT INTO events VALUES (?,?,?,?)", (self.tid,1,
+            db.execute("INSERT INTO events VALUES (?,?,?,?,?)", (self.tid,1,
                 "client/turn/requested",json.dumps({
-                    "source":"spawn","requestId":"req1",
-                    "input":[{"type":"text","text":self.prompt}]})))
+                    "source":"spawn","initiator":"user","requestId":"req1",
+                    "input":[{"type":"text","text":self.prompt}]}),1760000000000))
         self.document = {"id":self.cid,"messages":[
             {"role":"user","id":self.mid,"status":"finished_successfully",
              "parts":["system\n"+self.prompt]},
@@ -89,6 +89,61 @@ class AcceptedTurnReconcilerTests(unittest.TestCase):
         self.assertEqual(len(calls),1)
         self.assertEqual(calls[0][1],"show")
         self.assertEqual(list(self.state.glob("*.json")),[])
+
+    def prepare_legacy(self):
+        s=json.loads(self.session_file.read_text())
+        s.pop("pending_turn")
+        s["conversation_id"]=self.cid
+        self.session_file.write_text(json.dumps(s))
+        self.document["messages"][0]["create_time"]=1760000000
+        with sqlite3.connect(self.bb / "bb.db") as db:
+            db.execute("INSERT INTO events VALUES (?,?,?,?,?)",(
+                self.tid,2,"provider/error",
+                json.dumps({"detail":"peer closed connection (incomplete chunked read)"}),
+                1760000010000))
+
+    def test_legacy_transport_failure_recovers_exact_original_only(self):
+        self.prepare_legacy()
+        calls=[]
+        def fake_run(*args,**kwargs):
+            calls.append(args[1:])
+            if args[1]=="show":
+                return SimpleNamespace(returncode=0, stdout=json.dumps(self.document))
+            return SimpleNamespace(returncode=0, stdout='{"ok":true}')
+        with patch.object(reconciler, "run", side_effect=fake_run):
+            report=reconciler.reconcile_once()
+        self.assertEqual(report,[{"thread":self.tid,"status":"dispatched"}])
+        self.assertEqual([x[0] for x in calls],["show","show","thread","thread"])
+        saved=json.loads(self.session_file.read_text())
+        self.assertEqual(saved["pending_turn"]["message_id"],self.mid)
+
+    def test_legacy_incomplete_source_does_not_modify_session(self):
+        self.prepare_legacy()
+        self.document["messages"][1]["status"]="in_progress"
+        original=self.session_file.read_bytes()
+        with patch.object(reconciler, "run",
+                          return_value=SimpleNamespace(returncode=0,stdout=json.dumps(self.document))) as run:
+            self.assertEqual(reconciler.reconcile_once(),[])
+            run.assert_called_once()
+        self.assertEqual(self.session_file.read_bytes(),original)
+
+    def test_legacy_wrong_user_identity_rejected(self):
+        self.prepare_legacy()
+        self.document["messages"][0]["parts"]=["a completely different request"]
+        original=self.session_file.read_bytes()
+        with patch.object(reconciler, "run",
+                          return_value=SimpleNamespace(returncode=0,stdout=json.dumps(self.document))):
+            self.assertEqual(reconciler.reconcile_once(),[])
+        self.assertEqual(self.session_file.read_bytes(),original)
+
+    def test_legacy_other_provider_error_rejected(self):
+        self.prepare_legacy()
+        with sqlite3.connect(self.bb/"bb.db") as db:
+            db.execute("UPDATE events SET data=? WHERE type='provider/error'",
+                       (json.dumps({"detail":"permission denied"}),))
+        with patch.object(reconciler, "run") as run:
+            self.assertEqual(reconciler.reconcile_once(),[])
+            run.assert_not_called()
 
     def test_unrelated_thread_and_malformed_sessions_are_skipped(self):
         with sqlite3.connect(self.bb / "bb.db") as db:

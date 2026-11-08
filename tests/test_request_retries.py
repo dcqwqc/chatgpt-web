@@ -65,7 +65,7 @@ class ReadOnlyRecoveryTests(unittest.TestCase):
 
     @staticmethod
     def saved_answer(*, done=True, channel="final", msg="Submitted answer"):
-        return {"gizmo_id": "proj", "messages": [
+        return {"id": "conversation", "gizmo_id": "proj", "messages": [
             {"id": "old", "author": {"role": "user"}},
             {"id": "submitted-uuid", "author": {"role": "user"},
              "status": "finished_successfully"},
@@ -102,8 +102,12 @@ class ReadOnlyRecoveryTests(unittest.TestCase):
                     callback({"type":"submission_identity", "message_id":"submitted-uuid"})
                     raise httpx.ReadTimeout("stream timed out")
                 self.client.send_prompt_direct.side_effect = timeout
-                with self.assertRaises(httpx.ReadTimeout):
-                    self.client.send_prompt("conversation", "test")
+                with patch.object(self.m, "wait_for_original_final",
+                                  side_effect=TimeoutError("original unfinished")):
+                    with self.assertRaisesRegex(self.m.ChatGPTWebError,
+                                                "Accepted ChatGPT request is still running"):
+                        self.client.send_prompt("conversation", "test")
+                self.assertFalse(self.m.verified_saved_answer(saved, "submitted-uuid", {"old"}))
                 self.client.send_prompt_direct.assert_called_once()
                 self.client.send_prompt_direct.reset_mock()
                 self.client.get_conversation.reset_mock()
@@ -114,6 +118,10 @@ class ReadOnlyRecoveryTests(unittest.TestCase):
             callback({"type":"submission_identity", "message_id":"another-id"})
             raise httpx.ReadTimeout("stream timed out")
         self.client.send_prompt_direct.side_effect = timeout
-        with self.assertRaises(httpx.ReadTimeout):
-            self.client.send_prompt("conversation", "test")
+        with patch.object(self.m, "wait_for_original_final",
+                          side_effect=TimeoutError("wrong accepted message ID")):
+            with self.assertRaisesRegex(self.m.ChatGPTWebError,
+                                        "Accepted ChatGPT request is still running"):
+                self.client.send_prompt("conversation", "test")
+        self.assertFalse(self.m.verified_saved_answer(self.saved_answer(), "another-id", {"old"}))
         self.client.send_prompt_direct.assert_called_once()
