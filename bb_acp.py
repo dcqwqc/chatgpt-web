@@ -240,11 +240,14 @@ def accepted_session_for_cwd(cwd: Any) -> dict[str, Any] | None:
     """Recover across a new ACP session ID only for the exact BB workspace.
 
     BB may allocate a replacement ACP session on a failed-turn retry.
-    The previous accepted message must not be sent again in that case.
+    An explicitly superseded, stalled source remains bound to its original
+    conversation, so a user-authorized fresh continuation is never misrouted
+    into a new chat.
     """
     if not isinstance(cwd, str) or not cwd or not ROOT.is_dir():
         return None
     matches = []
+    resumable = []
     for candidate in ROOT.glob("*.json"):
         if not SESSION_RE.fullmatch(candidate.stem):
             continue
@@ -253,14 +256,30 @@ def accepted_session_for_cwd(cwd: Any) -> dict[str, Any] | None:
         except (OSError, ValueError):
             continue
         pending = session.get("pending_turn")
-        if (session.get("cwd") == cwd and isinstance(pending, dict)
-                and pending.get("accepted") is True):
+        if session.get("cwd") != cwd:
+            continue
+        if isinstance(pending, dict) and pending.get("accepted") is True:
             matches.append(session)
+        elif (pending is None
+              and session.get("archived_accepted_turn", {}).get("resolution")
+              == "explicit-user-continuation"
+              and isinstance(session.get("conversation_id"), str)
+              and CONVERSATION_RE.fullmatch(session["conversation_id"])):
+            resumable.append(session)
     if len(matches) > 1:
         raise RuntimeError(
             "Multiple accepted ChatGPT turns exist for this workspace; "
             "ambiguous recovery is blocked without resubmitting.")
-    return matches[0] if matches else None
+    if matches:
+        return matches[0]
+    if len(resumable) > 1:
+        # The original session is authoritative only if all copies refer to
+        # exactly one conversation; otherwise a fresh turn must fail closed.
+        ids = {item["conversation_id"] for item in resumable}
+        if len(ids) != 1:
+            raise RuntimeError("Conflicting saved ChatGPT conversations for workspace")
+        resumable.sort(key=lambda item: item["sessionId"])
+    return resumable[-1] if resumable else None
 
 
 def remove_bb_system_envelope(text: str) -> str:

@@ -37,6 +37,24 @@ class NoCatalogRecoveryTests(unittest.IsolatedAsyncioTestCase):
         }
         bb_acp.save_session(self.session)
 
+    async def test_user_authorized_continuation_preserves_saved_chat_on_new_session(self):
+        previous = dict(self.session)
+        previous.pop("pending_turn")
+        previous["archived_accepted_turn"] = {
+            "resolution": "explicit-user-continuation",
+            "message_id": self.pending["message_id"],
+        }
+        bb_acp.save_session(previous)
+        with patch.object(bb_acp, "model_capabilities",
+                          return_value=[{"slug":"gpt-6-thinking","efforts":[]}]) as catalog:
+            await self.server.dispatch({"jsonrpc":"2.0","id":10,
+                                        "method":"session/new","params":{"cwd":self.cwd}})
+        catalog.assert_called()
+        self.assertIn("result",self.sent[-1])
+        stored=bb_acp.load_session(self.sent[-1]["result"]["sessionId"])
+        self.assertEqual(stored["conversation_id"], self.pending["conversation_id"])
+        self.assertNotIn("pending_turn",stored)
+
     async def test_new_session_recovers_without_model_catalog_network(self):
         with patch.object(bb_acp, "model_capabilities",
                           side_effect=RuntimeError("429 rate limit")) as network:
