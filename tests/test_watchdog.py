@@ -30,6 +30,7 @@ class WatchdogPolicyTests(unittest.TestCase):
             patch.object(watchdog, "composer_ready", return_value=(True, "")),
             patch.object(watchdog, "shared_daemon_busy", return_value=False),
             patch.object(watchdog, "daemon_build_current", return_value=True),
+            patch.object(watchdog, "committed_daemon_source", return_value=True),
         ]
         self.mocks = [p.start() for p in self.patches]
         for p in self.patches:
@@ -86,6 +87,14 @@ class WatchdogPolicyTests(unittest.TestCase):
     def test_stale_daemon_with_active_work_cannot_restart(self):
         self.mocks[10].return_value = False
         self.mocks[9].return_value = True
+        first=watchdog.run_once()
+        self.assertFalse(first["daemon_build_current"])
+        self.mocks[6].assert_not_called()
+        self.assertNotIn("daemon_upgrade_last_restart",first)
+
+    def test_stale_daemon_with_dirty_source_cannot_restart(self):
+        self.mocks[10].return_value = False
+        self.mocks[11].return_value = False
         first=watchdog.run_once()
         self.assertFalse(first["daemon_build_current"])
         self.mocks[6].assert_not_called()

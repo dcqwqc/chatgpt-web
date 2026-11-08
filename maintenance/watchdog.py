@@ -82,6 +82,24 @@ def daemon_ready() -> bool:
         return False
 
 
+def committed_daemon_source() -> bool:
+    """Allow code rollout only when the installed daemon source is committed.
+
+    Workers may be writing the file while a separate watchdog timer fires.
+    A half-written or uncommitted source must never become an active process.
+    """
+    repo = Path(__file__).resolve().parents[1]
+    try:
+        probe = subprocess.run(
+            ["git", "-C", str(repo), "diff", "--quiet", "HEAD", "--",
+             "chatgpt-web", "maintenance/watchdog.py"],
+            capture_output=True, timeout=8, check=False,
+        )
+        return probe.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def daemon_build_current() -> bool | None:
     """Compare the live daemon's boot-time code fingerprint to installed code.
 
@@ -237,7 +255,10 @@ def run_once() -> dict:
     if (daemon and browser and build_current is False
             and now - state.get("daemon_upgrade_last_restart", 0)
             >= UPGRADE_COOLDOWN):
-        if (busy_threads() is False
+        if not committed_daemon_source():
+            print("BB ChatGPT Web: deferred code upgrade; source is not a "
+                  "clean committed revision", flush=True)
+        elif (busy_threads() is False
                 and shared_daemon_busy(Path.home()) is False):
             state["daemon_upgrade_last_restart"] = now
             result = cmd("systemctl", "--user", "restart", DAEMON, timeout=45)
