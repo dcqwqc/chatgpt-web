@@ -26,7 +26,13 @@ def preserve_progress(fragment: str, *, rich_ui: bool = False) -> str:
     def substitute(match: re.Match[str]) -> str:
         percent = min(100, max(0, int(match.group(1))))
         if rich_ui:
-            return '\n\n::chatgpt-progress{value="' + str(percent) + '"}\n\n'
+            fills = re.findall(r'background="([^"\n]+)"', match.group(0))
+            fill = fills[-1] if fills else ""
+            tone = ("success" if fill in ("success-solid", "success") else
+                    "warning" if fill in ("warning-solid", "warning") else
+                    "danger" if fill in ("danger-solid", "destructive", "error") else
+                    "neutral")
+            return f'\n\n::chatgpt-progress{{value="{percent}" tone="{tone}"}}\n\n'
         filled = round(percent * 16 / 100)
         return '\n' + '━' * filled + '─' * (16 - filled) + '\n'
     return PROGRESS_TRACK.sub(substitute, fragment)

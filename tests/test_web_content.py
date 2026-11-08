@@ -63,8 +63,15 @@ class RichContentTests(unittest.TestCase):
                   '<box width="73%" height="100%" background="success-solid"/>'
                   '</box>')
         self.assertEqual(render_web_elements(source, rich_ui=True).strip(),
-                         '::chatgpt-progress{value="73"}')
+                         '::chatgpt-progress{value="73" tone="success"}')
         self.assertIn('━━━━', render_web_elements(source))
+
+    def test_progress_tone_is_taken_from_source_fill(self):
+        source = ('<box background="surface-tertiary" height="10px" radius="full" clip>'
+                  '<box width="25%" height="100%" background="secondary"/>'
+                  '</box>')
+        self.assertEqual(render_web_elements(source, rich_ui=True).strip(),
+                         '::chatgpt-progress{value="25" tone="neutral"}')
 
     def test_directive_not_inserted_inside_fenced_source(self):
         example = ('```jsx\n<box background="surface-tertiary" height="8px" radius="full" clip>'

@@ -13,6 +13,10 @@ export function ChatGPTProgress({ attributes, source }: PluginMessageDirectivePr
   if (percent === null) return <span className="text-muted-foreground">{source}</span>;
   const label = (attributes.label ?? "Progress").slice(0, 100);
   const completed = Math.max(0, Math.min(100, percent));
+  const tone = attributes.tone;
+  const fill = tone === "success" ? "var(--success)" :
+               tone === "warning" ? "var(--warning)" :
+               tone === "danger" ? "var(--destructive)" : "var(--primary)";
   return (
     <div
       role="progressbar"
@@ -23,8 +27,8 @@ export function ChatGPTProgress({ attributes, source }: PluginMessageDirectivePr
       className="my-2 w-full max-w-full overflow-hidden rounded-full bg-muted h-2"
     >
       <div
-        className="h-full rounded-full bg-primary transition-[width] duration-200 ease-out motion-reduce:transition-none"
-        style={{ width: `${completed}%` }}
+        className="h-full rounded-full transition-[width] duration-200 ease-out motion-reduce:transition-none"
+        style={{ width: `${completed}%`, backgroundColor: fill }}
       />
     </div>
   );
