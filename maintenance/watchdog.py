@@ -31,7 +31,7 @@ ROOT = Path.home() / ".local/state/chatgpt-web/watchdog"
 STATE = ROOT / "status.json"
 RUNTIME = Path(os.getenv("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
 DAEMON_SOCKET = RUNTIME / "chatgpt-web/daemon-v4.sock"
-BROWSER = "qwqc-image-browser-session.service"
+BROWSER = os.environ.get("CHATGPT_WEB_BROWSER_UNIT", "")
 DAEMON = "chatgpt-web.service"
 COOLDOWN = 900
 FAILURE_THRESHOLD = 3
@@ -182,7 +182,10 @@ def busy_image_jobs() -> bool | None:
     The image workflow worker stays active even while idle, so service state
     alone is not evidence of an active render. Check its durable job ledger.
     """
-    db = Path.home() / "services/image-workflow/data/image-workflow.sqlite3"
+    configured = os.environ.get("CHATGPT_WEB_IMAGE_JOBS_DB", "")
+    if not configured:
+        return None
+    db = Path(configured).expanduser()
     try:
         with sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2) as conn:
             row = conn.execute(
@@ -206,7 +209,7 @@ def run_once() -> dict:
     except (OSError, ValueError):
         state = {}
     now = time.time()
-    browser = active(BROWSER) and browser_ready()
+    browser = (active(BROWSER) if BROWSER else True) and browser_ready()
     # Real socket challenge-response is the source of truth, not
     # systemd.is-active: a duplicate CLI invocation exits cleanly while
     # the existing owner daemon continues to serve ACP sessions.
@@ -222,7 +225,7 @@ def run_once() -> dict:
     # No restart before 3 consecutive failed checks (normally >=4 minutes).
     # Never interrupt a BB run or act when the thread API cannot be checked.
     for name, service in (("browser", BROWSER), ("daemon", DAEMON)):
-        if not allowed_repair(state, name, now):
+        if not service or not allowed_repair(state, name, now):
             continue
         # If Chrome is down, restarting the daemon is neither useful nor safe.
         # Repair the browser first and let the next checks assess the daemon.

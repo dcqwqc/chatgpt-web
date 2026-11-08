@@ -20,7 +20,7 @@ class SSEActivityTests(unittest.TestCase):
         client.create_sentinel_headers = lambda on_phase=None: {}
         client.create_conversation_body = lambda *_args: {"messages": [{"id": "submitted"}]}
         client.target_project_id = lambda: "project"
-        code = '{"path":"/Philipedia Terminal/link_1234/run_command","args":{"host":"philipedia"}}'
+        code = '{"path":"/Example Terminal/link_1234/run_command","args":{"host":"example"}}'
         sample = [
             {"message":{"id":"tool1","author":{"role":"assistant"},
                         "recipient":"api_tool.call_tool",

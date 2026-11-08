@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import tempfile
 
-PROJECT_NAME = "CLI"
+PROJECT_NAME = os.environ.get("CHATGPT_WEB_PROJECT_NAME", "CLI").strip() or "CLI"
 PROJECT_ID_RE = re.compile(r"^g-p-[a-f0-9]{32}$")
 MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,79}$")
 

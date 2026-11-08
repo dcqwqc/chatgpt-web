@@ -21,22 +21,30 @@ def source_catalog():
     return models
 
 class BbCorePolicyTests(unittest.TestCase):
-    def test_published_policy_is_read_from_bb_data_dir(self):
-        value = bb_acp.load_bb_core_policy()
-        self.assertIn("Shared Agent Operating Contract", value)
-        self.assertGreater(len(value), 1000)
+    def test_operator_policy_is_optional_and_loaded_only_when_configured(self):
+        with patch.dict("os.environ", {"CHATGPT_WEB_ACP_POLICY_FILE": ""}):
+            self.assertEqual(bb_acp.load_bb_core_policy(), "")
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "policy.md"
+            path.write_text("Example operator policy")
+            with patch.dict("os.environ", {"CHATGPT_WEB_ACP_POLICY_FILE": str(path)}):
+                self.assertEqual(bb_acp.load_bb_core_policy(), "Example operator policy")
+                policy, digest = bb_acp.adapter_policy({"cwd": "/workspace"})
+                self.assertIn("Example operator policy", policy)
+                self.assertEqual(len(digest), 64)
 
-    def test_missing_or_empty_core_policy_fails_closed(self):
-        with tempfile.TemporaryDirectory() as d, patch.object(
-            bb_acp.Path, "home", return_value=Path(d)
-        ):
-            with self.assertRaisesRegex(RuntimeError, "not published"):
-                bb_acp.load_bb_core_policy()
-            folder = Path(d) / ".bb"
-            folder.mkdir()
-            (folder / "AGENTS.md").write_text("")
-            with self.assertRaisesRegex(RuntimeError, "empty"):
-                bb_acp.load_bb_core_policy()
+    def test_explicit_policy_missing_empty_or_oversized_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "policy.md"
+            with patch.dict("os.environ", {"CHATGPT_WEB_ACP_POLICY_FILE": str(path)}):
+                with self.assertRaisesRegex(RuntimeError, "missing"):
+                    bb_acp.load_bb_core_policy()
+                path.write_text("")
+                with self.assertRaisesRegex(RuntimeError, "empty"):
+                    bb_acp.load_bb_core_policy()
+                path.write_text("x" * 256_001)
+                with self.assertRaisesRegex(RuntimeError, "too large"):
+                    bb_acp.load_bb_core_policy()
 
 
 class BbInstructionEnvelopeTests(unittest.TestCase):
@@ -63,7 +71,7 @@ class FamilyTests(unittest.TestCase):
         self.assertEqual(x["gpt-6-mini"],{
             "instant":"gpt-6-mini","thinking":"gpt-6-t-mini"})
         self.assertEqual([r["name"] for r in bb_acp.model_rows(source_catalog())],
-            ["GPT-6","GPT-6 Mini","GPT-5.6 Sol","GPT-5.6 Luna"])
+            ["GPT-6","GPT-6 Mini","GPT-5.6","GPT-5.6 Mini"])
         self.assertEqual(bb_acp.build_families([{"slug":"gpt-6-instant"}]),
                          {"gpt-6":{"instant":"gpt-6-instant"}})
 
@@ -160,8 +168,8 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                           side_effect=fake_exec):
             await self.server.do_prompt(54, sid, [{"type": "text", "text": payload}])
         self.assertIn("USER-TEXT", args_seen[-1])
-        self.assertIn("[BB Agent Control — published Core Instructions]", args_seen[-1])
-        self.assertIn("Shared Agent Operating Contract", args_seen[-1])
+        self.assertIn("[ChatGPT Web ACP adapter", args_seen[-1])
+        self.assertNotIn("Shared Agent Operating Contract", args_seen[-1])
         self.assertNotIn("bb-only secret tool instructions", args_seen[-1])
         self.assertEqual(self.records[-1]["result"]["stopReason"], "end_turn")
 
@@ -361,7 +369,8 @@ class ImageFallbackTests(unittest.IsolatedAsyncioTestCase):
                 bb_acp,"model_capabilities",return_value=source_catalog()),patch.object(
                 bb_acp.asyncio,"create_subprocess_exec",side_effect=fake_exec),patch.object(
                 bb_acp,"image_bridge_call",side_effect=fake_bridge),patch.object(
-                bb_acp.asyncio,"sleep",new_callable=AsyncMock):
+                bb_acp.asyncio,"sleep",new_callable=AsyncMock),patch.object(
+                bb_acp, "BB_WORKER_ENDPOINT", "/worker-image"):
                 server.catalog()
                 await server.do_prompt(12,sid,[{"type":"text","text":"Generate an image of a tree."}])
             updates=[r["params"]["update"]["content"]["text"] for r in records if r.get("method")=="session/update"]
@@ -427,12 +436,12 @@ class RateLimitRecoveryTests(unittest.IsolatedAsyncioTestCase):
         async def fake_exec(*args, **kwargs):
             calls.append(args)
             return self.process(failed=len(calls) == 1)
-        async def instant_sleep(seconds):
+        async def instant_cooldown(_sid, seconds):
             self.assertEqual(seconds, 59)
         with patch.object(bb_acp.asyncio, "create_subprocess_exec",
                           side_effect=fake_exec), patch.object(
-                              bb_acp.asyncio, "sleep",
-                              side_effect=instant_sleep):
+                              self.server, "wait_rate_limit",
+                              side_effect=instant_cooldown):
             await self.server.do_prompt(
                 9, self.sid, [{"type": "text", "text": "recommend plugins for BB"}])
         self.assertEqual(len(calls), 2)
@@ -460,17 +469,49 @@ class RateLimitRecoveryTests(unittest.IsolatedAsyncioTestCase):
         async def fake_exec(*args, **kwargs):
             calls.append(args)
             return self.process(failed=True)
-        async def fake_sleep(seconds):
+        async def fake_wait(_sid, seconds):
             sleeps.append(seconds)
         with patch.object(bb_acp.asyncio, "create_subprocess_exec",
                           side_effect=fake_exec), patch.object(
-                              bb_acp.asyncio, "sleep",
-                              side_effect=fake_sleep):
+                              self.server, "wait_rate_limit",
+                              side_effect=fake_wait):
             with self.assertRaisesRegex(RuntimeError, "retry after 58 seconds"):
                 await self.server.do_prompt(
                     11, self.sid, [{"type":"text","text":"retry with bounds"}])
         self.assertEqual(len(calls), 3)
         self.assertEqual(sleeps, [59, 59])
+
+    async def test_live_countdown_reuses_one_progress_item_and_is_cancellable(self):
+        current = [100.0]
+        async def fake_sleep(seconds):
+            current[0] += seconds
+        with patch.object(bb_acp.time, "monotonic", side_effect=lambda: current[0]), patch.object(
+            bb_acp.asyncio, "sleep", side_effect=fake_sleep
+        ):
+            await self.server.wait_rate_limit(self.sid, 3)
+        updates = [row["params"]["update"] for row in self.records
+                   if row.get("method") == "session/update"]
+        self.assertEqual(len({row["toolCallId"] for row in updates}), 1)
+        self.assertEqual([row["sessionUpdate"] for row in updates],
+                         ["tool_call", "tool_call_update", "tool_call_update",
+                          "tool_call_update"])
+        self.assertTrue(any("00:03" in row["title"] for row in updates))
+        self.assertTrue(any("00:02" in row["title"] for row in updates))
+        self.assertTrue(any("00:01" in row["title"] for row in updates))
+        self.assertEqual(updates[-1]["status"], "completed")
+
+        self.records.clear()
+        event = asyncio.Event()
+        async def pause(_seconds):
+            event.set()
+            await asyncio.Event().wait()
+        with patch.object(bb_acp.asyncio, "sleep", side_effect=pause):
+            task = asyncio.create_task(self.server.wait_rate_limit(self.sid, 53))
+            await asyncio.wait_for(event.wait(), timeout=1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual(self.records[-1]["params"]["update"]["status"], "cancelled")
 
     async def test_unreasonable_retry_after_is_not_retried(self):
         calls = []

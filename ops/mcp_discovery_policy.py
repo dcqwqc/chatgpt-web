@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Enable existing read-only QWQC discovery aliases, preserving other policy.
+"""Enable read-only MCP discovery aliases, preserving other policy.
 
-MCPhub intercepts search_tools/describe_tool before the facade sees them.
+Some MCP gateways reserve discovery names before a facade receives them.
 The already implemented aliases avoid those reserved names through execute_tool.
 No credentials, execution tools or network access are added by this change.
 """
