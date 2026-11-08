@@ -13,6 +13,36 @@ def load_client():
 
 
 class SSEActivityTests(unittest.TestCase):
+    def test_connected_app_code_text_carries_actual_tool_parameters(self):
+        m = load_client()
+        client = object.__new__(m.ChatGPTWebClient)
+        client.headers = {"authorization": "local-test-only"}
+        client.create_sentinel_headers = lambda on_phase=None: {}
+        client.create_conversation_body = lambda *_args: {"messages": [{"id": "submitted"}]}
+        client.target_project_id = lambda: "project"
+        code = '{"path":"/Philipedia Terminal/link_1234/run_command","args":{"host":"philipedia"}}'
+        sample = [
+            {"message":{"id":"tool1","author":{"role":"assistant"},
+                        "recipient":"api_tool.call_tool",
+                        "metadata":{"reasoning_title":"Retrieving current Git commit"},
+                        "content":{"content_type":"code","text":code}}},
+            {"conversation_id":"verified", "message":{"id":"final","author":{"role":"assistant"},
+                       "channel":"final","content":{"parts":["Result"]}}}
+        ]
+        class FakeResponse:
+            status_code = 200
+            headers = {"content-type":"text/event-stream"}
+            def iter_lines(self):
+                for event in sample: yield "data: " + json.dumps(event)
+                yield "data: [DONE]"
+        client.http = SimpleNamespace(stream=lambda *args,**kwargs:contextlib.nullcontext(FakeResponse()))
+        events = []
+        client.send_prompt_direct(None,"Check",[],events.append)
+        calls = [e for e in events if e.get("type")=="tool_start"]
+        self.assertEqual(len(calls),1)
+        self.assertEqual(calls[0]["arguments"],code)
+        self.assertEqual(calls[0]["native_title"],"Retrieving current Git commit")
+
     def test_stream_channels_never_mix_commentary_tools_and_answer(self):
         m = load_client()
         client = object.__new__(m.ChatGPTWebClient)

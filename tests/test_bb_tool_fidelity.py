@@ -11,6 +11,12 @@ class ToolFidelityTests(unittest.TestCase):
         self.assertEqual(readable_tool_activity('web.run', '')[0], 'Search and retrieve web data')
         self.assertEqual(readable_tool_activity('mcp__Loom__loom_task_update', '')[0], 'Loom · loom_task_update')
 
+    def test_real_connected_app_envelope_preserves_specific_method(self):
+        payload = '{"path":"/Philipedia Terminal/link_abcd1234/run_command","args":{"host":"philipedia","command":"git status"}}'
+        label, actual = readable_tool_activity('api_tool.call_tool', payload)
+        self.assertEqual(label, 'Philipedia Terminal · run command')
+        self.assertEqual(actual, payload)
+
     def test_unknown_argument_format_does_not_invent_operation(self):
         self.assertEqual(readable_tool_activity('api_tool.call_tool', '{broken')[0], 'Use connected app')
         self.assertEqual(readable_tool_activity('functions.exec', '{"command":"git status"}')[0],

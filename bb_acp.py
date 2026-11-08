@@ -381,7 +381,18 @@ def readable_tool_activity(name: str, arguments: str) -> tuple[str, str]:
     except (ValueError, TypeError):
         parsed = None
     if isinstance(parsed, dict):
+        # ChatGPT connected-app calls provide the exact app and method path.
+        # The link_* segment is a private routing handle, not a human label.
+        path = parsed.get("path")
+        if isinstance(path, str) and path.startswith("/"):
+            path_parts = [part for part in path.split("/") if part and
+                          not part.startswith("link_")]
+            if len(path_parts) >= 2:
+                human_name = path_parts[0]
+                subject = path_parts[-1].replace("_", " ")
         for key in ("tool", "recipient_name", "tool_name", "operation", "command"):
+            if subject:
+                break
             value = parsed.get(key)
             if isinstance(value, str) and value and len(value) < 100:
                 subject = value.replace("mcp__", "").replace("__", " · ")
@@ -764,6 +775,13 @@ class Server:
                             r'(?i)\bBearer\s+[A-Za-z0-9_./~+\-=]{8,}',
                             'Bearer [redacted]', sanitized)
                         activity_titles[raw_id], _ = readable_tool_activity(name, sanitized)
+                        native_title = event.get("native_title")
+                        if isinstance(native_title, str) and native_title.strip():
+                            native_title = native_title.strip()
+                            native_title = re.sub(
+                                r'(?i)(authorization|api[_-]?key|password|secret|token)\s*[:=]\s*[^,\s}]+',
+                                r'\1=[redacted]', native_title)
+                            activity_titles[raw_id] = native_title[:180]
                         await self.activity(sid, activity_prefix + "-tool-" +
                                             hashlib.sha256(raw_id.encode()).hexdigest()[:12],
                                             activity_titles[raw_id], started=started,

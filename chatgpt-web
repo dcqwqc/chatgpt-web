@@ -934,18 +934,30 @@ class ChatGPTWebClient:
                             and message_id not in completed_tool_calls):
                         # SSE can first reveal the call name and only later
                         # supply its arguments. Preserve each revised snapshot.
-                        arguments = text_from_parts(
-                            message_parts(message.get("content")))[:12000]
+                        content = message.get("content")
+                        arguments = text_from_parts(message_parts(content))
+                        # ChatGPT's connected-app calls store JSON arguments in
+                        # content.text (content_type=code), *not* in parts.
+                        if (not arguments and isinstance(content, dict) and
+                                isinstance(content.get("text"), str)):
+                            arguments = content["text"]
+                        arguments = arguments[:12000]
+                        metadata = message.get("metadata")
+                        metadata = metadata if isinstance(metadata, dict) else {}
+                        native_title = metadata.get("reasoning_title")
+                        native_title = native_title[:180] if isinstance(native_title, str) else ""
                         if message_id not in seen_tool_calls:
                             seen_tool_calls.add(message_id)
                             pending_tools.setdefault(recipient, set()).add(message_id)
                             tool_argument_snapshots[message_id] = arguments
                             on_event({"type": "tool_start", "id": message_id,
-                                      "name": recipient, "arguments": arguments})
+                                      "name": recipient, "arguments": arguments,
+                                      "native_title": native_title})
                         elif tool_argument_snapshots.get(message_id) != arguments:
                             tool_argument_snapshots[message_id] = arguments
                             on_event({"type": "tool_update", "id": message_id,
-                                      "name": recipient, "arguments": arguments})
+                                      "name": recipient, "arguments": arguments,
+                                      "native_title": native_title})
                     continue
                 text = text_from_parts(message_parts(message.get("content")))
                 # Public commentary can be revised in-place by SSE. Emit a
