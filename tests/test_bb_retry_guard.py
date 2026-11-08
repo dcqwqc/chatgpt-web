@@ -47,6 +47,40 @@ class RetryProofTests(unittest.TestCase):
     def test_native_retry_can_recover_original_prompt(self):
         self.assertEqual(self.verify(), self.original)
 
+    def test_two_level_retry_preserves_original_without_another_prompt(self):
+        with sqlite3.connect(self.path / "bb.db") as db:
+            db.execute("INSERT INTO events VALUES (?,?,?,?)", (self.tid, 3,
+                "client/turn/requested", json.dumps({
+                    "source": "tell", "initiator": "system",
+                    "requestId": "req-third", "retryOfRequestId": "req-next",
+                    "input": [{"type": "text", "text": "Please continue."}]})))
+        self.assertEqual(self.verify(), self.original)
+
+    def test_retry_chain_missing_middle_fails_closed(self):
+        with sqlite3.connect(self.path / "bb.db") as db:
+            db.execute("UPDATE events SET data=? WHERE sequence=2",
+                (json.dumps({"source":"tell","requestId":"req-next",
+                             "retryOfRequestId":"absent",
+                             "input":[{"type":"text","text":"Please continue."}]}),))
+            db.execute("INSERT INTO events VALUES (?,?,?,?)", (self.tid, 3,
+                "client/turn/requested", json.dumps({
+                    "source":"tell","requestId":"req-third",
+                    "retryOfRequestId":"req-next",
+                    "input":[{"type":"text","text":"Please continue."}]})))
+        self.assertIsNone(self.verify())
+
+    def test_intermediate_user_message_fails_closed(self):
+        with sqlite3.connect(self.path / "bb.db") as db:
+            orig=json.loads(db.execute("SELECT data FROM events WHERE sequence=2").fetchone()[0])
+            orig["input"][0]["text"]="different user prompt"
+            db.execute("UPDATE events SET data=? WHERE sequence=2",(json.dumps(orig),))
+            db.execute("INSERT INTO events VALUES (?,?,?,?)", (self.tid, 3,
+                "client/turn/requested", json.dumps({
+                    "source":"tell","requestId":"req-third",
+                    "retryOfRequestId":"req-next",
+                    "input":[{"type":"text","text":"Please continue."}]})))
+        self.assertIsNone(self.verify())
+
     def test_arbitrary_user_prompt_is_not_retry(self):
         self.assertIsNone(self.verify("new unrelated work"))
 

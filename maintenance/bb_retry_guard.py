@@ -55,19 +55,60 @@ def original_prompt_for_retry(cwd: Any, pending: dict[str, Any],
                     or inputs[0].get("text") != received_prompt):
                 return None
             rows = db.execute("""
-                SELECT data FROM events WHERE thread_id=?
+                SELECT sequence,data FROM events WHERE thread_id=?
                 AND type='client/turn/requested'
                 ORDER BY sequence ASC
                 """, (tid,)).fetchall()
-            origin = next((json.loads(row[0]) for row in rows
-                           if json.loads(row[0]).get("requestId") == old_request_id), None)
-            if origin is None or not origin.get("input"):
+            by_id: dict[str, tuple[int, dict[str, Any]]] = {}
+            for seq, raw in rows:
+                event = json.loads(raw)
+                key = event.get("requestId")
+                if not isinstance(key, str) or not key or key in by_id:
+                    return None
+                by_id[key] = (seq, event)
+
+            # BB may retry an already retried turn. Traverse the complete
+            # authenticated retry lineage, rather than assuming one hop.
+            # Every intermediate hop must be a system-generated retry, never
+            # an unrelated user message or model-supplied continuation.
+            latest_id = attempt.get("requestId")
+            current_seq = by_id.get(latest_id, (None, None))[0]
+            if current_seq is None:
                 return None
-            original = origin["input"][0].get("text", "")
-            if (not isinstance(original, str) or not original
-                    or hashlib.sha256(original.encode()).hexdigest()
-                    != pending["prompt_sha256"]):
-                return None
-            return original
+            seen: set[str] = {latest_id}
+            for _ in range(24):
+                if old_request_id in seen or old_request_id not in by_id:
+                    return None
+                seen.add(old_request_id)
+                previous_seq, previous = by_id[old_request_id]
+                if previous_seq >= current_seq:
+                    return None
+                current_seq = previous_seq
+                next_id = previous.get("retryOfRequestId")
+                if isinstance(next_id, str) and next_id:
+                    blocks = previous.get("input")
+                    if (previous.get("source") != "tell"
+                            or previous.get("initiator") not in (None, "system")
+                            or not isinstance(blocks, list) or len(blocks) != 1
+                            or not isinstance(blocks[0], dict)
+                            or blocks[0].get("type") != "text"
+                            or blocks[0].get("text") != "Please continue."):
+                        return None
+                    old_request_id = next_id
+                    continue
+
+                blocks = previous.get("input")
+                if (previous.get("initiator") not in (None, "user")
+                        or not isinstance(blocks, list) or len(blocks) != 1
+                        or not isinstance(blocks[0], dict)
+                        or blocks[0].get("type") != "text"):
+                    return None
+                original = blocks[0].get("text", "")
+                if (not isinstance(original, str) or not original
+                        or hashlib.sha256(original.encode()).hexdigest()
+                        != pending["prompt_sha256"]):
+                    return None
+                return original
+            return None  # No cycles or unbounded linked retry chains.
     except (sqlite3.Error, OSError, ValueError, TypeError, KeyError):
         return None
