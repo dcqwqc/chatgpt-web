@@ -98,6 +98,37 @@ class AcceptedTurnReconcilerTests(unittest.TestCase):
         self.assertEqual([a[1] for a in calls],["show","thread"])
         self.assertEqual(calls[-1][2:5],("retry",self.tid,"--turn"))
 
+    def test_repeated_identical_user_followup_is_recoverable(self):
+        with sqlite3.connect(self.bb / "bb.db") as db:
+            first=json.loads(db.execute("SELECT data FROM events WHERE sequence=1").fetchone()[0])
+            first["source"]="tell"
+            first["initiator"]="user"
+            db.execute("UPDATE events SET data=? WHERE sequence=1",(json.dumps(first),))
+            duplicate=dict(first)
+            duplicate["requestId"]="req-latest"
+            db.execute("INSERT INTO events VALUES (?,?,?,?,?)",(
+                self.tid,2,"client/turn/requested",json.dumps(duplicate),1760001000000))
+        calls=[]
+        def fake_run(*args,**kwargs):
+            calls.append(args)
+            if args[1]=="show":
+                return SimpleNamespace(returncode=0,stdout=json.dumps(self.document))
+            return SimpleNamespace(returncode=0,stdout='{"ok":true}')
+        with patch.object(reconciler,"run",side_effect=fake_run):
+            self.assertEqual(reconciler.reconcile_once(),[
+                {"thread":self.tid,"status":"dispatched"}])
+        self.assertEqual(calls[-1][5],"req-latest")
+
+    def test_older_matching_prompt_cannot_recover_new_different_followup(self):
+        with sqlite3.connect(self.bb / "bb.db") as db:
+            other={"source":"tell","initiator":"user","requestId":"req-new",
+                   "input":[{"type":"text","text":"Different later prompt"}]}
+            db.execute("INSERT INTO events VALUES (?,?,?,?,?)",(
+                self.tid,2,"client/turn/requested",json.dumps(other),1760001000000))
+        with patch.object(reconciler,"run") as runner:
+            self.assertEqual(reconciler.reconcile_once(),[])
+            runner.assert_not_called()
+
     def test_system_synthetic_retry_cannot_be_source_prompt(self):
         with sqlite3.connect(self.bb / "bb.db") as db:
             row=json.loads(db.execute("SELECT data FROM events WHERE sequence=1").fetchone()[0])

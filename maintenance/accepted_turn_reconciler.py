@@ -50,8 +50,14 @@ def run(*args: str, timeout: int = 40) -> subprocess.CompletedProcess[str] | Non
 
 
 def original_prompt(db: sqlite3.Connection, tid: str, digest: str) -> str | None:
-    """Require one unique originating BB request, never a synthetic retry."""
-    found: list[str] = []
+    """Match the latest real user prompt, never a BB-generated retry.
+
+    Repeating a normal user phrase such as "continue" is not ambiguity:
+    only the latest real user request may correspond to the currently pending
+    accepted website message. The later source message ID and saved final
+    still need independent verification.
+    """
+    most_recent: str | None = None
     for (raw,) in db.execute("""
         SELECT data FROM events WHERE thread_id=? AND type='client/turn/requested'
         ORDER BY sequence ASC
@@ -64,8 +70,11 @@ def original_prompt(db: sqlite3.Connection, tid: str, digest: str) -> str | None
             # The initiator and retry linkage, NOT source, identify a genuine
             # user-authored request.
             if (event.get("retryOfRequestId")
-                    or event.get("initiator") not in (None, "user")
-                    or event.get("source") not in ("spawn", "tell")):
+                    or event.get("source") not in ("spawn", "tell")
+                    or (event.get("source") == "tell"
+                        and event.get("initiator") != "user")
+                    or (event.get("source") == "spawn"
+                        and event.get("initiator") not in (None, "user"))):
                 continue
             blocks = event.get("input")
             if (not isinstance(blocks, list) or len(blocks) != 1
@@ -73,12 +82,14 @@ def original_prompt(db: sqlite3.Connection, tid: str, digest: str) -> str | None
                     or blocks[0].get("type") != "text"):
                 continue
             prompt = blocks[0].get("text")
-            if (isinstance(prompt, str) and
-                    hashlib.sha256(prompt.encode()).hexdigest() == digest):
-                found.append(prompt)
+            if isinstance(prompt, str) and prompt:
+                most_recent = prompt
         except (KeyError, TypeError, ValueError):
             continue
-    return found[0] if len(found) == 1 else None
+    if (most_recent and
+            hashlib.sha256(most_recent.encode()).hexdigest() == digest):
+        return most_recent
+    return None
 
 
 
