@@ -17,6 +17,7 @@ class LiveActivityTests(unittest.IsolatedAsyncioTestCase):
             {"type": "commentary", "id": "c1", "text": "Looking into the request"},
             {"type": "tool_start", "id": "t1", "name": "functions.exec"},
             {"type": "tool_start", "id": "t1", "name": "functions.exec"},
+            {"type": "tool_end", "id": "t1", "status": "completed"},
             {"type": "delta", "text": "Old answer"},
             {"type": "replace", "text": "Corrected answer"},
             {"type": "message", "role": "assistant", "channel": "commentary",

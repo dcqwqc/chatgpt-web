@@ -33,7 +33,8 @@ class SSEActivityTests(unittest.TestCase):
                          "recipient": "functions.exec", "content": {"parts": ["invoke"]}}},
             {"message": {"id": "tool1", "author": {"role": "assistant"},
                          "recipient": "functions.exec", "content": {"parts": ["invoke"]}}},
-            {"message": {"id": "result1", "author": {"role": "tool"},
+            {"message": {"id": "result1", "author": {"role": "tool", "name": "functions.exec"},
+                         "status": "finished_successfully",
                          "content": {"parts": ["Tool output"]}}},
             {"message": {"id": "final", "author": {"role": "assistant"},
                          "channel": "final", "content": {"parts": ["Draft"]}}},
@@ -56,8 +57,8 @@ class SSEActivityTests(unittest.TestCase):
         resolved, submitted = client.send_prompt_direct(None, "Test", [], events.append)
         self.assertEqual((resolved, submitted), ("verified-conversation", "submitted-user-message"))
         self.assertEqual([e["type"] for e in events if e.get("type") in
-                         ("tool_start", "commentary", "delta", "replace")],
-                         ["commentary", "commentary", "tool_start", "delta", "replace"])
+                         ("tool_start", "tool_end", "commentary", "delta", "replace")],
+                         ["commentary", "commentary", "tool_start", "tool_end", "delta", "replace"])
         self.assertEqual([e["name"] for e in events if e.get("type") == "tool_start"],
                          ["functions.exec"])
         self.assertEqual([e["text"] for e in events if e.get("type") == "commentary"],
@@ -65,6 +66,8 @@ class SSEActivityTests(unittest.TestCase):
         self.assertEqual([e["text"] for e in events if e.get("type") == "replace"],
                          ["Final answer"])
         self.assertNotIn("private analysis", str(events))
+        self.assertEqual([e for e in events if e.get("type") == "tool_end"],
+                         [{"type": "tool_end", "id": "tool1", "status": "completed"}])
         self.assertNotIn("Tool output", str(events))
         self.assertEqual(observed[0].read, 1100.0)
         self.assertEqual(observed[0].connect, 20.0)

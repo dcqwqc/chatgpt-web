@@ -845,6 +845,8 @@ class ChatGPTWebClient:
         resolved_id: str | None = conversation_id
         rendered = ""
         seen_tool_calls: set[str] = set()
+        completed_tool_calls: set[str] = set()
+        pending_tools: dict[str, set[str]] = {}
         commentary_snapshots: dict[str, str] = {}
         if on_event:
             on_event({"type":"phase","status":"Submitting request to ChatGPT…"})
@@ -898,7 +900,25 @@ class ChatGPTWebClient:
                 if not isinstance(message, dict):
                     continue
                 author = message.get("author")
-                if not isinstance(author, dict) or author.get("role") != "assistant":
+                if not isinstance(author, dict):
+                    continue
+                if author.get("role") == "tool":
+                    # Only complete an unambiguous observed invocation. Several
+                    # concurrent calls to the same tool cannot be paired safely
+                    # without a provider call-ID, so they close at turn end.
+                    name = author.get("name")
+                    candidates = pending_tools.get(name, set()) if isinstance(name, str) else set()
+                    if (len(candidates) == 1 and message.get("status") in
+                            ("finished_successfully", "finished_unsuccessfully")):
+                        call_id = next(iter(candidates))
+                        if call_id not in completed_tool_calls and on_event:
+                            completed_tool_calls.add(call_id)
+                            candidates.remove(call_id)
+                            on_event({"type": "tool_end", "id": call_id,
+                                      "status": "completed" if message.get("status") ==
+                                      "finished_successfully" else "failed"})
+                    continue
+                if author.get("role") != "assistant":
                     continue
                 recipient = message.get("recipient")
                 channel = message.get("channel")
@@ -909,6 +929,7 @@ class ChatGPTWebClient:
                     if (on_event is not None and isinstance(message_id, str)
                             and message_id not in seen_tool_calls):
                         seen_tool_calls.add(message_id)
+                        pending_tools.setdefault(recipient, set()).add(message_id)
                         on_event({"type": "tool_start", "id": message_id,
                                   "name": recipient})
                     continue

@@ -600,6 +600,15 @@ class Server:
                                             hashlib.sha256(raw_id.encode()).hexdigest()[:12],
                                             activity_titles[raw_id],
                                             started=True, kind="other")
+                elif typ == "tool_end" and isinstance(event.get("id"), str):
+                    raw_id = event["id"]
+                    if raw_id in activity_rows:
+                        await self.activity(sid, activity_prefix + "-tool-" +
+                                            hashlib.sha256(raw_id.encode()).hexdigest()[:12],
+                                            activity_titles[raw_id],
+                                            status="failed" if event.get("status") == "failed"
+                                            else "completed")
+                        activity_rows.remove(raw_id)
                 elif typ == "commentary" and isinstance(event.get("id"), str):
                     raw_id = "commentary-" + event["id"]
                     body = event.get("text")
