@@ -70,13 +70,44 @@ class AcceptedTurnReconcilerTests(unittest.TestCase):
         with patch.object(reconciler,"run",side_effect=fake_run):
             report=reconciler.reconcile_once()
         self.assertEqual(report,[{"thread":self.tid,"status":"dispatched"}])
-        self.assertEqual([x[1] for x in calls],["show","thread","thread"])
-        self.assertEqual([x[2] for x in calls if x[1]=="thread"],["stop","retry"])
+        self.assertEqual([x[1] for x in calls],["show","thread"])
+        self.assertEqual([x[2] for x in calls if x[1]=="thread"],["retry"])
+        self.assertEqual(calls[-1][4:6],("--turn","req1"))
         self.assertEqual(reconciler.reconcile_once.__name__,"reconcile_once")
         # Bounded and persisted; never continuously resubmit.
         with patch.object(reconciler,"run",side_effect=fake_run):
             self.assertEqual(reconciler.reconcile_once(),[])
-        self.assertEqual(len(calls),3)
+        self.assertEqual(len(calls),2)
+
+    def test_real_user_tell_followup_is_recovered(self):
+        # This is exactly how BB stores a normal user follow-up.
+        with sqlite3.connect(self.bb / "bb.db") as db:
+            row=json.loads(db.execute("SELECT data FROM events WHERE sequence=1").fetchone()[0])
+            row["source"]="tell"
+            row["initiator"]="user"
+            db.execute("UPDATE events SET data=? WHERE sequence=1", (json.dumps(row),))
+        calls=[]
+        def fake_run(*args,**kwargs):
+            calls.append(args)
+            if args[1]=="show":
+                return SimpleNamespace(returncode=0, stdout=json.dumps(self.document))
+            return SimpleNamespace(returncode=0, stdout='{"ok":true}')
+        with patch.object(reconciler,"run",side_effect=fake_run):
+            self.assertEqual(reconciler.reconcile_once(),[
+                {"thread":self.tid,"status":"dispatched"}])
+        self.assertEqual([a[1] for a in calls],["show","thread"])
+        self.assertEqual(calls[-1][2:5],("retry",self.tid,"--turn"))
+
+    def test_system_synthetic_retry_cannot_be_source_prompt(self):
+        with sqlite3.connect(self.bb / "bb.db") as db:
+            row=json.loads(db.execute("SELECT data FROM events WHERE sequence=1").fetchone()[0])
+            row["source"]="tell"
+            row["initiator"]="system"
+            row["retryOfRequestId"]="other-request"
+            db.execute("UPDATE events SET data=? WHERE sequence=1",(json.dumps(row),))
+        with patch.object(reconciler,"run") as runner:
+            self.assertEqual(reconciler.reconcile_once(),[])
+            runner.assert_not_called()
 
     def test_unfinished_web_response_never_retries(self):
         self.document["messages"][1]["status"]="in_progress"
@@ -113,7 +144,7 @@ class AcceptedTurnReconcilerTests(unittest.TestCase):
         with patch.object(reconciler, "run", side_effect=fake_run):
             report=reconciler.reconcile_once()
         self.assertEqual(report,[{"thread":self.tid,"status":"dispatched"}])
-        self.assertEqual([x[0] for x in calls],["show","show","thread","thread"])
+        self.assertEqual([x[0] for x in calls],["show","show","thread"])
         saved=json.loads(self.session_file.read_text())
         self.assertEqual(saved["pending_turn"]["message_id"],self.mid)
 

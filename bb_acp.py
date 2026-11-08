@@ -1017,6 +1017,27 @@ class Server:
             if exit_code != 0:
                 errors.append(stderr or f"CLI exited with code {exit_code}")
             if errors:
+                # A user turn already accepted by ChatGPT is NOT a new failure
+                # that BB should retry by sending another prompt. The website
+                # may still be executing tools and can finish normally after
+                # the SSE peer drops. Keep this BB turn alive and reconcile the
+                # exact accepted message ID using GET only.
+                accepted = session.get("pending_turn")
+                if (submission.get("accepted") is True
+                        and isinstance(accepted, dict)
+                        and accepted.get("accepted") is True
+                        and accepted.get("prompt_sha256") == prompt_hash
+                        and isinstance(accepted.get("message_id"), str)
+                        and accepted.get("message_id")
+                        and isinstance(accepted.get("conversation_id"), str)
+                        and CONVERSATION_RE.fullmatch(accepted["conversation_id"])):
+                    await self.activity(
+                        sid, activity_prefix + "-request",
+                        "ChatGPT Web · Connection interrupted · recovering saved original",
+                        started="request" not in activity_rows, kind="other")
+                    await self.recover_accepted_turn(
+                        request_id, sid, session, accepted, user_prompt)
+                    return
                 # This specific error occurs before an API request is prepared.
                 # Do not auto-retry any ambiguous send failure: duplicates matter.
                 if (not rendered.strip() and not final.strip()

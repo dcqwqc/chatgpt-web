@@ -58,12 +58,21 @@ def original_prompt(db: sqlite3.Connection, tid: str, digest: str) -> str | None
         """, (tid,)):
         try:
             event = json.loads(raw)
-            if event.get("retryOfRequestId") or event.get("source") == "tell":
+            # BB uses source=tell for ordinary follow-ups as well as its
+            # synthetic retries. A source=tell exclusion silently drops most
+            # real requests and disables the self-healing reconciler.
+            # The initiator and retry linkage, NOT source, identify a genuine
+            # user-authored request.
+            if (event.get("retryOfRequestId")
+                    or event.get("initiator") not in (None, "user")
+                    or event.get("source") not in ("spawn", "tell")):
                 continue
             blocks = event.get("input")
-            if not isinstance(blocks, list) or not blocks:
+            if (not isinstance(blocks, list) or len(blocks) != 1
+                    or not isinstance(blocks[0], dict)
+                    or blocks[0].get("type") != "text"):
                 continue
-            prompt = blocks[0].get("text") if isinstance(blocks[0], dict) else None
+            prompt = blocks[0].get("text")
             if (isinstance(prompt, str) and
                     hashlib.sha256(prompt.encode()).hexdigest() == digest):
                 found.append(prompt)
@@ -305,11 +314,25 @@ def reconcile_once() -> list[dict[str, str]]:
                 continue
             if check_status(tid) != "error":
                 continue
-            # This controls only an already-errored BB bridge runtime. The
-            # corresponding website turn is proven complete, so it is safe to
-            # release the stale adapter before retrying the BB projection.
-            stopped = run(str(BB_CLI), "thread", "stop", tid, "--json", timeout=30)
-            if stopped is None or stopped.returncode != 0:
+            # The errored turn is already terminated. Do NOT call thread stop:
+            # stop may transition Error -> Idle, which makes BB reject retry as
+            # no_failed_turn. Only retry the verified, latest failed request.
+            with sqlite3.connect(f"file:{BB / 'bb.db'}?mode=ro",
+                                 uri=True, timeout=4) as db:
+                row = db.execute("""
+                    SELECT data FROM events WHERE thread_id=?
+                    AND type='client/turn/requested'
+                    ORDER BY sequence DESC LIMIT 1
+                    """, (tid,)).fetchone()
+            if not row:
+                continue
+            try:
+                latest = json.loads(row[0])
+            except (TypeError, ValueError):
+                continue
+            retry_id = latest.get("requestId")
+            if (not isinstance(retry_id, str) or not retry_id
+                    or latest.get("initiator") not in (None, "user", "system")):
                 continue
             state["attempts"] = int(state.get("attempts", 0)) + 1
             state["last_attempt"] = now
@@ -321,6 +344,7 @@ def reconcile_once() -> list[dict[str, str]]:
             os.chmod(temp, 0o600)
             temp.replace(path)
             retried = run(str(BB_CLI), "thread", "retry", tid,
+                          "--turn", retry_id,
                           "--reason", "Recover verified original ChatGPT final without sending again",
                           "--json", timeout=35)
             status = "dispatched" if retried and retried.returncode == 0 else "retry-error"
