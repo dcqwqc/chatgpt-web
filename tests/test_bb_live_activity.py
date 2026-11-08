@@ -15,8 +15,8 @@ class LiveActivityTests(unittest.IsolatedAsyncioTestCase):
             {"type": "phase", "status": "Waiting for ChatGPT response…", "submitted": True},
             {"type": "commentary", "id": "c1", "text": "Looking into it"},
             {"type": "commentary", "id": "c1", "text": "Looking into the request"},
-            {"type": "tool_start", "id": "t1", "name": "functions.exec"},
-            {"type": "tool_start", "id": "t1", "name": "functions.exec"},
+            {"type": "tool_start", "id": "t1", "name": "functions.exec", "arguments": ""},
+            {"type": "tool_update", "id": "t1", "name": "functions.exec", "arguments": "command=git status"},
             {"type": "tool_end", "id": "t1", "status": "completed"},
             {"type": "delta", "text": "Old answer"},
             {"type": "replace", "text": "Corrected answer"},
@@ -51,13 +51,15 @@ class LiveActivityTests(unittest.IsolatedAsyncioTestCase):
             await server.do_prompt(123, sid, [{"type": "text", "text": "test"}])
         updates = [x["params"]["update"] for x in output if x.get("method") == "session/update"]
         responses = [x["content"]["text"] for x in updates if x["sessionUpdate"] == "agent_message_chunk"]
-        self.assertEqual(responses, ["Corrected answer."])
+        self.assertEqual(responses, ["\n\nLooking into it", "\n\nLooking into the request\n\n", "\n\nCorrected answer."])
         phases = [x for x in updates if x.get("toolCallId", "").endswith("-request")]
         self.assertEqual([x["sessionUpdate"] for x in phases], ["tool_call", "tool_call_update", "tool_call_update"])
         self.assertEqual(phases[-1]["status"], "completed")
-        tool_starts = [x for x in updates if x.get("title") == "ChatGPT · functions.exec"]
-        self.assertEqual(len(tool_starts), 2)
+        tool_starts = [x for x in updates if x.get("title", "").startswith("ChatGPT · functions.exec")]
+        self.assertEqual(len(tool_starts), 3)
         self.assertEqual(tool_starts[0]["sessionUpdate"], "tool_call")
+        self.assertIn("command=git status", tool_starts[1]["title"])
+        self.assertIn("command=git status", tool_starts[1]["content"][0]["content"]["text"])
         self.assertEqual(tool_starts[-1]["status"], "completed")
         previews = [x for x in updates if x.get("toolCallId", "").endswith("-preview")]
         self.assertEqual([x["sessionUpdate"] for x in previews],
@@ -65,10 +67,10 @@ class LiveActivityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Old answer", previews[0]["title"])
         self.assertIn("Corrected answer", previews[1]["title"])
         self.assertEqual(previews[-1]["status"], "completed")
-        commentary = [x for x in updates if "Looking into" in x.get("title", "")]
-        self.assertEqual(len(commentary), 3)
-        self.assertEqual(commentary[-1]["title"], "Looking into the request")
-        self.assertEqual(commentary[-1]["status"], "completed")
+        commentary = [x for x in updates if x.get("sessionUpdate") == "agent_message_chunk"
+                      and "Looking into" in x["content"]["text"]]
+        self.assertEqual(len(commentary), 2)
+        self.assertTrue(all("toolCallId" not in x for x in commentary))
         self.assertEqual(output[-1]["result"]["stopReason"], "end_turn")
 
 if __name__ == "__main__": unittest.main()

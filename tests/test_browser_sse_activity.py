@@ -30,7 +30,7 @@ class SSEActivityTests(unittest.TestCase):
             {"message": {"id": "comment", "author": {"role": "assistant"},
                          "channel": "commentary", "content": {"parts": ["Checking files"]}}},
             {"message": {"id": "tool1", "author": {"role": "assistant"},
-                         "recipient": "functions.exec", "content": {"parts": ["invoke"]}}},
+                         "recipient": "functions.exec", "content": {"parts": [""]}}},
             {"message": {"id": "tool1", "author": {"role": "assistant"},
                          "recipient": "functions.exec", "content": {"parts": ["invoke"]}}},
             {"message": {"id": "result1", "author": {"role": "tool", "name": "functions.exec"},
@@ -57,10 +57,14 @@ class SSEActivityTests(unittest.TestCase):
         resolved, submitted = client.send_prompt_direct(None, "Test", [], events.append)
         self.assertEqual((resolved, submitted), ("verified-conversation", "submitted-user-message"))
         self.assertEqual([e["type"] for e in events if e.get("type") in
-                         ("tool_start", "tool_end", "commentary", "delta", "replace")],
-                         ["commentary", "commentary", "tool_start", "tool_end", "delta", "replace"])
+                         ("tool_start", "tool_update", "tool_end", "commentary", "delta", "replace")],
+                         ["commentary", "commentary", "tool_start", "tool_update", "tool_end", "delta", "replace"])
         self.assertEqual([e["name"] for e in events if e.get("type") == "tool_start"],
                          ["functions.exec"])
+        self.assertEqual([e["arguments"] for e in events if e.get("type") == "tool_start"],
+                         [""])
+        self.assertEqual([e["arguments"] for e in events if e.get("type") == "tool_update"],
+                         ["invoke"])
         self.assertEqual([e["text"] for e in events if e.get("type") == "commentary"],
                          ["Checking", "Checking files"])
         self.assertEqual([e["text"] for e in events if e.get("type") == "replace"],

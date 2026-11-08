@@ -352,7 +352,7 @@ class Server:
 
     async def activity(self, sid: str, call_id: str, title: str,
                        *, started: bool = False, status: str = "in_progress",
-                       kind: str = "other") -> None:
+                       kind: str = "other", detail: str = "") -> None:
         """Render a truthful, replaceable ACP activity row in BB."""
         if not title.strip():
             return
@@ -360,7 +360,10 @@ class Server:
                          "params": {"sessionId": sid, "update": {
                              "sessionUpdate": "tool_call" if started else "tool_call_update",
                              "toolCallId": call_id, "title": title[:240],
-                             "kind": kind, "status": status}}})
+                             "kind": kind, "status": status,
+                             **({"content": [{"type": "content", "content":
+                                  {"type": "text", "text": detail[:12000]}}]}
+                                if detail else {})}}})
 
     def catalog(self):
         details = model_capabilities()
@@ -591,15 +594,34 @@ class Server:
                                             kind="think")
                         activity_rows.add("request")
                         activity_titles["request"] = "ChatGPT Web · " + title
-                elif typ == "tool_start" and isinstance(event.get("id"), str):
+                elif typ in ("tool_start", "tool_update") and isinstance(event.get("id"), str):
                     raw_id = event["id"]
-                    if raw_id not in activity_rows and isinstance(event.get("name"), str):
+                    name = event.get("name")
+                    if isinstance(name, str) and (typ == "tool_update" or raw_id not in activity_rows):
+                        started = raw_id not in activity_rows
                         activity_rows.add(raw_id)
-                        activity_titles[raw_id] = "ChatGPT · " + event["name"]
+                        arguments = event.get("arguments", "")
+                        detail = arguments.strip() if isinstance(arguments, str) else ""
+                        # Tool payloads sometimes include auth headers. Do not
+                        # reproduce recognizable credentials in the BB activity.
+                        sanitized = re.sub(
+                            r'(?i)(authorization|api[_-]?key|password|secret|token)\s*[:=]\s*[^,\s}]+',
+                            r'\1=[redacted]', detail)
+                        sanitized = re.sub(
+                            r'(?i)(["\'](?:authorization|api[_-]?key|password|secret|token)["\']\s*:\s*)'
+                            r'(["\'])(?:\\.|(?!\2).)*?\2',
+                            r'\1"[redacted]"', sanitized)
+                        sanitized = re.sub(
+                            r'(?i)\bBearer\s+[A-Za-z0-9_./~+\-=]{8,}',
+                            'Bearer [redacted]', sanitized)
+                        preview = re.sub(r'\s+', ' ', sanitized).strip()
+                        activity_titles[raw_id] = "ChatGPT · " + name
+                        if preview:
+                            activity_titles[raw_id] += " · " + preview[:140]
                         await self.activity(sid, activity_prefix + "-tool-" +
                                             hashlib.sha256(raw_id.encode()).hexdigest()[:12],
-                                            activity_titles[raw_id],
-                                            started=True, kind="other")
+                                            activity_titles[raw_id], started=started,
+                                            kind="other", detail=sanitized[:4000])
                 elif typ == "tool_end" and isinstance(event.get("id"), str):
                     raw_id = event["id"]
                     if raw_id in activity_rows:
@@ -613,12 +635,21 @@ class Server:
                     raw_id = "commentary-" + event["id"]
                     body = event.get("text")
                     if isinstance(body, str) and body.strip():
-                        await self.activity(sid, activity_prefix + "-" +
-                                            hashlib.sha256(raw_id.encode()).hexdigest()[:12],
-                                            body.strip(), started=raw_id not in activity_rows,
-                                            kind="think")
-                        activity_rows.add(raw_id)
-                        activity_titles[raw_id] = body.strip()
+                        # Commentary is public assistant text. A native ACP
+                        # message chunk preserves Markdown, spacing and full
+                        # paragraphs; a tool title truncates at 240 chars.
+                        prior = activity_titles.get(raw_id, "")
+                        current = body.strip()
+                        if current.startswith(prior):
+                            new_text = current[len(prior):]
+                            if new_text:
+                                await self.update(sid, new_text if prior else "\n\n" + current)
+                        elif current != prior:
+                            # Provider replaced a snapshot. ACP cannot retract
+                            # already appended text, so publish the correction
+                            # rather than silently dropping the revision.
+                            await self.update(sid, "\n\n" + current + "\n\n")
+                        activity_titles[raw_id] = current
                 # Browser SSE supplies mutable assistant snapshots. ACP's
                 # agent_message_chunk is append-only: publishing a snapshot
                 # before the final answer makes any later "replace" event
@@ -689,6 +720,10 @@ class Server:
             # Never concatenate both: replacements are not append-only deltas.
             canonical = final if final else rendered
             if canonical:
+                # The last streamed commentary might not have ended in a
+                # newline. Keep the final answer as its own Markdown block.
+                if any(key.startswith("commentary-") for key in activity_titles):
+                    canonical = "\n\n" + canonical
                 await self.update(sid, canonical)
             for raw_id in activity_rows:
                 if raw_id == "request":

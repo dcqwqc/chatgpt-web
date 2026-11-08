@@ -845,6 +845,7 @@ class ChatGPTWebClient:
         resolved_id: str | None = conversation_id
         rendered = ""
         seen_tool_calls: set[str] = set()
+        tool_argument_snapshots: dict[str, str] = {}
         completed_tool_calls: set[str] = set()
         pending_tools: dict[str, set[str]] = {}
         commentary_snapshots: dict[str, str] = {}
@@ -927,11 +928,21 @@ class ChatGPTWebClient:
                 # invocations, never inferred or invented tool activity.
                 if isinstance(recipient, str) and recipient not in ("", "all"):
                     if (on_event is not None and isinstance(message_id, str)
-                            and message_id not in seen_tool_calls):
-                        seen_tool_calls.add(message_id)
-                        pending_tools.setdefault(recipient, set()).add(message_id)
-                        on_event({"type": "tool_start", "id": message_id,
-                                  "name": recipient})
+                            and message_id not in completed_tool_calls):
+                        # SSE can first reveal the call name and only later
+                        # supply its arguments. Preserve each revised snapshot.
+                        arguments = text_from_parts(
+                            message_parts(message.get("content")))[:12000]
+                        if message_id not in seen_tool_calls:
+                            seen_tool_calls.add(message_id)
+                            pending_tools.setdefault(recipient, set()).add(message_id)
+                            tool_argument_snapshots[message_id] = arguments
+                            on_event({"type": "tool_start", "id": message_id,
+                                      "name": recipient, "arguments": arguments})
+                        elif tool_argument_snapshots.get(message_id) != arguments:
+                            tool_argument_snapshots[message_id] = arguments
+                            on_event({"type": "tool_update", "id": message_id,
+                                      "name": recipient, "arguments": arguments})
                     continue
                 text = text_from_parts(message_parts(message.get("content")))
                 # Public commentary can be revised in-place by SSE. Emit a
