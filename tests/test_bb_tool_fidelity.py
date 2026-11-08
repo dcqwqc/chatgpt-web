@@ -1,6 +1,6 @@
 """Readable, stable, evidence-based BB activity labels."""
 import unittest
-from bb_acp import readable_tool_activity
+from bb_acp import readable_tool_activity, concise_tool_details
 
 
 class ToolFidelityTests(unittest.TestCase):
@@ -10,6 +10,12 @@ class ToolFidelityTests(unittest.TestCase):
                          'Use connected app · run_command')
         self.assertEqual(readable_tool_activity('web.run', '')[0], 'Search and retrieve web data')
         self.assertEqual(readable_tool_activity('mcp__Loom__loom_task_update', '')[0], 'Loom · loom_task_update')
+
+    def test_short_safe_command_is_visible_even_without_expandable_arguments(self):
+        payload = '{"path":"/Philipedia Terminal/link_123/run_command","args":{"host":"philipedia","command":"date +%H:%M"}}'
+        self.assertEqual(concise_tool_details(payload), 'philipedia · date +%H:%M')
+        self.assertEqual(concise_tool_details('{"args":{"host":"philipedia","command":"curl -H Authorization:Bearer secret"}}'), 'philipedia')
+        self.assertEqual(concise_tool_details('{"args":{"host":"philipedia","command":"one\\ntwo"}}'), 'philipedia')
 
     def test_real_connected_app_envelope_preserves_specific_method(self):
         payload = '{"path":"/Philipedia Terminal/link_abcd1234/run_command","args":{"host":"philipedia","command":"git status"}}'

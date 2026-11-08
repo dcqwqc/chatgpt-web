@@ -405,6 +405,27 @@ def readable_tool_activity(name: str, arguments: str) -> tuple[str, str]:
     return title[:240], arguments
 
 
+def concise_tool_details(arguments: str) -> str:
+    """Show only safe, observed short command metadata in the BB title."""
+    try:
+        payload = json.loads(arguments)
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    args = payload.get("args")
+    if not isinstance(args, dict):
+        return ""
+    host = args.get("host")
+    host = host if isinstance(host, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,48}", host) else ""
+    command = args.get("command")
+    if not isinstance(command, str) or not command or len(command) > 90 or "\n" in command:
+        return host
+    if re.search(r"(?i)(bearer|password|secret|token|api[_-]?key|\s-H\s|--header|://[^/]*@)", command):
+        return host
+    return (host + " · " if host else "") + command
+
+
 class Server:
     def __init__(self):
         self.sessions: dict[str, dict[str, Any]] = {}
@@ -783,6 +804,10 @@ class Server:
                                 r'(?i)(authorization|api[_-]?key|password|secret|token)\s*[:=]\s*[^,\s}]+',
                                 r'\1=[redacted]', native_title)
                             activity_titles[raw_id] = native_title[:180]
+                        specifics = concise_tool_details(sanitized)
+                        if specifics:
+                            activity_titles[raw_id] = (
+                                activity_titles[raw_id][:170] + " · " + specifics)[:240]
                         await self.activity(sid, activity_prefix + "-tool-" +
                                             hashlib.sha256(raw_id.encode()).hexdigest()[:12],
                                             activity_titles[raw_id], started=started,
