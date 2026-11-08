@@ -450,6 +450,43 @@ def concise_tool_details(arguments: str) -> str:
     return (host + " · " if host else "") + command
 
 
+SENSITIVE_TOOL_KEY = re.compile(
+    r"(?i)(?:authorization|password|secret|token|api[_-]?key|cookie|credential|private[_-]?key|session[_-]?key|access[_-]?key)"
+)
+SENSITIVE_TOOL_VALUE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9_./~+\-=]{8,}")
+
+
+def safe_tool_input(detail: str) -> dict[str, Any] | None:
+    """Give BB its supported structured ACP rawInput shape, never a string.
+
+    String rawInput was silently discarded by BB's ACP bridge. Keep nested
+    objects where available and redact credential-bearing fields recursively.
+    """
+    if not detail.strip():
+        return None
+    try:
+        value = json.loads(detail)
+    except (TypeError, ValueError):
+        value = {"input": detail[:4000]}
+    if not isinstance(value, dict):
+        value = {"input": str(value)[:4000]}
+
+    def clean(item: Any, depth: int = 0) -> Any:
+        if depth > 6:
+            return "[nested value omitted]"
+        if isinstance(item, dict):
+            return {str(k)[:120]: ("[redacted]" if SENSITIVE_TOOL_KEY.search(str(k))
+                                  else clean(v, depth + 1))
+                    for k, v in list(item.items())[:50]}
+        if isinstance(item, list):
+            return [clean(v, depth + 1) for v in item[:40]]
+        if isinstance(item, str):
+            return SENSITIVE_TOOL_VALUE.sub("Bearer [redacted]", item[:4000])
+        return item if isinstance(item, (int, float, bool)) or item is None else "[unsupported value]"
+
+    return clean(value)
+
+
 class Server:
     def __init__(self):
         self.sessions: dict[str, dict[str, Any]] = {}
@@ -485,7 +522,7 @@ class Server:
                              "kind": kind, "status": status,
                              **({"content": [{"type": "content", "content":
                                   {"type": "text", "text": detail[:12000]}}],
-                                 "rawInput": detail[:4000]}
+                                 "rawInput": safe_tool_input(detail)}
                                 if detail else {})}}})
 
     def catalog(self):

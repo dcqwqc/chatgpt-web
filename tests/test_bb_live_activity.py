@@ -60,7 +60,7 @@ class LiveActivityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_starts[0]["sessionUpdate"], "tool_call")
         self.assertEqual(tool_starts[1]["title"], "Run connected tools")
         self.assertIn("command=git status", tool_starts[1]["content"][0]["content"]["text"])
-        self.assertEqual(tool_starts[1]["rawInput"], "command=git status")
+        self.assertEqual(tool_starts[1]["rawInput"], {"input": "command=git status"})
         self.assertEqual(tool_starts[-1]["status"], "completed")
         previews = [x for x in updates if x.get("toolCallId", "").endswith("-preview")]
         self.assertEqual([x["sessionUpdate"] for x in previews],

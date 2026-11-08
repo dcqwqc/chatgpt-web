@@ -1,6 +1,6 @@
 """Readable, stable, evidence-based BB activity labels."""
 import unittest
-from bb_acp import readable_tool_activity, concise_tool_details
+from bb_acp import readable_tool_activity, concise_tool_details, safe_tool_input
 
 
 class ToolFidelityTests(unittest.TestCase):
@@ -10,6 +10,18 @@ class ToolFidelityTests(unittest.TestCase):
                          'Use connected app · run_command')
         self.assertEqual(readable_tool_activity('web.run', '')[0], 'Search and retrieve web data')
         self.assertEqual(readable_tool_activity('mcp__Loom__loom_task_update', '')[0], 'Loom · loom_task_update')
+
+    def test_tool_input_is_structured_for_bb_and_secrets_are_redacted(self):
+        payload = ('{"path":"/Philipedia Terminal/link_abc/run_command",'
+                   '"args":{"host":"philipedia","command":"date +%H:%M",'
+                   '"headers":{"Authorization":"Bearer sampletoken123456789",'
+                   '"x-api-key":"privatevalue"}}}')
+        result = safe_tool_input(payload)
+        self.assertEqual(result["args"]["command"], "date +%H:%M")
+        self.assertEqual(result["args"]["headers"]["Authorization"], "[redacted]")
+        self.assertEqual(result["args"]["headers"]["x-api-key"], "[redacted]")
+        self.assertEqual(safe_tool_input(""), None)
+        self.assertEqual(safe_tool_input("some text"), {"input": "some text"})
 
     def test_short_safe_command_is_visible_even_without_expandable_arguments(self):
         payload = '{"path":"/Philipedia Terminal/link_123/run_command","args":{"host":"philipedia","command":"date +%H:%M"}}'
