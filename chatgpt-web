@@ -1441,13 +1441,16 @@ def text_from_parts(parts: Iterable[Any]) -> str:
     return "\n".join(rendered)
 
 
+from genui_image_resolution import from_metadata
+
+
 def normalize_message(message: dict[str, Any]) -> dict[str, Any]:
     author = message.get("author")
     author = author if isinstance(author, dict) else {}
     content = message.get("content")
     content = content if isinstance(content, dict) else {}
     parts = message_parts(content)
-    return {
+    normalized = {
         "id": message.get("id"),
         "role": author.get("role"),
         "name": author.get("name"),
@@ -1460,6 +1463,10 @@ def normalize_message(message: dict[str, Any]) -> dict[str, Any]:
         "parts": parts,
         "text": text_from_parts(parts),
     }
+    resolved = from_metadata(message.get("metadata"), normalized["text"])
+    if resolved:
+        normalized["resolved_images"] = resolved
+    return normalized
 
 
 def normalize_conversation(conversation: dict[str, Any]) -> dict[str, Any]:

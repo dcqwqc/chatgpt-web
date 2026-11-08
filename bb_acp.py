@@ -22,6 +22,7 @@ from typing import Any
 
 from cooldown import retry_after_seconds
 from web_content import render_web_elements, embedded_image_assets
+from genui_image_resolution import apply_resolved_images, hydrate_from_cache
 # Enabled only after BB's native directive component was installed and checked.
 RICH_UI_READY = Path.home() / ".local/state/chatgpt-web/bb-native-rich-ui-ready"
 
@@ -503,6 +504,7 @@ class Server:
 
     async def update(self, sid: str, text: str):
         if text:
+            text = hydrate_from_cache(text, self.sessions.get(sid, {}).get("conversation_id"), CONVERSATION_ROOT)
             text = render_web_elements(text, rich_ui=RICH_UI_READY.is_file(),
                                        image_assets=(frozenset(generated_media(
                                            self.sessions.get(sid, {}).get("conversation_id")))
@@ -655,6 +657,7 @@ class Server:
             if not isinstance(content, str) or not content:
                 continue
             if role == "assistant":
+                content = apply_resolved_images(content, msg.get("resolved_images"))
                 content = render_web_elements(content, rich_ui=RICH_UI_READY.is_file(),
                                               image_assets=image_assets)
             await self.emit({"jsonrpc": "2.0", "method": "session/update",
