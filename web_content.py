@@ -6,6 +6,7 @@ from __future__ import annotations
 import re
 from html import unescape
 from urllib.parse import urlsplit
+from rich_content import component_spans, rich_fence, replace_literal_charts, literal_json
 
 
 def code_fence(body: str, language: str = '', *, closed: bool = True) -> str:
@@ -19,6 +20,7 @@ INLINE = re.compile(r'(`[^`\n]+`)')
 PROTECTED = re.compile(
     r'(?P<fence>^[ \t]{0,3}(?P<ticks>`{3,}|~{3,})[^\n]*\n)'
     r'|<CodeBlock\b[^>]*>'
+    r'|(?P<rich_tag><(?:Chart|AsyncImageGroup|button|checkbox)\b)'
     r'|(?P<inline>`+)(?!`)[^\n]*?(?<!`)(?P=inline)(?!`)', re.M)
 
 
@@ -31,6 +33,11 @@ def protected_segments(text: str):
         if match.group('inline'):
             end = match.end()
             yield True, text[start:end]
+        elif match.group('rich_tag'):
+            name=match.group('rich_tag')[1:]
+            span=next(component_spans(text[start:],name),None)
+            end=start+span[1] if span and span[0]==0 else match.end()
+            yield False,text[start:end]
         elif match.group('fence'):
             ticks = match.group('ticks')
             close = re.search(r'^[ \t]{0,3}' + re.escape(ticks[0]) +
@@ -183,6 +190,59 @@ def image_with_source(match: re.Match[str], *, image_assets: frozenset[str] = fr
     return f'[Image source unavailable in BB: {alt}]'
 
 
+def rich_gallery(fragment: str, image_assets: frozenset[str]) -> str:
+    result, end = [], 0
+    for start, stop, attributes in component_spans(fragment, 'AsyncImageGroup'):
+        source = fragment[start:stop]
+        body=source[len('<AsyncImageGroup')+len(attributes)+1:-(len('</AsyncImageGroup>'))]
+        matches = list(IMAGE_SOURCE.finditer(body))
+        result.append(fragment[end:start])
+        items = []
+        for match in matches[:12]:
+            attrs = match.group(1)
+            rendered = image_with_source(match, image_assets=image_assets)
+            embedded = re.search(r'!\[([^\n]*)\]\(([^\n]+)\)', rendered)
+            if not embedded:
+                items.append({'unavailable': rendered})
+                continue
+            item = {'src': embedded.group(2), 'alt': embedded.group(1)}
+            for key in ('caption', 'href'):
+                value = image_attribute(attrs, key)
+                if value and ((key == 'caption' and len(value) <= 160 and not any(ord(c)<32 for c in value)) or
+                              (key == 'href' and safe_image_url(value))):
+                    item[key] = safe_image_url(value) if key == 'href' else value
+            items.append(item)
+        caption = image_attribute(attributes, 'caption') or image_attribute(attributes, 'title')
+        caption = caption if caption and caption.strip() else None
+        remainder = IMAGE_SOURCE.sub('', body).strip()
+        if items and all(len(i.get('src',''))<=4000 for i in items) and len(matches) <= 12 and not remainder and (not caption or len(caption) <= 160 and not any(ord(c)<32 for c in caption)):
+            result.append(rich_fence({'kind': 'gallery', 'images': items, **({'caption': caption} if caption else {})}))
+        else:
+            result.append(source)
+        end = stop
+    return ''.join(result) + fragment[end:]
+
+
+def rich_static_controls(fragment: str) -> str:
+    def button(match):
+        label = unescape(match.group(1)).strip()
+        if not label or len(label) > 160 or any(ord(c)<32 for c in label):
+            return match.group()
+        return rich_fence({'kind':'control', 'type':'button', 'label':label})
+    value = re.sub(r'<button\b[^>]*>([^<>]*)</button>', button, fragment)
+    def checkbox(match):
+        attrs = match.group(1)
+        label = image_attribute(attrs, 'label')
+        if not label or len(label)>160 or any(ord(c)<32 for c in label):
+            return match.group()
+        checked = re.search(r'(?<![-\w])checked(?:\s*=\s*(?:\{(true|false)\}|"(true|false)"))?(?=\s|/|$)', attrs)
+        if re.search(r'(?<![-\w])checked\s*=',attrs) and (not checked or '=' not in checked.group()):
+            return match.group()
+        state = bool(checked) and (checked.group(1) or checked.group(2) or 'true') == 'true'
+        return rich_fence({'kind':'control','type':'checkbox','label':label,'checked':state})
+    return re.sub(r'<checkbox\b([^<>]*?)/>', checkbox, value)
+
+
 def normalize_layout_indentation(fragment: str) -> str:
     """Prevent JSX indentation from becoming unintended Markdown code blocks."""
     if '<box' not in fragment and '<row' not in fragment:
@@ -273,13 +333,60 @@ def render_web_elements(text: str, *, rich_ui: bool = False, image_assets: froze
         if protected:
             result.append(chunk)
         else:
-            result.extend(flatten(part, rich_ui=rich_ui, image_assets=image_assets) if n % 2 == 0 else part
-                          for n, part in enumerate(INLINE.split(chunk)))
+            if rich_ui:
+                chunk = replace_literal_charts(chunk, lambda source: chart_fallback(re.match(r'.*', source, re.S)))
+                # Generated fences are protected before any remaining HTML/layout
+                # normalization, so labels and data stay exactly as serialized.
+                pieces = []
+                for locked, part in protected_segments(chunk):
+                    pieces.append(part if locked else rich_gallery(part, image_assets))
+                chunk = ''.join(pieces)
+                pieces = []
+                for locked, part in protected_segments(chunk):
+                    pieces.append(part if locked else rich_static_controls(part))
+                chunk = ''.join(pieces)
+            for locked, part in protected_segments(chunk):
+                if locked:
+                    result.append(part)
+                else:
+                    result.extend(flatten(item, rich_ui=rich_ui, image_assets=image_assets) if n % 2 == 0 else item
+                                  for n, item in enumerate(INLINE.split(part)))
     return ''.join(result)
 
 
 def embedded_image_assets(text: str) -> frozenset[str]:
-    """Find rendered local image links, excluding fenced/inline source examples."""
+    """Find rendered image links or validated gallery fences, not code examples."""
     pattern = re.compile(r'!\[[^\n]*?\]\(/api/v1/plugins/image-generation/http/cli-image\?asset=(file_[A-Za-z0-9]{12,80})\)')
-    return frozenset(match.group(1) for protected, chunk in protected_segments(text)
-                     if not protected for match in pattern.finditer(chunk))
+    assets = set()
+    for protected, chunk in protected_segments(text):
+        if not protected:
+            assets.update(match.group(1) for match in pattern.finditer(chunk))
+            continue
+        fence = re.fullmatch(r'[ \t]{0,3}(`{3,})chatgpt-rich\n(.*?)\n\1[ \t]*\n?', chunk, re.S)
+        if not fence:
+            continue
+        try:
+            value=literal_json(fence.group(2))
+        except (ValueError,RecursionError):
+            continue
+        def label(v,n):
+            return isinstance(v,str) and 0<len(v.strip())<=n and not any(ord(c)<32 for c in v)
+        if not isinstance(value,dict) or value.get('kind')!='gallery' or set(value)-{'kind','images','caption'} or 'caption' in value and not label(value['caption'],160):
+            continue
+        images=value.get('images')
+        if not isinstance(images,list) or not 1<=len(images)<=12:
+            continue
+        valid=True
+        for item in images:
+            if not isinstance(item,dict):
+                valid=False;break
+            if set(item)=={'unavailable'} and label(item['unavailable'],240):
+                continue
+            if set(item)-{'src','alt','caption','href'} or not isinstance(item.get('src'),str) or len(item['src'])>4000 or not (BB_IMAGE_ROUTE.fullmatch(item['src']) or item['src'].startswith('https://') and safe_image_url(item['src'])) or not label(item.get('alt'),120) or 'caption' in item and not label(item['caption'],160) or 'href' in item and (not isinstance(item['href'],str) or not safe_image_url(item['href'])):
+                valid=False;break
+        if valid:
+            for item in images:
+                match=re.fullmatch(r'/api/v1/plugins/image-generation/http/cli-image\?asset=(file_[A-Za-z0-9]{12,80})',item.get('src',''))
+                if match:
+                    assets.add(match.group(1))
+    return frozenset(assets)

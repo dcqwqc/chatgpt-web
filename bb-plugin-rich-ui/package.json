@@ -25,6 +25,7 @@
     "typescript": "^5.7.0"
   },
   "scripts": {
-    "qa:build": "bb plugin build . && node qa/build.mjs"
+    "qa:build": "bb plugin build . && node qa/build.mjs",
+    "test": "node qa/test-rich.mjs"
   }
 }

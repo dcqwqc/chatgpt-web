@@ -5,3 +5,27 @@
   --chatgpt-badge-text: color-mix(in oklch, var(--success-foreground) 90%, var(--foreground));
 }
 .dark .chatgpt-status-badge[data-tone="success"] { --chatgpt-badge-text: var(--success-foreground); }
+.chatgpt-chart, .chatgpt-gallery { max-width:100%; min-width:0; margin:1rem 0; color:var(--foreground); }
+.chatgpt-chart > figcaption, .chatgpt-gallery-caption { font-weight:600; margin-bottom:.5rem; overflow-wrap:anywhere; }
+.chatgpt-chart svg { display:block; width:100%; height:auto; max-height:22rem; }
+.chatgpt-chart svg text { font-size:11px; fill:var(--muted-foreground); }
+.chatgpt-chart-legend { display:flex; flex-wrap:wrap; gap:.5rem 1rem; font-size:.875rem; }
+.chatgpt-chart-legend span { display:inline-flex; align-items:center; gap:.35rem; overflow-wrap:anywhere; max-width:100%; }
+.chatgpt-chart-legend i { width:.65rem; height:.65rem; flex-shrink:0; border-radius:2px; }
+.chatgpt-chart details { margin-top:.75rem; }
+.chatgpt-chart summary { cursor:pointer; color:var(--muted-foreground); }
+.chatgpt-chart-data { max-width:100%; overflow:auto; margin-top:.5rem; }
+.chatgpt-chart table { border-collapse:collapse; width:100%; font-size:.875rem; }
+.chatgpt-chart th,.chatgpt-chart td { border-bottom:1px solid var(--border); padding:.4rem; text-align:left; overflow-wrap:anywhere; }
+.chatgpt-chart-data:focus-visible,.chatgpt-gallery-open:focus-visible { outline:2px solid var(--ring); outline-offset:2px; }
+.chatgpt-gallery-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,14rem),1fr)); gap:.75rem; }
+.chatgpt-gallery figure { min-width:0; margin:0; }
+.chatgpt-gallery-open { border:1px solid var(--border); border-radius:.6rem; background:var(--muted); padding:0; width:100%; overflow:hidden; display:block; cursor:zoom-in; }
+.chatgpt-gallery img { width:100%; height:auto; max-height:22rem; object-fit:contain; display:block; }
+.chatgpt-gallery figcaption { margin-top:.35rem; color:var(--muted-foreground); font-size:.875rem; overflow-wrap:anywhere; }
+.chatgpt-unavailable { padding:.75rem; border:1px solid var(--border); border-radius:.5rem; }
+.chatgpt-static-control { margin:.5rem 0; display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; }
+.chatgpt-static-control button { border:1px solid var(--border); border-radius:.5rem; padding:.4rem .75rem; background:var(--muted); color:var(--muted-foreground); cursor:not-allowed; }
+.chatgpt-static-control [role=checkbox] { display:inline-flex; align-items:center; gap:.4rem; }
+.chatgpt-static-control svg { width:1.1rem; height:1.1rem; fill:none; stroke:var(--muted-foreground); stroke-width:1.5; }
+.chatgpt-static-control small { color:var(--muted-foreground); }

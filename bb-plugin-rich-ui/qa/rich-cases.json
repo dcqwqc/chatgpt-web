@@ -1,0 +1,13 @@
+[
+ {"name":"bar negative and zero","valid":true,"value":{"kind":"chart","type":"bar","title":"Observed values","unit":"s","labels":["Before","After","Idle"],"series":[{"name":"Measured","values":[4.06,-2.9,0]}]}},
+ {"name":"line multiple series","valid":true,"value":{"kind":"chart","type":"line","title":"Literal trend","labels":["A","B","C"],"series":[{"name":"First","values":[1,3,2]},{"name":"Second","values":[0,1,4]}]}},
+ {"name":"pie including zero","valid":true,"value":{"kind":"chart","type":"pie","title":"Literal shares","labels":["Used","Free","Empty"],"series":[{"name":"Count","values":[3,7,0]}]}},
+ {"name":"pie one full slice","valid":true,"value":{"kind":"chart","type":"pie","labels":["Only"],"series":[{"name":"Count","values":[5]}]}},
+ {"name":"bar all zero","valid":true,"value":{"kind":"chart","type":"bar","labels":["Zero"],"series":[{"name":"Count","values":[0]}]}},
+ {"name":"unaligned data","valid":false,"value":{"kind":"chart","type":"line","labels":["A","B"],"series":[{"name":"One","values":[1]}]}},
+ {"name":"boolean is not numeric data","valid":false,"value":{"kind":"chart","type":"bar","labels":["A"],"series":[{"name":"One","values":[true]}]}},
+ {"name":"zero pie","valid":false,"value":{"kind":"chart","type":"pie","labels":["A"],"series":[{"name":"One","values":[0]}]}},
+ {"name":"negative pie","valid":false,"value":{"kind":"chart","type":"pie","labels":["A","B"],"series":[{"name":"One","values":[-1,3]}]}},
+ {"name":"function binding string","valid":false,"value":{"kind":"chart","type":"bar","labels":["A"],"series":[{"name":"One","values":"getData()"}]}},
+ {"name":"unknown fields","valid":false,"value":{"kind":"chart","type":"bar","labels":["A"],"series":[{"name":"One","values":[1]}],"onClick":"run()"}}
+]

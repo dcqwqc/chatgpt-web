@@ -1,3 +1,4 @@
+import { RichContent } from "./rich";
 import "./app.css";
 import { definePluginApp } from "@get-bb/plugin-sdk/app";
 import type { PluginMessageDirectiveProps } from "@get-bb/plugin-sdk/app";
@@ -73,6 +74,7 @@ export function ChatGPTMetric({ attributes, source }: PluginMessageDirectiveProp
 }
 
 export default definePluginApp((app) => {
+  app.slots.experimental_codeFenceRenderer({id:"chatgpt-rich",languages:["chatgpt-rich"],component:RichContent});
   app.slots.messageDirective({ id: "chatgpt-progress", component: ChatGPTProgress });
   app.slots.messageDirective({ id: "chatgpt-badge", component: ChatGPTBadge });
   app.slots.messageDirective({ id: "chatgpt-metric", component: ChatGPTMetric });
