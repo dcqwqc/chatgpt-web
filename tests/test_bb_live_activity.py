@@ -55,10 +55,10 @@ class LiveActivityTests(unittest.IsolatedAsyncioTestCase):
         phases = [x for x in updates if x.get("toolCallId", "").endswith("-request")]
         self.assertEqual([x["sessionUpdate"] for x in phases], ["tool_call", "tool_call_update", "tool_call_update"])
         self.assertEqual(phases[-1]["status"], "completed")
-        tool_starts = [x for x in updates if x.get("title", "").startswith("ChatGPT · functions.exec")]
+        tool_starts = [x for x in updates if x.get("title", "").startswith("Run connected tools")]
         self.assertEqual(len(tool_starts), 3)
         self.assertEqual(tool_starts[0]["sessionUpdate"], "tool_call")
-        self.assertIn("command=git status", tool_starts[1]["title"])
+        self.assertEqual(tool_starts[1]["title"], "Run connected tools")
         self.assertIn("command=git status", tool_starts[1]["content"][0]["content"]["text"])
         self.assertEqual(tool_starts[-1]["status"], "completed")
         previews = [x for x in updates if x.get("toolCallId", "").endswith("-preview")]

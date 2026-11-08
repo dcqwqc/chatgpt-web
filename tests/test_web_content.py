@@ -33,6 +33,37 @@ class RichContentTests(unittest.TestCase):
         self.assertIn('ChatGPT Web', render_web_elements('<svg><path d="X"/></svg>'))
         self.assertIn('ChatGPT Web', render_web_elements('<AppBlock><script>go()</script></AppBlock>'))
 
+    def test_chatgpt_layout_bars_keep_fill_and_do_not_turn_into_code(self):
+        source = ("## Results\n\n<box gap={2}>\n"
+                  '  <row align="center" justify="between">\n'
+                  '    <text color="secondary">Before</text>\n'
+                  '    **4.06 s**\n'
+                  '  </row>\n'
+                  '  <box background="surface-tertiary" height="10px" radius="full" clip>\n'
+                  '    <box background="secondary" width="100%" height="100%" radius="full"/>\n'
+                  '  </box>\n'
+                  '  <row>\n'
+                  '    <text color="secondary">After</text>\n'
+                  '    **2.82–2.97 s**\n'
+                  '  </row>\n'
+                  '  <box background="surface-tertiary" height="10px" radius="full" clip>\n'
+                  '    <box background="success-solid" width="70%" height="100%" radius="full"/>\n'
+                  '  </box>\n'
+                  '</box>\n')
+        rendered = render_web_elements(source)
+        self.assertIn('Before\n**4.06 s**', rendered)
+        self.assertIn('After\n**2.82–2.97 s**', rendered)
+        self.assertIn('━━━━━━━━━━━━━━━━', rendered)
+        self.assertIn('━━━━━━━━━━━─────', rendered)
+        self.assertNotIn('    **4.06 s**', rendered)
+        self.assertNotIn('<box', rendered)
+
+    def test_layout_normalization_does_not_change_indented_code_outside_layout(self):
+        source = '<row>\n  A paragraph\n</row>\n\n    a = 1\n    b = 2'
+        rendered = render_web_elements(source)
+        self.assertIn('A paragraph', rendered)
+        self.assertIn('    a = 1\n    b = 2', rendered)
+
     def test_inline_code_is_not_modified(self):
         self.assertEqual(render_web_elements('Use ' + chr(96) + '<badge>High</badge>' +
                           chr(96) + ' in code.'), 'Use ' + chr(96) +

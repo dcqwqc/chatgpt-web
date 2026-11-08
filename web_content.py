@@ -12,10 +12,47 @@ PLAIN = 'text caption label row col box card grid grid-item flow flow-item list 
 NEWLINES = 'row col box card grid-item table-row list-item'.split()
 
 
+# These are rendered ChatGPT layout tracks, not executable HTML. The native
+# ChatGPT client draws them as rounded horizontal bars; BB understands Markdown
+# rather than DIL, so preserve their relative fill instead of deleting them.
+PROGRESS_TRACK = re.compile(
+    r'<box\b(?=[^>]*background="surface-tertiary")(?=[^>]*height="(?:8|10)px")[^>]*>'
+    r'\s*<box\b(?=[^>]*background="[^"]+")(?=[^>]*width="(\d{1,3})%")'
+    r'[^>]*/>\s*</box>', re.S)
+LAYOUT_TAG = re.compile(r'</?(?:box|row|col|grid|grid-item|flow|flow-item|card)\b[^>]*>')
+
+
+def preserve_progress(fragment: str) -> str:
+    def substitute(match: re.Match[str]) -> str:
+        percent = min(100, max(0, int(match.group(1))))
+        filled = round(percent * 16 / 100)
+        return '\n' + '━' * filled + '─' * (16 - filled) + '\n'
+    return PROGRESS_TRACK.sub(substitute, fragment)
+
+
+def normalize_layout_indentation(fragment: str) -> str:
+    """Prevent JSX indentation from becoming unintended Markdown code blocks."""
+    if '<box' not in fragment and '<row' not in fragment:
+        return fragment
+    depth = 0
+    lines = []
+    for line in fragment.splitlines(keepends=True):
+        before = depth
+        tags = list(LAYOUT_TAG.finditer(line))
+        for tag in tags:
+            t = tag.group()
+            if t.startswith('</'):
+                depth = max(0, depth - 1)
+            elif not t.endswith('/>'):
+                depth += 1
+        lines.append(line.lstrip(' \t') if before or depth or tags else line)
+    return ''.join(lines)
+
+
 def flatten(fragment: str) -> str:
     if '<' not in fragment:
         return fragment
-    value = fragment
+    value = normalize_layout_indentation(preserve_progress(fragment))
     value = re.sub(r'<AppBlock\b[^>]*>.*?</AppBlock>', '[Interactive app — open in ChatGPT Web]', value, flags=re.S)
     value = re.sub(r'<svg\b[^>]*>.*?</svg>', '[Vector image — open in ChatGPT Web]', value, flags=re.S)
     for tag, label in [('AsyncImage','Image'),('AsyncImageGroup','Image gallery'),

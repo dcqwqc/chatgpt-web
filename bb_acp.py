@@ -328,6 +328,43 @@ as code. Distinguish implemented, tested and deployed outcomes.
     return policy, hashlib.sha256(policy.encode("utf-8")).hexdigest()
 
 
+def readable_tool_activity(name: str, arguments: str) -> tuple[str, str]:
+    """Use observed tool identity and arguments, not an invented action label.
+
+    Metadata is presented in BB's native collapsible tool item. The title
+    stays compact while the detail retains the provider's actual call text.
+    """
+    descriptions = {
+        "functions.exec": "Run connected tools",
+        "api_tool.call_tool": "Use connected app",
+        "web.run": "Search and retrieve web data",
+        "python.exec": "Run Python",
+        "python_user_visible.exec": "Run Python",
+        "container.exec": "Run terminal command",
+        "image_gen.text2im": "Generate image",
+    }
+    human_name = descriptions.get(name, name.replace("mcp__", "").replace("__", " · "))
+    subject = ""
+    # A structured tool envelope can expose the exact target operation.
+    # Do not claim a specific operation when the envelope is not parseable.
+    try:
+        parsed = json.loads(arguments)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        for key in ("tool", "recipient_name", "tool_name", "operation", "command"):
+            value = parsed.get(key)
+            if isinstance(value, str) and value and len(value) < 100:
+                subject = value.replace("mcp__", "").replace("__", " · ")
+                break
+        if not subject and isinstance(parsed.get("server"), str):
+            subject = parsed["server"]
+    if not subject and name.startswith("mcp__"):
+        human_name = name.removeprefix("mcp__").replace("__", " · ")
+    title = human_name + (" · " + subject if subject and subject != name else "")
+    return title[:240], arguments
+
+
 class Server:
     def __init__(self):
         self.sessions: dict[str, dict[str, Any]] = {}
@@ -614,10 +651,7 @@ class Server:
                         sanitized = re.sub(
                             r'(?i)\bBearer\s+[A-Za-z0-9_./~+\-=]{8,}',
                             'Bearer [redacted]', sanitized)
-                        preview = re.sub(r'\s+', ' ', sanitized).strip()
-                        activity_titles[raw_id] = "ChatGPT · " + name
-                        if preview:
-                            activity_titles[raw_id] += " · " + preview[:140]
+                        activity_titles[raw_id], _ = readable_tool_activity(name, sanitized)
                         await self.activity(sid, activity_prefix + "-tool-" +
                                             hashlib.sha256(raw_id.encode()).hexdigest()[:12],
                                             activity_titles[raw_id], started=started,
