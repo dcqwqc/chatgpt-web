@@ -20,6 +20,7 @@ PROGRESS_TRACK = re.compile(
     r'\s*<box\b(?=[^>]*background="[^"]+")(?=[^>]*width="(\d{1,3})%")'
     r'[^>]*/>\s*</box>', re.S)
 LAYOUT_TAG = re.compile(r'</?(?:box|row|col|grid|grid-item|flow|flow-item|card)\b[^>]*>')
+BADGE_LINE = re.compile(r'(?m)^[ \t]*<badge\b([^>]*)>([^<>\n]{1,100})</badge>[ \t]*$')
 
 
 def preserve_progress(fragment: str, *, rich_ui: bool = False) -> str:
@@ -36,6 +37,20 @@ def preserve_progress(fragment: str, *, rich_ui: bool = False) -> str:
         filled = round(percent * 16 / 100)
         return '\n' + '━' * filled + '─' * (16 - filled) + '\n'
     return PROGRESS_TRACK.sub(substitute, fragment)
+
+
+def preserve_status_badges(fragment: str) -> str:
+    """Promote safe standalone status badges into BB-native directives."""
+    def convert(match: re.Match[str]) -> str:
+        label = match.group(2).strip()
+        if not label or any(mark in label for mark in ('"', '{', '}')):
+            return '**' + label + '**'
+        color = re.search(r'\bcolor="([^"\n]+)"', match.group(1))
+        raw = color.group(1) if color else "neutral"
+        tone = (raw if raw in ('success', 'info', 'warning', 'danger') else
+                'danger' if raw in ('error', 'destructive') else 'neutral')
+        return f'\n::chatgpt-badge{{label="{label}" tone="{tone}"}}\n'
+    return BADGE_LINE.sub(convert, fragment)
 
 
 def normalize_layout_indentation(fragment: str) -> str:
@@ -61,6 +76,8 @@ def flatten(fragment: str, *, rich_ui: bool = False) -> str:
     if '<' not in fragment:
         return fragment
     value = normalize_layout_indentation(preserve_progress(fragment, rich_ui=rich_ui))
+    if rich_ui:
+        value = preserve_status_badges(value)
     value = re.sub(r'<AppBlock\b[^>]*>.*?</AppBlock>', '[Interactive app — open in ChatGPT Web]', value, flags=re.S)
     value = re.sub(r'<svg\b[^>]*>.*?</svg>', '[Vector image — open in ChatGPT Web]', value, flags=re.S)
     for tag, label in [('AsyncImage','Image'),('AsyncImageGroup','Image gallery'),

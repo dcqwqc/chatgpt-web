@@ -4,6 +4,20 @@ from web_content import render_web_elements
 
 
 class RichContentTests(unittest.TestCase):
+    def test_standalone_rich_badge_keeps_status_tone(self):
+        source = '<row>\n  <badge color="success">Verified</badge>\n</row>'
+        rendered = render_web_elements(source, rich_ui=True)
+        self.assertIn('::chatgpt-badge{label="Verified" tone="success"}', rendered)
+        self.assertNotIn('<badge', rendered)
+        self.assertEqual(render_web_elements('<badge color="info">Working</badge>', rich_ui=False),
+                         '**Working**')
+
+    def test_badge_unknown_color_and_unsafe_label_use_safe_fallback(self):
+        self.assertIn('tone="neutral"', render_web_elements(
+            '<badge color="unknown">Pending</badge>', rich_ui=True))
+        self.assertNotIn('::chatgpt-badge', render_web_elements(
+            '<badge color="info">a "quoted" value</badge>', rich_ui=True))
+
     def test_badge_does_not_show_raw_markup(self):
         self.assertEqual(render_web_elements('<badge color="warning">High</badge>'),
                          '**High**')
