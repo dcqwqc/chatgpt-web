@@ -4,6 +4,39 @@ from web_content import render_web_elements
 
 
 class RichContentTests(unittest.TestCase):
+    def test_real_https_image_source_becomes_embedded_markdown(self):
+        source = '<AsyncImage src="https://example.com/images/flower.png" alt="Flower"/>'
+        self.assertEqual(render_web_elements(source).strip(),
+                         '![Flower](https://example.com/images/flower.png)')
+
+    def test_bb_loopback_image_uses_portable_relative_route(self):
+        src = 'http://127.0.0.1:38886/api/v1/plugins/image-generation/http/cli-image?asset=file_BBParityMetric20261108A'
+        expected = '/api/v1/plugins/image-generation/http/cli-image?asset=file_BBParityMetric20261108A'
+        self.assertEqual(render_web_elements(f'<AsyncImage src="{src}" alt="Actual screenshot"/>').strip(),
+                         f'![Actual screenshot]({expected})')
+        self.assertEqual(render_web_elements(f'<AsyncImage src="{expected}" alt="Actual screenshot"/>').strip(),
+                         f'![Actual screenshot]({expected})')
+
+    def test_query_only_image_does_not_invent_image_bytes(self):
+        rendered = render_web_elements('<AsyncImage query="my original screenshot"/>')
+        self.assertIn('my original screenshot', rendered)
+        self.assertIn('view in ChatGPT Web', rendered)
+        self.assertNotIn('![', rendered)
+
+    def test_unsafe_image_sources_are_never_embedded(self):
+        for src in ('javascript:alert(1)', 'data:image/svg+xml;base64,AA',
+                    'file:///etc/passwd', 'http://attacker.example/p.png',
+                    'http://127.0.0.1:38886/private',
+                    'https://user:password@example.com/img.png'):
+            with self.subTest(src=src):
+                rendered = render_web_elements(f'<AsyncImage src="{src}" alt="Picture"/>')
+                self.assertNotIn('![', rendered)
+                self.assertIn('source unavailable', rendered)
+
+    def test_markup_inside_literal_code_does_not_load_image(self):
+        text = '```jsx\n<AsyncImage src="https://example.com/a.png"/>\n```'
+        self.assertEqual(render_web_elements(text), text)
+
     def test_standalone_rich_badge_keeps_status_tone(self):
         source = '<row>\n  <badge color="success">Verified</badge>\n</row>'
         rendered = render_web_elements(source, rich_ui=True)
@@ -27,7 +60,7 @@ class RichContentTests(unittest.TestCase):
                          '[Details](https://example.com)')
 
     def test_external_component_fallback_is_honest(self):
-        self.assertIn('open in ChatGPT Web',
+        self.assertIn('view in ChatGPT Web',
                       render_web_elements('<AsyncImage query="cat"/>'))
         self.assertIn('ChatGPT Web',
                       render_web_elements('<button>Execute</button>'))

@@ -4,6 +4,8 @@ Never evaluate bindings or actions; retain original text in stored transcripts.
 """
 from __future__ import annotations
 import re
+from html import unescape
+from urllib.parse import urlsplit
 
 
 def code_fence(body: str, language: str = '', *, closed: bool = True) -> str:
@@ -113,6 +115,56 @@ def chart_fallback(match: re.Match[str]) -> str:
     return '[Chart' + detail + ' — open in ChatGPT Web; chart data unavailable here]'
 
 
+# The native ChatGPT client can resolve AsyncImage.query/ref server-side.
+# A plain ACP transcript only includes that markup, not its resolved pixels.
+# Preserve images with a real source URL. Never invent one from a query.
+IMAGE_SOURCE = re.compile(r'<AsyncImage\b([^<>]*?)/>', re.S)
+BB_IMAGE_ROUTE = re.compile(
+    r'^/api/v1/plugins/image-generation/http/(?:cli-image|worker-image)'
+    r'\?asset=file_[A-Za-z0-9]{12,80}$'
+)
+
+
+def image_attribute(attributes: str, key: str) -> str | None:
+    match = re.search(r'(?<![-\w])' + re.escape(key) + r'="([^"\n]*)"', attributes)
+    return unescape(match.group(1)) if match else None
+
+
+def safe_image_url(source: str) -> str | None:
+    """Use actual image URLs only, converting our own loopback host to BB-relative."""
+    if BB_IMAGE_ROUTE.fullmatch(source):
+        return source
+    try:
+        url = urlsplit(source)
+    except ValueError:
+        return None
+    if (url.scheme == 'http' and url.hostname in ('127.0.0.1', 'localhost')
+            and url.port == 38886 and not url.username and not url.password):
+        path = url.path + ('?' + url.query if url.query else '')
+        return path if BB_IMAGE_ROUTE.fullmatch(path) else None
+    if (url.scheme != 'https' or not url.netloc or not url.hostname
+            or url.username or url.password or any(c.isspace() for c in source)
+            or any(c in source for c in ('<', '>', '`', chr(92)))):
+        return None
+    # Markdown URLs must not contain unescaped parentheses.
+    return source.replace('(', '%28').replace(')', '%29')
+
+
+def image_with_source(match: re.Match[str]) -> str:
+    attributes = match.group(1)
+    alt = image_attribute(attributes, 'alt') or 'Image'
+    alt = re.sub(r'[\[\]\r\n]', ' ', alt).strip()[:120] or 'Image'
+    src = image_attribute(attributes, 'src')
+    url = safe_image_url(src) if src else None
+    if url:
+        return f'\n\n![{alt}]({url})\n\n'
+    query = image_attribute(attributes, 'query')
+    if query:
+        description = re.sub(r'[\r\n\[\]]', ' ', query).strip()[:120]
+        return f'[Image search unavailable in BB: {description} — view in ChatGPT Web]'
+    return f'[Image source unavailable in BB: {alt}]'
+
+
 def normalize_layout_indentation(fragment: str) -> str:
     """Prevent JSX indentation from becoming unintended Markdown code blocks."""
     if '<box' not in fragment and '<row' not in fragment:
@@ -140,8 +192,9 @@ def flatten(fragment: str, *, rich_ui: bool = False) -> str:
         value = preserve_metric_rows(preserve_status_badges(value))
     value = re.sub(r'<AppBlock\b[^>]*>.*?</AppBlock>', '[Interactive app — open in ChatGPT Web]', value, flags=re.S)
     value = re.sub(r'<svg\b[^>]*>.*?</svg>', '[Vector image — open in ChatGPT Web]', value, flags=re.S)
+    value = IMAGE_SOURCE.sub(image_with_source, value)
     value = re.sub(r'<Chart\b[^>]*(?:/>|>.*?</Chart>)', chart_fallback, value, flags=re.S)
-    for tag, label in [('AsyncImage','Image'),('AsyncImageGroup','Image gallery'),
+    for tag, label in [('AsyncImageGroup','Image gallery'),
                        ('AsyncVideo','Video'),('MapWidgetV2','Map'),
                        ('FileNavList','Files')]:
         value = re.sub(r'<'+tag+r'\b[^>]*(?:/>|>.*?</'+tag+r'>)',
