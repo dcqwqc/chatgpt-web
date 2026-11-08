@@ -649,8 +649,8 @@ class Server:
                 "Accepted ChatGPT request has no verified recovery IDs. "
                 "Preserved without resubmitting; manual correlation is required.")
         row_id = "chatgpt-recover-" + hashlib.sha256(message_id.encode()).hexdigest()[:12]
-        await self.activity(sid, row_id, "ChatGPT Web · Recovering accepted turn",
-                            started=True, kind="think")
+        await self.activity(sid, row_id, "ChatGPT Web · Recovering original response",
+                            started=True, kind="other")
         deadline = asyncio.get_running_loop().time() + 1050
         attempt = 0
         stale_observations = 0
@@ -692,7 +692,7 @@ class Server:
                             f"ChatGPT Web · {label} · "
                             f"{observation['tool_calls']} saved tool calls · "
                             f"last {observation['last_at']}",
-                            status="in_progress", kind="think",
+                            status="in_progress", kind="other",
                             detail=observation["detail"],
                         )
                         if (not fresh and last_source_time == observation["last_activity"]):
@@ -714,7 +714,7 @@ class Server:
                         await self.update(sid, answer)
                         await self.activity(sid, row_id,
                                             "ChatGPT Web · Original response recovered",
-                                            status="completed", kind="think")
+                                            status="completed", kind="other")
                         await self.emit({"jsonrpc": "2.0", "id": request_id,
                                          "result": {"stopReason": "end_turn"}})
                         return
@@ -725,7 +725,7 @@ class Server:
                     sid, row_id,
                     f"ChatGPT Web · Source read unavailable · "
                     f"next read-only check in {delay}s",
-                    kind="think",
+                    kind="other",
                 )
             await asyncio.sleep(min(delay, max(0, deadline - asyncio.get_running_loop().time())))
         raise RuntimeError(

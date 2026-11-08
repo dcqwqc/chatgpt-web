@@ -67,6 +67,13 @@ class ReadOnlyRetryTests(unittest.IsolatedAsyncioTestCase):
                  for e in responses if e.get("method") == "session/update"
                  and e["params"]["update"]["sessionUpdate"] == "agent_message_chunk"]
         self.assertEqual(texts, ["Original answer."])
+        # Recovery is a visible activity card, not a blank Thinking row.
+        recovery = [r["params"]["update"] for r in responses
+                    if r.get("method") == "session/update"
+                    and r["params"]["update"]["sessionUpdate"] == "tool_call"]
+        self.assertEqual(len(recovery), 1)
+        self.assertEqual(recovery[0]["kind"], "other")
+        self.assertIn("Recovering original response", recovery[0]["title"])
         self.assertEqual(responses[-1]["result"], {"stopReason": "end_turn"})
 
     async def test_different_prompt_fails_closed_without_send(self):
