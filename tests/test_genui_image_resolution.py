@@ -52,6 +52,17 @@ class GenUIImageResolutionTests(unittest.TestCase):
    with self.subTest(url=url):
     self.assertIsNone(trusted_image_url(url,'inline'))
 
+ def test_cli_normalization_exports_only_verified_component_urls(self):
+  from importlib.machinery import SourceFileLoader
+  from pathlib import Path
+  cli=SourceFileLoader('bb_image_cli_fixture',str(Path(__file__).resolve().parents[1]/'chatgpt-web')).load_module()
+  raw={'id':'test-message','author':{'role':'assistant'},'channel':'final',
+       'content':{'content_type':'text','parts':[TEXT]},'metadata':META}
+  normalized=cli.normalize_message(raw)
+  self.assertEqual(normalized['resolved_images'],from_metadata(META,TEXT))
+  raw['metadata']={'genui_components':[],'safe_urls':[INLINE]}
+  self.assertNotIn('resolved_images',cli.normalize_message(raw))
+
  def test_no_arbitrary_cache_access_and_exact_message_selection(self):
   cid='6af03ffb-8920-83eb-a2cc-8ceaf959bf9c'
   with tempfile.TemporaryDirectory() as directory:
