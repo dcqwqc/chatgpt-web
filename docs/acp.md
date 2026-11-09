@@ -47,3 +47,21 @@ Exact countdown display depends on how the ACP host renders progress updates; ve
 The ACP adapter has no native ACP shell, filesystem or workspace tools. ChatGPT connected tools, if present in the authenticated account, remain separate and must be discovered at runtime. Model prose does not prove execution.
 
 CHATGPT_WEB_ACP_POLICY_FILE supplies an optional operator policy file. An explicitly configured missing/empty/oversized policy fails safely. CHATGPT_WEB_ACP_IMAGE_BRIDGE configures an optional trusted local Python worker. CHATGPT_WEB_ACP_IMAGE_ENDPOINT and CHATGPT_WEB_ACP_WORKER_IMAGE_ENDPOINT configure optional image-serving routes. Without a trusted relative HTTP route, the adapter reports saved image IDs instead of inventing working image URLs.
+
+
+## Browser composer recovery
+
+Browser recipe capture uses a temporary, helper-owned tab. The editor is
+observed until it remains visible through a short hydration window; native
+editing follows only after the current editor is verified again.
+
+Known transient editor replacement can be retried **only before submission**.
+An unknown draft is never cleared. Authentication, human-verification,
+offline-browser and unavailable-conversation states receive distinct errors,
+without copying page contents into logs. A potentially accepted submission
+is reconciled from its original request instead of blindly sent twice.
+
+Use `node --test tests/test_chrome_recipe.js` for offline regressions.
+For an optional real-browser editor test, point
+`CHATGPT_WEB_TEST_CDP_URL` to an authorized Chrome debugging endpoint.
+That test opens a disposable `about:blank` page and does not send messages.

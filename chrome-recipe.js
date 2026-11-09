@@ -9,7 +9,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { composerExpression, inspectComposer:inspectEditor,
-  prepareComposer:prepareEditor } = require("./composer.js");
+  prepareComposer:prepareEditor, waitForStableComposer, composerBlockerExpression } = require("./composer.js");
 
 const cdpBase = process.env.CHATGPT_WEB_CDP_URL || "http://127.0.0.1:9222";
 const timeoutMs = Number(process.env.CHATGPT_WEB_RECIPE_TIMEOUT_MS || "90000");
@@ -306,6 +306,21 @@ async function main() {
     if (cleared.ok) await delay(200);
   };
 
+  async function composerFailureReason() {
+    try {
+      const response = await call("Runtime.evaluate", {
+        expression:composerBlockerExpression(), returnByValue:true,
+      });
+      const reason = response.result?.value;
+      if (["browser offline", "authentication required",
+           "human verification required", "conversation unavailable",
+           "editor missing"].includes(reason)) return reason;
+    } catch (_error) {
+      // Keep transient navigation failures local and never disclose page text.
+    }
+    return "editor missing";
+  }
+
   async function inspectComposer(expected, select = false) {
     return inspectEditor(call, expected, select);
   }
@@ -421,20 +436,24 @@ async function main() {
         composerExpression(),
         30000,
       );
-      if (!ready) return fail("ChatGPT composer did not become ready");
-      // The composer readiness probe already waits for hydration. Keep a
-      // short configurable settling window; the subsequent exact editor and
-      // send-button checks reject stale or replaced editors safely.
-      const settleMs = Math.max(200, Math.min(1800,
-        Number(process.env.CHATGPT_WEB_COMPOSER_SETTLE_MS || "400") || 400));
-      await delay(settleMs);
+      if (!ready) return fail(
+        `ChatGPT composer did not become ready: ${await composerFailureReason()}`);
+      // ChatGPT may replace an editor several times during hydration.
+      // Never enter a draft until consecutive snapshots confirm readiness.
+      const stable = await waitForStableComposer(async () => {
+        try { return await inspectComposer(); }
+        catch (error) {
+          if (isTransientLifecycleError(error)) return null;
+          throw error;
+        }
+      }, {budgetMs:16000, stableMs:350, pollMs:125});
+      if (!stable) return fail(
+        `ChatGPT composer was replaced or hidden during hydration: ${await composerFailureReason()}`);
       if (input.check === true) {
-        const snapshot = await inspectComposer();
-        if (!snapshot?.present) return fail("ChatGPT composer did not stay ready");
         clearTimeout(timer);
         watchdogTimer = null;
         process.stdout.write(JSON.stringify({ok:true, composer_ready:true,
-          draft_present:!!snapshot.text}));
+          draft_present:!!stable.text}));
         closing = true;
         socket.close();
         await closeOwnedTab();
@@ -444,11 +463,17 @@ async function main() {
       // helper cleared its owned DOM. A private hash ledger recognizes only
       // prompts this helper injected; unknown user drafts remain untouched.
       let focused;
-      for (let attempt = 0; attempt < 5; attempt++) {
-        const snapshot = await inspectComposer();
+      const preflightDeadline = Date.now() + 16000;
+      while (Date.now() < preflightDeadline) {
+        let snapshot;
+        try { snapshot = await inspectComposer(); }
+        catch (error) {
+          if (!isTransientLifecycleError(error)) throw error;
+          snapshot = null;
+        }
         if (!snapshot?.present) {
           focused = {ok:false,reason:"editor missing"};
-          if (attempt < 4) await delay(500);
+          await delay(200);
           continue;
         }
         const staleText = snapshot.text || "";
@@ -459,12 +484,21 @@ async function main() {
           focused = {ok:false,reason:"unknown draft preserved"};
           break;
         }
-        focused = await prepareComposer(staleText);
+        try { focused = await prepareComposer(staleText); }
+        catch (error) {
+          if (!isTransientLifecycleError(error)) throw error;
+          focused = {ok:false,reason:"editor replaced during preflight"};
+        }
         if (focused.ok) break;
-        if (attempt < 4) await delay(500);
+        if (!["editor missing", "editor focus unavailable",
+              "editor was not cleared", "editor replaced during preflight"]
+              .includes(focused.reason)) break;
+        await delay(200);
       }
       if (!focused?.ok) {
-        return fail(`ChatGPT editor preflight failed: ${focused?.reason || "unknown"}`);
+        const reason = focused?.reason === "editor missing"
+          ? await composerFailureReason() : focused?.reason || "unknown";
+        return fail(`ChatGPT editor preflight failed: ${reason}`);
       }
       await call("Input.insertText", { text: input.prompt });
       promptInjected = true;

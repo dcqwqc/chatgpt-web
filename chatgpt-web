@@ -1342,6 +1342,8 @@ class ChatGPTWebClient:
             "No frame for given id",
             "lost the Chrome debugger connection",
             "send click did not start a request",
+            "ChatGPT composer did not become ready: editor missing",
+            "ChatGPT composer was replaced or hidden during hydration: editor missing",
             "ChatGPT editor preflight failed: editor missing",
             "ChatGPT editor preflight failed: editor changed",
             "ChatGPT editor preflight failed: editor was not cleared",
