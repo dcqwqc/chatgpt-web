@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const { readFileSync } = require("node:fs");
 const vm = require("node:vm");
 const path = require("node:path");
-const { composerExpression } = require("../composer.js");
+const { composerExpression, waitForStableComposer, composerBlockerExpression } = require("../composer.js");
 const code = readFileSync(path.join(__dirname, "..", "chrome-recipe.js"), "utf8");
 const composerCode = readFileSync(path.join(__dirname, "..", "composer.js"), "utf8");
 
@@ -113,4 +113,60 @@ test("owned draft recovery stores only bounded private SHA-256 markers", () => {
   assert.match(code, /mode:0o600/);
   assert.match(code, /live.slice\(256\)/);
   assert.doesNotMatch(code, /writeFileSync\([^\n]+input.prompt/);
+});
+
+test("preflight waits through hydration editor replacement", async () => {
+  let clock = 0;
+  const visible = {present:true, text:""};
+  const snapshots = [visible, null, visible, visible, visible, visible];
+  const result = await waitForStableComposer(
+    async () => snapshots.length ? snapshots.shift() : visible,
+    {budgetMs:1000, stableMs:300, pollMs:100,
+      now:() => clock, sleep:async ms => {clock += ms;}},
+  );
+  assert.equal(result, visible);
+  assert.ok(clock >= 400, "a briefly visible editor must not pass preflight");
+});
+
+test("preflight fails closed when editor never stabilizes", async () => {
+  let clock = 0;
+  let observations = 0;
+  const result = await waitForStableComposer(async () => {
+    observations += 1;
+    return observations % 2 ? {present:true, text:""} : null;
+  }, {budgetMs:750, stableMs:300, pollMs:100,
+    now:() => clock, sleep:async ms => {clock += ms;}});
+  assert.equal(result, null);
+  assert.ok(clock <= 750, "the wait must be strictly bounded");
+});
+
+test("recipe retries missing editors only before send, preserving unknown drafts", () => {
+  assert.match(code, /const preflightDeadline = Date.now\(\) \+ 16000/);
+  assert.match(code, /editor replaced during preflight/);
+  assert.match(code, /unknown draft preserved/);
+  assert.match(code, /submissionStarted = true/);
+});
+
+test("composer blocker diagnosis never returns page content", () => {
+  function reason({path="/",title="",text="",online=true}) {
+    const document = {title, body:{innerText:text}};
+    const location = {pathname:path};
+    const navigator = {onLine:online};
+    return vm.runInNewContext(composerBlockerExpression(), {document,location,navigator});
+  }
+  assert.equal(reason({path:"/auth/login"}), "authentication required");
+  assert.equal(reason({text:"Log in to ChatGPT"}), "authentication required");
+  assert.equal(reason({title:"Just a moment ..."}), "human verification required");
+  assert.equal(reason({text:"Verify you are human"}), "human verification required");
+  assert.equal(reason({text:"Could not load this ChatGPT conversation"}), "conversation unavailable");
+  assert.equal(reason({online:false}), "browser offline");
+  assert.equal(reason({text:"confidential chat: secret message"}), "editor missing");
+  assert.doesNotMatch(composerBlockerExpression(), /console\.log/);
+});
+
+test("login and challenge blockers are not treated as transient retryable editor errors", () => {
+  assert.match(code, /composerFailureReason\(\)/);
+  assert.match(code, /ChatGPT composer did not become ready:/);
+  assert.match(code, /ChatGPT editor preflight failed:/);
+  assert.match(code, /human verification required/);
 });

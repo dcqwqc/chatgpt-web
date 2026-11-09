@@ -62,4 +62,50 @@ async function prepareComposer(call, expected) {
   return inspectComposer(call, "", true);
 }
 
-module.exports = { composerState, composerExpression, inspectComposer, prepareComposer };
+// A page can briefly expose an editor and then replace it during React
+// hydration. Require consecutive visible observations before preflight, with
+// a deadline on the host (never a long-lived promise in the page context).
+async function waitForStableComposer(inspect, {
+  budgetMs = 16000, stableMs = 350, pollMs = 125,
+  now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
+} = {}) {
+  const deadline = now() + budgetMs;
+  let stableSince = null;
+  while (now() < deadline) {
+    const snapshot = await inspect();
+    if (snapshot?.present) {
+      if (stableSince === null) stableSince = now();
+      if (now() - stableSince >= stableMs) return snapshot;
+    } else {
+      stableSince = null;
+    }
+    const left = deadline - now();
+    if (left > 0) await sleep(Math.min(pollMs, left));
+  }
+  return null;
+}
+
+// Return only stable reason codes. Never send or log page text, cookies,
+// personal conversation contents, or login form fields in a diagnostic.
+function composerBlocker() {
+  const path = (location.pathname || "").toLowerCase();
+  const title = (document.title || "").toLowerCase();
+  const text = (document.body?.innerText || "").slice(0, 16000).toLowerCase();
+  if (navigator.onLine === false) return "browser offline";
+  if (/\/(?:auth|login|signin)(?:\/|$)/.test(path) ||
+      /(?:log in to chatgpt|sign in to chatgpt|login to chatgpt|anmelden bei chatgpt)/.test(text)) {
+    return "authentication required";
+  }
+  if (/just a moment|checking your browser|verify (?:you are|that you are) human|checking if the site connection is secure|security check|cloudflare challenge|human verification|confirme que eres humano/.test(title+" "+text)) {
+    return "human verification required";
+  }
+  if (/could not load (?:this )?chatgpt conversation|unable to load (?:chat )?history|conversation not found|this conversation is unavailable/.test(text)) {
+    return "conversation unavailable";
+  }
+  return "editor missing";
+}
+function composerBlockerExpression() {
+  return `(${composerBlocker.toString()})()`;
+}
+
+module.exports = { composerState, composerExpression, inspectComposer, prepareComposer, waitForStableComposer, composerBlocker, composerBlockerExpression };

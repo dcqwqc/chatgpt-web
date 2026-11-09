@@ -2,7 +2,7 @@
 // no account, website traffic, user tabs, or desktop input is involved.
 const {test} = require("node:test");
 const assert = require("node:assert/strict");
-const {prepareComposer, inspectComposer} = require("../composer.js");
+const {prepareComposer, inspectComposer, composerBlockerExpression} = require("../composer.js");
 const base = process.env.CHATGPT_WEB_TEST_CDP_URL;
 
 test("native Chrome editor clearing survives re-render, repeated turns, and hidden editors",
@@ -55,6 +55,14 @@ test("native Chrome editor clearing survives re-render, repeated turns, and hidd
       assert.equal((await inspectComposer(call)).text, "");
       const hidden = await call("Runtime.evaluate", {expression:"document.querySelector('#prompt-textarea').innerText", returnByValue:true});
       assert.equal(hidden.result.value, "hidden");
+      await call("Runtime.evaluate", {
+        expression:"document.title='Just a moment';document.body.textContent='Verify you are human. private session data'",
+      });
+      const diagnosis = await call("Runtime.evaluate", {
+        expression:composerBlockerExpression(), returnByValue:true,
+      });
+      assert.equal(diagnosis.result.value, "human verification required");
+      assert.ok(!JSON.stringify(diagnosis.result.value).includes("private session"));
     } finally {
       for (const item of pending.values()) clearTimeout(item.timer);
       ws.close();
