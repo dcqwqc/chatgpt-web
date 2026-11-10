@@ -1,9 +1,18 @@
 # License status
 
-This repository is derived from tritao/chatgpt-web. The upstream Git tree, inspected on 2026-11-08, did not include a LICENSE or COPYING file.
+On 2026-11-10, upstream [tritao/chatgpt-web](https://github.com/tritao/chatgpt-web)
+published an MIT license in commit
+[`0024d5a7d`](https://github.com/tritao/chatgpt-web/commit/0024d5a7d)
+and closed [licensing issue #3](https://github.com/tritao/chatgpt-web/issues/3).
+The upstream copyright and MIT notice are reproduced in [LICENSE](LICENSE).
+Retain that notice in copies or substantial portions of upstream-derived code.
 
-No blanket right to relicense or distribute upstream-derived content is asserted here. Absence of a license is not an open-source license.
+This resolves the previously missing **upstream license**. It does not
+establish ownership or license coverage of every independently contributed
+file or third-party asset. Review those notices before packaging.
 
-Independent additions retain their respective authors' rights. A public GitHub fork does not automatically grant permission to package or redistribute the work under a new license.
-
-Before an independent distributable release, obtain an explicit upstream license or written permission, confirm third-party terms, and document the resolved legal basis in the repository.
+Independent additions retain their authors' rights unless separately licensed.
+A public GitHub fork does not, by itself, grant a blanket license to
+independent additions. Release readiness still depends on historical privacy,
+authenticated end-to-end acceptance, and packaging review as documented in
+[docs/public-release.md](docs/public-release.md).

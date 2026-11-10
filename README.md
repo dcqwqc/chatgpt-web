@@ -565,7 +565,7 @@ the Project used for browser-backed image requests, not only text chats.
 ### Public development
 
 The project is a maintained fork of [tritao/chatgpt-web](https://github.com/tritao/chatgpt-web).
-Upstream had no explicit LICENSE file when this fork was reviewed. This repository does not claim a blanket right to relicense the original code.
+Upstream published an MIT license on 2026-11-10. This fork preserves the upstream notice without claiming rights over separately authored additions.
 See [license status](LICENSE-STATUS.md) before distributing builds outside GitHub.
 
 For maintenance and contribution, see [CONTRIBUTING.md](CONTRIBUTING.md),
