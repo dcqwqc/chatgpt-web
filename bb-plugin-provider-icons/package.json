@@ -20,11 +20,11 @@
     "app": "./app.tsx",
     "skills": []
   },
-  "dependencies": {},
   "devDependencies": {
     "@get-bb/plugin-sdk": "0.6.94",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
+    "hono": "^4.13.18",
     "typescript": "^5.7.0"
   },
   "scripts": {
